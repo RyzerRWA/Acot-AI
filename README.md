@@ -1,2 +1,2 @@
-# Acot-AI-
+# Acot-AI
 AI Models
