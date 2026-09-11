@@ -1,0 +1,2226 @@
+{
+  "dataset_name": "Dubai Real Estate RAG Benchmark - 50 Synthetic Records",
+  "version": "1.0",
+  "created_for": "RAG retrieval, metadata display, source-link testing and document-grounded QA",
+  "record_count": 50,
+  "important_note": "Property prices, rents, areas and property-level combinations are synthetic benchmark data. The linked URLs point to official/public Dubai sources and should be used as source documents, not as proof that the synthetic record itself occurred.",
+  "official_source_catalog": [
+    {
+      "document_id": "DLD-RE-2024-ANNUAL",
+      "document_title": "Annual Report: Real Estate Sector Performance 2024",
+      "document_type": "PDF",
+      "document_url": "https://dubailand.gov.ae/media/c5ejvvoe/annual_report_2024_english.pdf",
+      "source_page": "https://dubailand.gov.ae/en/open-data/research/annual-report-real-estate-sector-performance-2024/",
+      "publisher": "Dubai Land Department",
+      "scope": "Dubai-wide real estate market performance, prices, transactions and market analysis"
+    },
+    {
+      "document_id": "DLD-RE-DATA",
+      "document_title": "Dubai Land Department Real Estate Data",
+      "document_type": "Web dataset",
+      "document_url": "https://dubailand.gov.ae/en/open-data/real-estate-data/",
+      "source_page": "https://dubailand.gov.ae/en/open-data/real-estate-data/",
+      "publisher": "Dubai Land Department",
+      "scope": "Transactions, rents, projects, valuations, land, buildings, units, brokers and developers"
+    },
+    {
+      "document_id": "DLD-PULSE-TRANS",
+      "document_title": "DLD Transactions Open Dataset",
+      "document_type": "Open-data dataset",
+      "document_url": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_transactions-open",
+      "source_page": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_transactions-open",
+      "publisher": "Dubai Land Department via Dubai Pulse",
+      "scope": "Real-estate transactions and related property attributes"
+    },
+    {
+      "document_id": "DLD-PULSE-AREAS",
+      "document_title": "DLD Dubai Communities Lookup Dataset",
+      "document_type": "Open-data dataset",
+      "document_url": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_lkp_areas-open-api",
+      "source_page": "https://www.gslb.dubaipulse.gov.ae/organisation/dld/service/dld-transactions",
+      "publisher": "Dubai Land Department via Dubai Pulse",
+      "scope": "Lookup data for Dubai communities/areas"
+    },
+    {
+      "document_id": "DM-BUILDING-CODE",
+      "document_title": "Dubai Building Code",
+      "document_type": "Document / web reference",
+      "document_url": "https://www.dm.gov.ae/municipality-business/planning-and-construction/dubai-building-code-2/",
+      "source_page": "https://www.dm.gov.ae/municipality-business/planning-and-construction/dubai-building-code-2/",
+      "publisher": "Dubai Municipality",
+      "scope": "Building design, safety, welfare, environmental and construction requirements"
+    }
+  ],
+  "records": [
+    {
+      "id": "DX-RE-0001",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Downtown Dubai",
+      "district": "Central Dubai",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 1,
+        "area_sqft": 58,
+        "estimated_sale_price_aed": 812000,
+        "estimated_annual_rent_aed": 36500,
+        "price_per_sqft_aed": 14000.0,
+        "parking_spaces": 2,
+        "status": "ready"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Burj Khalifa",
+          "Dubai Mall"
+        ],
+        "amenities": [
+          "Metro",
+          "Tram/Bus",
+          "retail",
+          "dining"
+        ],
+        "market_position": "premium"
+      },
+      "rag": {
+        "document_id": "DLD-RE-2024-ANNUAL",
+        "document_title": "Annual Report: Real Estate Sector Performance 2024",
+        "document_type": "PDF",
+        "document_url": "https://dubailand.gov.ae/media/c5ejvvoe/annual_report_2024_english.pdf",
+        "source_page": "https://dubailand.gov.ae/en/open-data/research/annual-report-real-estate-sector-performance-2024/",
+        "publisher": "Dubai Land Department",
+        "source_scope": "Dubai-wide real estate market performance, prices, transactions and market analysis",
+        "retrieval_text": "Downtown Dubai is a Dubai community. This synthetic benchmark record describes a 1-bedroom apartment with approximately 58 sq ft, an estimated sale price of AED 812,000, and estimated annual rent of AED 36,500. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0002",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Dubai Marina",
+      "district": "New Dubai",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 2,
+        "area_sqft": 95,
+        "estimated_sale_price_aed": 1115000,
+        "estimated_annual_rent_aed": 53500,
+        "price_per_sqft_aed": 11736.84,
+        "parking_spaces": 1,
+        "status": "under_construction"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Dubai Marina Walk",
+          "Marina Mall"
+        ],
+        "amenities": [
+          "Metro",
+          "Tram",
+          "waterfront",
+          "dining"
+        ],
+        "market_position": "mid_market"
+      },
+      "rag": {
+        "document_id": "DLD-RE-DATA",
+        "document_title": "Dubai Land Department Real Estate Data",
+        "document_type": "Web dataset",
+        "document_url": "https://dubailand.gov.ae/en/open-data/real-estate-data/",
+        "source_page": "https://dubailand.gov.ae/en/open-data/real-estate-data/",
+        "publisher": "Dubai Land Department",
+        "source_scope": "Transactions, rents, projects, valuations, land, buildings, units, brokers and developers",
+        "retrieval_text": "Dubai Marina is a Dubai community. This synthetic benchmark record describes a 2-bedroom apartment with approximately 95 sq ft, an estimated sale price of AED 1,115,000, and estimated annual rent of AED 53,500. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0003",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Jumeirah Village Circle",
+      "district": "New Dubai",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 3,
+        "area_sqft": 132,
+        "estimated_sale_price_aed": 1184000,
+        "estimated_annual_rent_aed": 60400,
+        "price_per_sqft_aed": 8969.7,
+        "parking_spaces": 1,
+        "status": "ready"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Circle Mall"
+        ],
+        "amenities": [
+          "Bus",
+          "retail",
+          "schools",
+          "parks"
+        ],
+        "market_position": "growth"
+      },
+      "rag": {
+        "document_id": "DLD-PULSE-TRANS",
+        "document_title": "DLD Transactions Open Dataset",
+        "document_type": "Open-data dataset",
+        "document_url": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_transactions-open",
+        "source_page": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_transactions-open",
+        "publisher": "Dubai Land Department via Dubai Pulse",
+        "source_scope": "Real-estate transactions and related property attributes",
+        "retrieval_text": "Jumeirah Village Circle is a Dubai community. This synthetic benchmark record describes a 3-bedroom apartment with approximately 132 sq ft, an estimated sale price of AED 1,184,000, and estimated annual rent of AED 60,400. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0004",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Business Bay",
+      "district": "Central Dubai",
+      "property": {
+        "property_type": "villa",
+        "usage": "residential",
+        "bedrooms": 4,
+        "area_sqft": 169,
+        "estimated_sale_price_aed": 2062000,
+        "estimated_annual_rent_aed": 111300,
+        "price_per_sqft_aed": 12201.18,
+        "parking_spaces": 2,
+        "status": "off_plan"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Dubai Canal",
+          "Bay Avenue"
+        ],
+        "amenities": [
+          "Metro",
+          "canal",
+          "offices",
+          "retail"
+        ],
+        "market_position": "luxury"
+      },
+      "rag": {
+        "document_id": "DLD-PULSE-AREAS",
+        "document_title": "DLD Dubai Communities Lookup Dataset",
+        "document_type": "Open-data dataset",
+        "document_url": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_lkp_areas-open-api",
+        "source_page": "https://www.gslb.dubaipulse.gov.ae/organisation/dld/service/dld-transactions",
+        "publisher": "Dubai Land Department via Dubai Pulse",
+        "source_scope": "Lookup data for Dubai communities/areas",
+        "retrieval_text": "Business Bay is a Dubai community. This synthetic benchmark record describes a 4-bedroom villa with approximately 169 sq ft, an estimated sale price of AED 2,062,000, and estimated annual rent of AED 111,300. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0005",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Palm Jumeirah",
+      "district": "Coastal Dubai",
+      "property": {
+        "property_type": "townhouse",
+        "usage": "residential",
+        "bedrooms": 3,
+        "area_sqft": 206,
+        "estimated_sale_price_aed": 3900000,
+        "estimated_annual_rent_aed": 222300,
+        "price_per_sqft_aed": 18932.04,
+        "parking_spaces": 1,
+        "status": "ready"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Atlantis",
+          "Palm West Beach"
+        ],
+        "amenities": [
+          "Monorail",
+          "beach",
+          "resorts"
+        ],
+        "market_position": "premium"
+      },
+      "rag": {
+        "document_id": "DM-BUILDING-CODE",
+        "document_title": "Dubai Building Code",
+        "document_type": "Document / web reference",
+        "document_url": "https://www.dm.gov.ae/municipality-business/planning-and-construction/dubai-building-code-2/",
+        "source_page": "https://www.dm.gov.ae/municipality-business/planning-and-construction/dubai-building-code-2/",
+        "publisher": "Dubai Municipality",
+        "source_scope": "Building design, safety, welfare, environmental and construction requirements",
+        "retrieval_text": "Palm Jumeirah is a Dubai community. This synthetic benchmark record describes a 3-bedroom townhouse with approximately 206 sq ft, an estimated sale price of AED 3,900,000, and estimated annual rent of AED 222,300. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0006",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Dubai Hills Estate",
+      "district": "New Dubai",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 1,
+        "area_sqft": 243,
+        "estimated_sale_price_aed": 3564000,
+        "estimated_annual_rent_aed": 160400,
+        "price_per_sqft_aed": 14666.67,
+        "parking_spaces": 1,
+        "status": "under_construction"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Dubai Hills Mall",
+          "Dubai Hills Park"
+        ],
+        "amenities": [
+          "Schools",
+          "park",
+          "golf",
+          "retail"
+        ],
+        "market_position": "mid_market"
+      },
+      "rag": {
+        "document_id": "DLD-RE-2024-ANNUAL",
+        "document_title": "Annual Report: Real Estate Sector Performance 2024",
+        "document_type": "PDF",
+        "document_url": "https://dubailand.gov.ae/media/c5ejvvoe/annual_report_2024_english.pdf",
+        "source_page": "https://dubailand.gov.ae/en/open-data/research/annual-report-real-estate-sector-performance-2024/",
+        "publisher": "Dubai Land Department",
+        "source_scope": "Dubai-wide real estate market performance, prices, transactions and market analysis",
+        "retrieval_text": "Dubai Hills Estate is a Dubai community. This synthetic benchmark record describes a 1-bedroom apartment with approximately 243 sq ft, an estimated sale price of AED 3,564,000, and estimated annual rent of AED 160,400. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0007",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Dubai Creek Harbour",
+      "district": "Dubai Creek",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 2,
+        "area_sqft": 280,
+        "estimated_sale_price_aed": 3891000,
+        "estimated_annual_rent_aed": 186800,
+        "price_per_sqft_aed": 13896.43,
+        "parking_spaces": 2,
+        "status": "ready"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Creek Beach",
+          "Dubai Creek"
+        ],
+        "amenities": [
+          "Waterfront",
+          "retail",
+          "planned transit"
+        ],
+        "market_position": "growth"
+      },
+      "rag": {
+        "document_id": "DLD-RE-DATA",
+        "document_title": "Dubai Land Department Real Estate Data",
+        "document_type": "Web dataset",
+        "document_url": "https://dubailand.gov.ae/en/open-data/real-estate-data/",
+        "source_page": "https://dubailand.gov.ae/en/open-data/real-estate-data/",
+        "publisher": "Dubai Land Department",
+        "source_scope": "Transactions, rents, projects, valuations, land, buildings, units, brokers and developers",
+        "retrieval_text": "Dubai Creek Harbour is a Dubai community. This synthetic benchmark record describes a 2-bedroom apartment with approximately 280 sq ft, an estimated sale price of AED 3,891,000, and estimated annual rent of AED 186,800. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0008",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Arabian Ranches",
+      "district": "Dubailand",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 3,
+        "area_sqft": 67,
+        "estimated_sale_price_aed": 913000,
+        "estimated_annual_rent_aed": 46600,
+        "price_per_sqft_aed": 13626.87,
+        "parking_spaces": 1,
+        "status": "off_plan"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Arabian Ranches Golf Club"
+        ],
+        "amenities": [
+          "Schools",
+          "golf",
+          "parks",
+          "community retail"
+        ],
+        "market_position": "luxury"
+      },
+      "rag": {
+        "document_id": "DLD-PULSE-TRANS",
+        "document_title": "DLD Transactions Open Dataset",
+        "document_type": "Open-data dataset",
+        "document_url": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_transactions-open",
+        "source_page": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_transactions-open",
+        "publisher": "Dubai Land Department via Dubai Pulse",
+        "source_scope": "Real-estate transactions and related property attributes",
+        "retrieval_text": "Arabian Ranches is a Dubai community. This synthetic benchmark record describes a 3-bedroom apartment with approximately 67 sq ft, an estimated sale price of AED 913,000, and estimated annual rent of AED 46,600. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0009",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Jumeirah Lake Towers",
+      "district": "New Dubai",
+      "property": {
+        "property_type": "villa",
+        "usage": "residential",
+        "bedrooms": 4,
+        "area_sqft": 104,
+        "estimated_sale_price_aed": 1494000,
+        "estimated_annual_rent_aed": 80700,
+        "price_per_sqft_aed": 14365.38,
+        "parking_spaces": 1,
+        "status": "ready"
+      },
+      "community_profile": {
+        "landmarks": [
+          "DMCC",
+          "JLT Lakes"
+        ],
+        "amenities": [
+          "Metro",
+          "lakes",
+          "offices",
+          "retail"
+        ],
+        "market_position": "premium"
+      },
+      "rag": {
+        "document_id": "DLD-PULSE-AREAS",
+        "document_title": "DLD Dubai Communities Lookup Dataset",
+        "document_type": "Open-data dataset",
+        "document_url": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_lkp_areas-open-api",
+        "source_page": "https://www.gslb.dubaipulse.gov.ae/organisation/dld/service/dld-transactions",
+        "publisher": "Dubai Land Department via Dubai Pulse",
+        "source_scope": "Lookup data for Dubai communities/areas",
+        "retrieval_text": "Jumeirah Lake Towers is a Dubai community. This synthetic benchmark record describes a 4-bedroom villa with approximately 104 sq ft, an estimated sale price of AED 1,494,000, and estimated annual rent of AED 80,700. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0010",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Dubai Sports City",
+      "district": "Dubailand",
+      "property": {
+        "property_type": "townhouse",
+        "usage": "residential",
+        "bedrooms": 3,
+        "area_sqft": 141,
+        "estimated_sale_price_aed": 1283000,
+        "estimated_annual_rent_aed": 73100,
+        "price_per_sqft_aed": 9099.29,
+        "parking_spaces": 2,
+        "status": "under_construction"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Dubai International Stadium"
+        ],
+        "amenities": [
+          "Sports facilities",
+          "schools",
+          "retail"
+        ],
+        "market_position": "mid_market"
+      },
+      "rag": {
+        "document_id": "DM-BUILDING-CODE",
+        "document_title": "Dubai Building Code",
+        "document_type": "Document / web reference",
+        "document_url": "https://www.dm.gov.ae/municipality-business/planning-and-construction/dubai-building-code-2/",
+        "source_page": "https://www.dm.gov.ae/municipality-business/planning-and-construction/dubai-building-code-2/",
+        "publisher": "Dubai Municipality",
+        "source_scope": "Building design, safety, welfare, environmental and construction requirements",
+        "retrieval_text": "Dubai Sports City is a Dubai community. This synthetic benchmark record describes a 3-bedroom townhouse with approximately 141 sq ft, an estimated sale price of AED 1,283,000, and estimated annual rent of AED 73,100. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0011",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Downtown Dubai",
+      "district": "Central Dubai",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 1,
+        "area_sqft": 178,
+        "estimated_sale_price_aed": 3797000,
+        "estimated_annual_rent_aed": 170900,
+        "price_per_sqft_aed": 21331.46,
+        "parking_spaces": 1,
+        "status": "ready"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Burj Khalifa",
+          "Dubai Mall"
+        ],
+        "amenities": [
+          "Metro",
+          "Tram/Bus",
+          "retail",
+          "dining"
+        ],
+        "market_position": "growth"
+      },
+      "rag": {
+        "document_id": "DLD-RE-2024-ANNUAL",
+        "document_title": "Annual Report: Real Estate Sector Performance 2024",
+        "document_type": "PDF",
+        "document_url": "https://dubailand.gov.ae/media/c5ejvvoe/annual_report_2024_english.pdf",
+        "source_page": "https://dubailand.gov.ae/en/open-data/research/annual-report-real-estate-sector-performance-2024/",
+        "publisher": "Dubai Land Department",
+        "source_scope": "Dubai-wide real estate market performance, prices, transactions and market analysis",
+        "retrieval_text": "Downtown Dubai is a Dubai community. This synthetic benchmark record describes a 1-bedroom apartment with approximately 178 sq ft, an estimated sale price of AED 3,797,000, and estimated annual rent of AED 170,900. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0012",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Dubai Marina",
+      "district": "New Dubai",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 2,
+        "area_sqft": 215,
+        "estimated_sale_price_aed": 4099000,
+        "estimated_annual_rent_aed": 196800,
+        "price_per_sqft_aed": 19065.12,
+        "parking_spaces": 1,
+        "status": "off_plan"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Dubai Marina Walk",
+          "Marina Mall"
+        ],
+        "amenities": [
+          "Metro",
+          "Tram",
+          "waterfront",
+          "dining"
+        ],
+        "market_position": "luxury"
+      },
+      "rag": {
+        "document_id": "DLD-RE-DATA",
+        "document_title": "Dubai Land Department Real Estate Data",
+        "document_type": "Web dataset",
+        "document_url": "https://dubailand.gov.ae/en/open-data/real-estate-data/",
+        "source_page": "https://dubailand.gov.ae/en/open-data/real-estate-data/",
+        "publisher": "Dubai Land Department",
+        "source_scope": "Transactions, rents, projects, valuations, land, buildings, units, brokers and developers",
+        "retrieval_text": "Dubai Marina is a Dubai community. This synthetic benchmark record describes a 2-bedroom apartment with approximately 215 sq ft, an estimated sale price of AED 4,099,000, and estimated annual rent of AED 196,800. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0013",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Jumeirah Village Circle",
+      "district": "New Dubai",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 3,
+        "area_sqft": 252,
+        "estimated_sale_price_aed": 2846000,
+        "estimated_annual_rent_aed": 145100,
+        "price_per_sqft_aed": 11293.65,
+        "parking_spaces": 2,
+        "status": "ready"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Circle Mall"
+        ],
+        "amenities": [
+          "Bus",
+          "retail",
+          "schools",
+          "parks"
+        ],
+        "market_position": "premium"
+      },
+      "rag": {
+        "document_id": "DLD-PULSE-TRANS",
+        "document_title": "DLD Transactions Open Dataset",
+        "document_type": "Open-data dataset",
+        "document_url": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_transactions-open",
+        "source_page": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_transactions-open",
+        "publisher": "Dubai Land Department via Dubai Pulse",
+        "source_scope": "Real-estate transactions and related property attributes",
+        "retrieval_text": "Jumeirah Village Circle is a Dubai community. This synthetic benchmark record describes a 3-bedroom apartment with approximately 252 sq ft, an estimated sale price of AED 2,846,000, and estimated annual rent of AED 145,100. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0014",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Business Bay",
+      "district": "Central Dubai",
+      "property": {
+        "property_type": "villa",
+        "usage": "residential",
+        "bedrooms": 4,
+        "area_sqft": 289,
+        "estimated_sale_price_aed": 5644000,
+        "estimated_annual_rent_aed": 304800,
+        "price_per_sqft_aed": 19529.41,
+        "parking_spaces": 1,
+        "status": "under_construction"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Dubai Canal",
+          "Bay Avenue"
+        ],
+        "amenities": [
+          "Metro",
+          "canal",
+          "offices",
+          "retail"
+        ],
+        "market_position": "mid_market"
+      },
+      "rag": {
+        "document_id": "DLD-PULSE-AREAS",
+        "document_title": "DLD Dubai Communities Lookup Dataset",
+        "document_type": "Open-data dataset",
+        "document_url": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_lkp_areas-open-api",
+        "source_page": "https://www.gslb.dubaipulse.gov.ae/organisation/dld/service/dld-transactions",
+        "publisher": "Dubai Land Department via Dubai Pulse",
+        "source_scope": "Lookup data for Dubai communities/areas",
+        "retrieval_text": "Business Bay is a Dubai community. This synthetic benchmark record describes a 4-bedroom villa with approximately 289 sq ft, an estimated sale price of AED 5,644,000, and estimated annual rent of AED 304,800. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0015",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Palm Jumeirah",
+      "district": "Coastal Dubai",
+      "property": {
+        "property_type": "townhouse",
+        "usage": "residential",
+        "bedrooms": 3,
+        "area_sqft": 76,
+        "estimated_sale_price_aed": 1996000,
+        "estimated_annual_rent_aed": 113800,
+        "price_per_sqft_aed": 26263.16,
+        "parking_spaces": 1,
+        "status": "ready"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Atlantis",
+          "Palm West Beach"
+        ],
+        "amenities": [
+          "Monorail",
+          "beach",
+          "resorts"
+        ],
+        "market_position": "growth"
+      },
+      "rag": {
+        "document_id": "DM-BUILDING-CODE",
+        "document_title": "Dubai Building Code",
+        "document_type": "Document / web reference",
+        "document_url": "https://www.dm.gov.ae/municipality-business/planning-and-construction/dubai-building-code-2/",
+        "source_page": "https://www.dm.gov.ae/municipality-business/planning-and-construction/dubai-building-code-2/",
+        "publisher": "Dubai Municipality",
+        "source_scope": "Building design, safety, welfare, environmental and construction requirements",
+        "retrieval_text": "Palm Jumeirah is a Dubai community. This synthetic benchmark record describes a 3-bedroom townhouse with approximately 76 sq ft, an estimated sale price of AED 1,996,000, and estimated annual rent of AED 113,800. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0016",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Dubai Hills Estate",
+      "district": "New Dubai",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 1,
+        "area_sqft": 113,
+        "estimated_sale_price_aed": 1355000,
+        "estimated_annual_rent_aed": 61000,
+        "price_per_sqft_aed": 11991.15,
+        "parking_spaces": 2,
+        "status": "off_plan"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Dubai Hills Mall",
+          "Dubai Hills Park"
+        ],
+        "amenities": [
+          "Schools",
+          "park",
+          "golf",
+          "retail"
+        ],
+        "market_position": "luxury"
+      },
+      "rag": {
+        "document_id": "DLD-RE-2024-ANNUAL",
+        "document_title": "Annual Report: Real Estate Sector Performance 2024",
+        "document_type": "PDF",
+        "document_url": "https://dubailand.gov.ae/media/c5ejvvoe/annual_report_2024_english.pdf",
+        "source_page": "https://dubailand.gov.ae/en/open-data/research/annual-report-real-estate-sector-performance-2024/",
+        "publisher": "Dubai Land Department",
+        "source_scope": "Dubai-wide real estate market performance, prices, transactions and market analysis",
+        "retrieval_text": "Dubai Hills Estate is a Dubai community. This synthetic benchmark record describes a 1-bedroom apartment with approximately 113 sq ft, an estimated sale price of AED 1,355,000, and estimated annual rent of AED 61,000. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0017",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Dubai Creek Harbour",
+      "district": "Dubai Creek",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 2,
+        "area_sqft": 150,
+        "estimated_sale_price_aed": 1909000,
+        "estimated_annual_rent_aed": 91600,
+        "price_per_sqft_aed": 12726.67,
+        "parking_spaces": 1,
+        "status": "ready"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Creek Beach",
+          "Dubai Creek"
+        ],
+        "amenities": [
+          "Waterfront",
+          "retail",
+          "planned transit"
+        ],
+        "market_position": "premium"
+      },
+      "rag": {
+        "document_id": "DLD-RE-DATA",
+        "document_title": "Dubai Land Department Real Estate Data",
+        "document_type": "Web dataset",
+        "document_url": "https://dubailand.gov.ae/en/open-data/real-estate-data/",
+        "source_page": "https://dubailand.gov.ae/en/open-data/real-estate-data/",
+        "publisher": "Dubai Land Department",
+        "source_scope": "Transactions, rents, projects, valuations, land, buildings, units, brokers and developers",
+        "retrieval_text": "Dubai Creek Harbour is a Dubai community. This synthetic benchmark record describes a 2-bedroom apartment with approximately 150 sq ft, an estimated sale price of AED 1,909,000, and estimated annual rent of AED 91,600. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0018",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Arabian Ranches",
+      "district": "Dubailand",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 3,
+        "area_sqft": 187,
+        "estimated_sale_price_aed": 2611000,
+        "estimated_annual_rent_aed": 133200,
+        "price_per_sqft_aed": 13962.57,
+        "parking_spaces": 1,
+        "status": "under_construction"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Arabian Ranches Golf Club"
+        ],
+        "amenities": [
+          "Schools",
+          "golf",
+          "parks",
+          "community retail"
+        ],
+        "market_position": "mid_market"
+      },
+      "rag": {
+        "document_id": "DLD-PULSE-TRANS",
+        "document_title": "DLD Transactions Open Dataset",
+        "document_type": "Open-data dataset",
+        "document_url": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_transactions-open",
+        "source_page": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_transactions-open",
+        "publisher": "Dubai Land Department via Dubai Pulse",
+        "source_scope": "Real-estate transactions and related property attributes",
+        "retrieval_text": "Arabian Ranches is a Dubai community. This synthetic benchmark record describes a 3-bedroom apartment with approximately 187 sq ft, an estimated sale price of AED 2,611,000, and estimated annual rent of AED 133,200. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0019",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Jumeirah Lake Towers",
+      "district": "New Dubai",
+      "property": {
+        "property_type": "villa",
+        "usage": "residential",
+        "bedrooms": 4,
+        "area_sqft": 224,
+        "estimated_sale_price_aed": 1947000,
+        "estimated_annual_rent_aed": 105100,
+        "price_per_sqft_aed": 8691.96,
+        "parking_spaces": 2,
+        "status": "ready"
+      },
+      "community_profile": {
+        "landmarks": [
+          "DMCC",
+          "JLT Lakes"
+        ],
+        "amenities": [
+          "Metro",
+          "lakes",
+          "offices",
+          "retail"
+        ],
+        "market_position": "growth"
+      },
+      "rag": {
+        "document_id": "DLD-PULSE-AREAS",
+        "document_title": "DLD Dubai Communities Lookup Dataset",
+        "document_type": "Open-data dataset",
+        "document_url": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_lkp_areas-open-api",
+        "source_page": "https://www.gslb.dubaipulse.gov.ae/organisation/dld/service/dld-transactions",
+        "publisher": "Dubai Land Department via Dubai Pulse",
+        "source_scope": "Lookup data for Dubai communities/areas",
+        "retrieval_text": "Jumeirah Lake Towers is a Dubai community. This synthetic benchmark record describes a 4-bedroom villa with approximately 224 sq ft, an estimated sale price of AED 1,947,000, and estimated annual rent of AED 105,100. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0020",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Dubai Sports City",
+      "district": "Dubailand",
+      "property": {
+        "property_type": "townhouse",
+        "usage": "residential",
+        "bedrooms": 3,
+        "area_sqft": 261,
+        "estimated_sale_price_aed": 2199000,
+        "estimated_annual_rent_aed": 125300,
+        "price_per_sqft_aed": 8425.29,
+        "parking_spaces": 1,
+        "status": "off_plan"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Dubai International Stadium"
+        ],
+        "amenities": [
+          "Sports facilities",
+          "schools",
+          "retail"
+        ],
+        "market_position": "luxury"
+      },
+      "rag": {
+        "document_id": "DM-BUILDING-CODE",
+        "document_title": "Dubai Building Code",
+        "document_type": "Document / web reference",
+        "document_url": "https://www.dm.gov.ae/municipality-business/planning-and-construction/dubai-building-code-2/",
+        "source_page": "https://www.dm.gov.ae/municipality-business/planning-and-construction/dubai-building-code-2/",
+        "publisher": "Dubai Municipality",
+        "source_scope": "Building design, safety, welfare, environmental and construction requirements",
+        "retrieval_text": "Dubai Sports City is a Dubai community. This synthetic benchmark record describes a 3-bedroom townhouse with approximately 261 sq ft, an estimated sale price of AED 2,199,000, and estimated annual rent of AED 125,300. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0021",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Downtown Dubai",
+      "district": "Central Dubai",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 1,
+        "area_sqft": 298,
+        "estimated_sale_price_aed": 8541000,
+        "estimated_annual_rent_aed": 384300,
+        "price_per_sqft_aed": 28661.07,
+        "parking_spaces": 1,
+        "status": "ready"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Burj Khalifa",
+          "Dubai Mall"
+        ],
+        "amenities": [
+          "Metro",
+          "Tram/Bus",
+          "retail",
+          "dining"
+        ],
+        "market_position": "premium"
+      },
+      "rag": {
+        "document_id": "DLD-RE-2024-ANNUAL",
+        "document_title": "Annual Report: Real Estate Sector Performance 2024",
+        "document_type": "PDF",
+        "document_url": "https://dubailand.gov.ae/media/c5ejvvoe/annual_report_2024_english.pdf",
+        "source_page": "https://dubailand.gov.ae/en/open-data/research/annual-report-real-estate-sector-performance-2024/",
+        "publisher": "Dubai Land Department",
+        "source_scope": "Dubai-wide real estate market performance, prices, transactions and market analysis",
+        "retrieval_text": "Downtown Dubai is a Dubai community. This synthetic benchmark record describes a 1-bedroom apartment with approximately 298 sq ft, an estimated sale price of AED 8,541,000, and estimated annual rent of AED 384,300. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0022",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Dubai Marina",
+      "district": "New Dubai",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 2,
+        "area_sqft": 85,
+        "estimated_sale_price_aed": 1138000,
+        "estimated_annual_rent_aed": 54600,
+        "price_per_sqft_aed": 13388.24,
+        "parking_spaces": 2,
+        "status": "under_construction"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Dubai Marina Walk",
+          "Marina Mall"
+        ],
+        "amenities": [
+          "Metro",
+          "Tram",
+          "waterfront",
+          "dining"
+        ],
+        "market_position": "mid_market"
+      },
+      "rag": {
+        "document_id": "DLD-RE-DATA",
+        "document_title": "Dubai Land Department Real Estate Data",
+        "document_type": "Web dataset",
+        "document_url": "https://dubailand.gov.ae/en/open-data/real-estate-data/",
+        "source_page": "https://dubailand.gov.ae/en/open-data/real-estate-data/",
+        "publisher": "Dubai Land Department",
+        "source_scope": "Transactions, rents, projects, valuations, land, buildings, units, brokers and developers",
+        "retrieval_text": "Dubai Marina is a Dubai community. This synthetic benchmark record describes a 2-bedroom apartment with approximately 85 sq ft, an estimated sale price of AED 1,138,000, and estimated annual rent of AED 54,600. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0023",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Jumeirah Village Circle",
+      "district": "New Dubai",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 3,
+        "area_sqft": 122,
+        "estimated_sale_price_aed": 1052000,
+        "estimated_annual_rent_aed": 53700,
+        "price_per_sqft_aed": 8622.95,
+        "parking_spaces": 1,
+        "status": "ready"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Circle Mall"
+        ],
+        "amenities": [
+          "Bus",
+          "retail",
+          "schools",
+          "parks"
+        ],
+        "market_position": "growth"
+      },
+      "rag": {
+        "document_id": "DLD-PULSE-TRANS",
+        "document_title": "DLD Transactions Open Dataset",
+        "document_type": "Open-data dataset",
+        "document_url": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_transactions-open",
+        "source_page": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_transactions-open",
+        "publisher": "Dubai Land Department via Dubai Pulse",
+        "source_scope": "Real-estate transactions and related property attributes",
+        "retrieval_text": "Jumeirah Village Circle is a Dubai community. This synthetic benchmark record describes a 3-bedroom apartment with approximately 122 sq ft, an estimated sale price of AED 1,052,000, and estimated annual rent of AED 53,700. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0024",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Business Bay",
+      "district": "Central Dubai",
+      "property": {
+        "property_type": "villa",
+        "usage": "residential",
+        "bedrooms": 4,
+        "area_sqft": 159,
+        "estimated_sale_price_aed": 2362000,
+        "estimated_annual_rent_aed": 127500,
+        "price_per_sqft_aed": 14855.35,
+        "parking_spaces": 1,
+        "status": "off_plan"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Dubai Canal",
+          "Bay Avenue"
+        ],
+        "amenities": [
+          "Metro",
+          "canal",
+          "offices",
+          "retail"
+        ],
+        "market_position": "luxury"
+      },
+      "rag": {
+        "document_id": "DLD-PULSE-AREAS",
+        "document_title": "DLD Dubai Communities Lookup Dataset",
+        "document_type": "Open-data dataset",
+        "document_url": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_lkp_areas-open-api",
+        "source_page": "https://www.gslb.dubaipulse.gov.ae/organisation/dld/service/dld-transactions",
+        "publisher": "Dubai Land Department via Dubai Pulse",
+        "source_scope": "Lookup data for Dubai communities/areas",
+        "retrieval_text": "Business Bay is a Dubai community. This synthetic benchmark record describes a 4-bedroom villa with approximately 159 sq ft, an estimated sale price of AED 2,362,000, and estimated annual rent of AED 127,500. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0025",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Palm Jumeirah",
+      "district": "Coastal Dubai",
+      "property": {
+        "property_type": "townhouse",
+        "usage": "residential",
+        "bedrooms": 3,
+        "area_sqft": 196,
+        "estimated_sale_price_aed": 6584000,
+        "estimated_annual_rent_aed": 375300,
+        "price_per_sqft_aed": 33591.84,
+        "parking_spaces": 2,
+        "status": "ready"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Atlantis",
+          "Palm West Beach"
+        ],
+        "amenities": [
+          "Monorail",
+          "beach",
+          "resorts"
+        ],
+        "market_position": "premium"
+      },
+      "rag": {
+        "document_id": "DM-BUILDING-CODE",
+        "document_title": "Dubai Building Code",
+        "document_type": "Document / web reference",
+        "document_url": "https://www.dm.gov.ae/municipality-business/planning-and-construction/dubai-building-code-2/",
+        "source_page": "https://www.dm.gov.ae/municipality-business/planning-and-construction/dubai-building-code-2/",
+        "publisher": "Dubai Municipality",
+        "source_scope": "Building design, safety, welfare, environmental and construction requirements",
+        "retrieval_text": "Palm Jumeirah is a Dubai community. This synthetic benchmark record describes a 3-bedroom townhouse with approximately 196 sq ft, an estimated sale price of AED 6,584,000, and estimated annual rent of AED 375,300. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0026",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Dubai Hills Estate",
+      "district": "New Dubai",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 1,
+        "area_sqft": 233,
+        "estimated_sale_price_aed": 4502000,
+        "estimated_annual_rent_aed": 202600,
+        "price_per_sqft_aed": 19321.89,
+        "parking_spaces": 1,
+        "status": "under_construction"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Dubai Hills Mall",
+          "Dubai Hills Park"
+        ],
+        "amenities": [
+          "Schools",
+          "park",
+          "golf",
+          "retail"
+        ],
+        "market_position": "mid_market"
+      },
+      "rag": {
+        "document_id": "DLD-RE-2024-ANNUAL",
+        "document_title": "Annual Report: Real Estate Sector Performance 2024",
+        "document_type": "PDF",
+        "document_url": "https://dubailand.gov.ae/media/c5ejvvoe/annual_report_2024_english.pdf",
+        "source_page": "https://dubailand.gov.ae/en/open-data/research/annual-report-real-estate-sector-performance-2024/",
+        "publisher": "Dubai Land Department",
+        "source_scope": "Dubai-wide real estate market performance, prices, transactions and market analysis",
+        "retrieval_text": "Dubai Hills Estate is a Dubai community. This synthetic benchmark record describes a 1-bedroom apartment with approximately 233 sq ft, an estimated sale price of AED 4,502,000, and estimated annual rent of AED 202,600. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0027",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Dubai Creek Harbour",
+      "district": "Dubai Creek",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 2,
+        "area_sqft": 270,
+        "estimated_sale_price_aed": 3120000,
+        "estimated_annual_rent_aed": 149800,
+        "price_per_sqft_aed": 11555.56,
+        "parking_spaces": 1,
+        "status": "ready"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Creek Beach",
+          "Dubai Creek"
+        ],
+        "amenities": [
+          "Waterfront",
+          "retail",
+          "planned transit"
+        ],
+        "market_position": "growth"
+      },
+      "rag": {
+        "document_id": "DLD-RE-DATA",
+        "document_title": "Dubai Land Department Real Estate Data",
+        "document_type": "Web dataset",
+        "document_url": "https://dubailand.gov.ae/en/open-data/real-estate-data/",
+        "source_page": "https://dubailand.gov.ae/en/open-data/real-estate-data/",
+        "publisher": "Dubai Land Department",
+        "source_scope": "Transactions, rents, projects, valuations, land, buildings, units, brokers and developers",
+        "retrieval_text": "Dubai Creek Harbour is a Dubai community. This synthetic benchmark record describes a 2-bedroom apartment with approximately 270 sq ft, an estimated sale price of AED 3,120,000, and estimated annual rent of AED 149,800. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0028",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Arabian Ranches",
+      "district": "Dubailand",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 3,
+        "area_sqft": 307,
+        "estimated_sale_price_aed": 4387000,
+        "estimated_annual_rent_aed": 223700,
+        "price_per_sqft_aed": 14289.9,
+        "parking_spaces": 2,
+        "status": "off_plan"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Arabian Ranches Golf Club"
+        ],
+        "amenities": [
+          "Schools",
+          "golf",
+          "parks",
+          "community retail"
+        ],
+        "market_position": "luxury"
+      },
+      "rag": {
+        "document_id": "DLD-PULSE-TRANS",
+        "document_title": "DLD Transactions Open Dataset",
+        "document_type": "Open-data dataset",
+        "document_url": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_transactions-open",
+        "source_page": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_transactions-open",
+        "publisher": "Dubai Land Department via Dubai Pulse",
+        "source_scope": "Real-estate transactions and related property attributes",
+        "retrieval_text": "Arabian Ranches is a Dubai community. This synthetic benchmark record describes a 3-bedroom apartment with approximately 307 sq ft, an estimated sale price of AED 4,387,000, and estimated annual rent of AED 223,700. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0029",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Jumeirah Lake Towers",
+      "district": "New Dubai",
+      "property": {
+        "property_type": "villa",
+        "usage": "residential",
+        "bedrooms": 4,
+        "area_sqft": 94,
+        "estimated_sale_price_aed": 895000,
+        "estimated_annual_rent_aed": 48300,
+        "price_per_sqft_aed": 9521.28,
+        "parking_spaces": 1,
+        "status": "ready"
+      },
+      "community_profile": {
+        "landmarks": [
+          "DMCC",
+          "JLT Lakes"
+        ],
+        "amenities": [
+          "Metro",
+          "lakes",
+          "offices",
+          "retail"
+        ],
+        "market_position": "premium"
+      },
+      "rag": {
+        "document_id": "DLD-PULSE-AREAS",
+        "document_title": "DLD Dubai Communities Lookup Dataset",
+        "document_type": "Open-data dataset",
+        "document_url": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_lkp_areas-open-api",
+        "source_page": "https://www.gslb.dubaipulse.gov.ae/organisation/dld/service/dld-transactions",
+        "publisher": "Dubai Land Department via Dubai Pulse",
+        "source_scope": "Lookup data for Dubai communities/areas",
+        "retrieval_text": "Jumeirah Lake Towers is a Dubai community. This synthetic benchmark record describes a 4-bedroom villa with approximately 94 sq ft, an estimated sale price of AED 895,000, and estimated annual rent of AED 48,300. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0030",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Dubai Sports City",
+      "district": "Dubailand",
+      "property": {
+        "property_type": "townhouse",
+        "usage": "residential",
+        "bedrooms": 3,
+        "area_sqft": 131,
+        "estimated_sale_price_aed": 1016000,
+        "estimated_annual_rent_aed": 57900,
+        "price_per_sqft_aed": 7755.73,
+        "parking_spaces": 1,
+        "status": "under_construction"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Dubai International Stadium"
+        ],
+        "amenities": [
+          "Sports facilities",
+          "schools",
+          "retail"
+        ],
+        "market_position": "mid_market"
+      },
+      "rag": {
+        "document_id": "DM-BUILDING-CODE",
+        "document_title": "Dubai Building Code",
+        "document_type": "Document / web reference",
+        "document_url": "https://www.dm.gov.ae/municipality-business/planning-and-construction/dubai-building-code-2/",
+        "source_page": "https://www.dm.gov.ae/municipality-business/planning-and-construction/dubai-building-code-2/",
+        "publisher": "Dubai Municipality",
+        "source_scope": "Building design, safety, welfare, environmental and construction requirements",
+        "retrieval_text": "Dubai Sports City is a Dubai community. This synthetic benchmark record describes a 3-bedroom townhouse with approximately 131 sq ft, an estimated sale price of AED 1,016,000, and estimated annual rent of AED 57,900. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0031",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Downtown Dubai",
+      "district": "Central Dubai",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 1,
+        "area_sqft": 168,
+        "estimated_sale_price_aed": 3022000,
+        "estimated_annual_rent_aed": 136000,
+        "price_per_sqft_aed": 17988.1,
+        "parking_spaces": 2,
+        "status": "ready"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Burj Khalifa",
+          "Dubai Mall"
+        ],
+        "amenities": [
+          "Metro",
+          "Tram/Bus",
+          "retail",
+          "dining"
+        ],
+        "market_position": "growth"
+      },
+      "rag": {
+        "document_id": "DLD-RE-2024-ANNUAL",
+        "document_title": "Annual Report: Real Estate Sector Performance 2024",
+        "document_type": "PDF",
+        "document_url": "https://dubailand.gov.ae/media/c5ejvvoe/annual_report_2024_english.pdf",
+        "source_page": "https://dubailand.gov.ae/en/open-data/research/annual-report-real-estate-sector-performance-2024/",
+        "publisher": "Dubai Land Department",
+        "source_scope": "Dubai-wide real estate market performance, prices, transactions and market analysis",
+        "retrieval_text": "Downtown Dubai is a Dubai community. This synthetic benchmark record describes a 1-bedroom apartment with approximately 168 sq ft, an estimated sale price of AED 3,022,000, and estimated annual rent of AED 136,000. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0032",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Dubai Marina",
+      "district": "New Dubai",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 2,
+        "area_sqft": 205,
+        "estimated_sale_price_aed": 4248000,
+        "estimated_annual_rent_aed": 203900,
+        "price_per_sqft_aed": 20721.95,
+        "parking_spaces": 1,
+        "status": "off_plan"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Dubai Marina Walk",
+          "Marina Mall"
+        ],
+        "amenities": [
+          "Metro",
+          "Tram",
+          "waterfront",
+          "dining"
+        ],
+        "market_position": "luxury"
+      },
+      "rag": {
+        "document_id": "DLD-RE-DATA",
+        "document_title": "Dubai Land Department Real Estate Data",
+        "document_type": "Web dataset",
+        "document_url": "https://dubailand.gov.ae/en/open-data/real-estate-data/",
+        "source_page": "https://dubailand.gov.ae/en/open-data/real-estate-data/",
+        "publisher": "Dubai Land Department",
+        "source_scope": "Transactions, rents, projects, valuations, land, buildings, units, brokers and developers",
+        "retrieval_text": "Dubai Marina is a Dubai community. This synthetic benchmark record describes a 2-bedroom apartment with approximately 205 sq ft, an estimated sale price of AED 4,248,000, and estimated annual rent of AED 203,900. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0033",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Jumeirah Village Circle",
+      "district": "New Dubai",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 3,
+        "area_sqft": 242,
+        "estimated_sale_price_aed": 2650000,
+        "estimated_annual_rent_aed": 135200,
+        "price_per_sqft_aed": 10950.41,
+        "parking_spaces": 1,
+        "status": "ready"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Circle Mall"
+        ],
+        "amenities": [
+          "Bus",
+          "retail",
+          "schools",
+          "parks"
+        ],
+        "market_position": "premium"
+      },
+      "rag": {
+        "document_id": "DLD-PULSE-TRANS",
+        "document_title": "DLD Transactions Open Dataset",
+        "document_type": "Open-data dataset",
+        "document_url": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_transactions-open",
+        "source_page": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_transactions-open",
+        "publisher": "Dubai Land Department via Dubai Pulse",
+        "source_scope": "Real-estate transactions and related property attributes",
+        "retrieval_text": "Jumeirah Village Circle is a Dubai community. This synthetic benchmark record describes a 3-bedroom apartment with approximately 242 sq ft, an estimated sale price of AED 2,650,000, and estimated annual rent of AED 135,200. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0034",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Business Bay",
+      "district": "Central Dubai",
+      "property": {
+        "property_type": "villa",
+        "usage": "residential",
+        "bedrooms": 4,
+        "area_sqft": 279,
+        "estimated_sale_price_aed": 2842000,
+        "estimated_annual_rent_aed": 153500,
+        "price_per_sqft_aed": 10186.38,
+        "parking_spaces": 2,
+        "status": "under_construction"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Dubai Canal",
+          "Bay Avenue"
+        ],
+        "amenities": [
+          "Metro",
+          "canal",
+          "offices",
+          "retail"
+        ],
+        "market_position": "mid_market"
+      },
+      "rag": {
+        "document_id": "DLD-PULSE-AREAS",
+        "document_title": "DLD Dubai Communities Lookup Dataset",
+        "document_type": "Open-data dataset",
+        "document_url": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_lkp_areas-open-api",
+        "source_page": "https://www.gslb.dubaipulse.gov.ae/organisation/dld/service/dld-transactions",
+        "publisher": "Dubai Land Department via Dubai Pulse",
+        "source_scope": "Lookup data for Dubai communities/areas",
+        "retrieval_text": "Business Bay is a Dubai community. This synthetic benchmark record describes a 4-bedroom villa with approximately 279 sq ft, an estimated sale price of AED 2,842,000, and estimated annual rent of AED 153,500. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0035",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Palm Jumeirah",
+      "district": "Coastal Dubai",
+      "property": {
+        "property_type": "townhouse",
+        "usage": "residential",
+        "bedrooms": 3,
+        "area_sqft": 66,
+        "estimated_sale_price_aed": 1447000,
+        "estimated_annual_rent_aed": 82500,
+        "price_per_sqft_aed": 21924.24,
+        "parking_spaces": 1,
+        "status": "ready"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Atlantis",
+          "Palm West Beach"
+        ],
+        "amenities": [
+          "Monorail",
+          "beach",
+          "resorts"
+        ],
+        "market_position": "growth"
+      },
+      "rag": {
+        "document_id": "DM-BUILDING-CODE",
+        "document_title": "Dubai Building Code",
+        "document_type": "Document / web reference",
+        "document_url": "https://www.dm.gov.ae/municipality-business/planning-and-construction/dubai-building-code-2/",
+        "source_page": "https://www.dm.gov.ae/municipality-business/planning-and-construction/dubai-building-code-2/",
+        "publisher": "Dubai Municipality",
+        "source_scope": "Building design, safety, welfare, environmental and construction requirements",
+        "retrieval_text": "Palm Jumeirah is a Dubai community. This synthetic benchmark record describes a 3-bedroom townhouse with approximately 66 sq ft, an estimated sale price of AED 1,447,000, and estimated annual rent of AED 82,500. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0036",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Dubai Hills Estate",
+      "district": "New Dubai",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 1,
+        "area_sqft": 103,
+        "estimated_sale_price_aed": 1715000,
+        "estimated_annual_rent_aed": 77200,
+        "price_per_sqft_aed": 16650.49,
+        "parking_spaces": 1,
+        "status": "off_plan"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Dubai Hills Mall",
+          "Dubai Hills Park"
+        ],
+        "amenities": [
+          "Schools",
+          "park",
+          "golf",
+          "retail"
+        ],
+        "market_position": "luxury"
+      },
+      "rag": {
+        "document_id": "DLD-RE-2024-ANNUAL",
+        "document_title": "Annual Report: Real Estate Sector Performance 2024",
+        "document_type": "PDF",
+        "document_url": "https://dubailand.gov.ae/media/c5ejvvoe/annual_report_2024_english.pdf",
+        "source_page": "https://dubailand.gov.ae/en/open-data/research/annual-report-real-estate-sector-performance-2024/",
+        "publisher": "Dubai Land Department",
+        "source_scope": "Dubai-wide real estate market performance, prices, transactions and market analysis",
+        "retrieval_text": "Dubai Hills Estate is a Dubai community. This synthetic benchmark record describes a 1-bedroom apartment with approximately 103 sq ft, an estimated sale price of AED 1,715,000, and estimated annual rent of AED 77,200. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0037",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Dubai Creek Harbour",
+      "district": "Dubai Creek",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 2,
+        "area_sqft": 140,
+        "estimated_sale_price_aed": 1454000,
+        "estimated_annual_rent_aed": 69800,
+        "price_per_sqft_aed": 10385.71,
+        "parking_spaces": 2,
+        "status": "ready"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Creek Beach",
+          "Dubai Creek"
+        ],
+        "amenities": [
+          "Waterfront",
+          "retail",
+          "planned transit"
+        ],
+        "market_position": "premium"
+      },
+      "rag": {
+        "document_id": "DLD-RE-DATA",
+        "document_title": "Dubai Land Department Real Estate Data",
+        "document_type": "Web dataset",
+        "document_url": "https://dubailand.gov.ae/en/open-data/real-estate-data/",
+        "source_page": "https://dubailand.gov.ae/en/open-data/real-estate-data/",
+        "publisher": "Dubai Land Department",
+        "source_scope": "Transactions, rents, projects, valuations, land, buildings, units, brokers and developers",
+        "retrieval_text": "Dubai Creek Harbour is a Dubai community. This synthetic benchmark record describes a 2-bedroom apartment with approximately 140 sq ft, an estimated sale price of AED 1,454,000, and estimated annual rent of AED 69,800. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0038",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Arabian Ranches",
+      "district": "Dubailand",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 3,
+        "area_sqft": 177,
+        "estimated_sale_price_aed": 2587000,
+        "estimated_annual_rent_aed": 131900,
+        "price_per_sqft_aed": 14615.82,
+        "parking_spaces": 1,
+        "status": "under_construction"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Arabian Ranches Golf Club"
+        ],
+        "amenities": [
+          "Schools",
+          "golf",
+          "parks",
+          "community retail"
+        ],
+        "market_position": "mid_market"
+      },
+      "rag": {
+        "document_id": "DLD-PULSE-TRANS",
+        "document_title": "DLD Transactions Open Dataset",
+        "document_type": "Open-data dataset",
+        "document_url": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_transactions-open",
+        "source_page": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_transactions-open",
+        "publisher": "Dubai Land Department via Dubai Pulse",
+        "source_scope": "Real-estate transactions and related property attributes",
+        "retrieval_text": "Arabian Ranches is a Dubai community. This synthetic benchmark record describes a 3-bedroom apartment with approximately 177 sq ft, an estimated sale price of AED 2,587,000, and estimated annual rent of AED 131,900. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0039",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Jumeirah Lake Towers",
+      "district": "New Dubai",
+      "property": {
+        "property_type": "villa",
+        "usage": "residential",
+        "bedrooms": 4,
+        "area_sqft": 214,
+        "estimated_sale_price_aed": 2215000,
+        "estimated_annual_rent_aed": 119600,
+        "price_per_sqft_aed": 10350.47,
+        "parking_spaces": 1,
+        "status": "ready"
+      },
+      "community_profile": {
+        "landmarks": [
+          "DMCC",
+          "JLT Lakes"
+        ],
+        "amenities": [
+          "Metro",
+          "lakes",
+          "offices",
+          "retail"
+        ],
+        "market_position": "growth"
+      },
+      "rag": {
+        "document_id": "DLD-PULSE-AREAS",
+        "document_title": "DLD Dubai Communities Lookup Dataset",
+        "document_type": "Open-data dataset",
+        "document_url": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_lkp_areas-open-api",
+        "source_page": "https://www.gslb.dubaipulse.gov.ae/organisation/dld/service/dld-transactions",
+        "publisher": "Dubai Land Department via Dubai Pulse",
+        "source_scope": "Lookup data for Dubai communities/areas",
+        "retrieval_text": "Jumeirah Lake Towers is a Dubai community. This synthetic benchmark record describes a 4-bedroom villa with approximately 214 sq ft, an estimated sale price of AED 2,215,000, and estimated annual rent of AED 119,600. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0040",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Dubai Sports City",
+      "district": "Dubailand",
+      "property": {
+        "property_type": "townhouse",
+        "usage": "residential",
+        "bedrooms": 3,
+        "area_sqft": 251,
+        "estimated_sale_price_aed": 1777000,
+        "estimated_annual_rent_aed": 101300,
+        "price_per_sqft_aed": 7079.68,
+        "parking_spaces": 2,
+        "status": "off_plan"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Dubai International Stadium"
+        ],
+        "amenities": [
+          "Sports facilities",
+          "schools",
+          "retail"
+        ],
+        "market_position": "luxury"
+      },
+      "rag": {
+        "document_id": "DM-BUILDING-CODE",
+        "document_title": "Dubai Building Code",
+        "document_type": "Document / web reference",
+        "document_url": "https://www.dm.gov.ae/municipality-business/planning-and-construction/dubai-building-code-2/",
+        "source_page": "https://www.dm.gov.ae/municipality-business/planning-and-construction/dubai-building-code-2/",
+        "publisher": "Dubai Municipality",
+        "source_scope": "Building design, safety, welfare, environmental and construction requirements",
+        "retrieval_text": "Dubai Sports City is a Dubai community. This synthetic benchmark record describes a 3-bedroom townhouse with approximately 251 sq ft, an estimated sale price of AED 1,777,000, and estimated annual rent of AED 101,300. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0041",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Downtown Dubai",
+      "district": "Central Dubai",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 1,
+        "area_sqft": 288,
+        "estimated_sale_price_aed": 7292000,
+        "estimated_annual_rent_aed": 328100,
+        "price_per_sqft_aed": 25319.44,
+        "parking_spaces": 1,
+        "status": "ready"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Burj Khalifa",
+          "Dubai Mall"
+        ],
+        "amenities": [
+          "Metro",
+          "Tram/Bus",
+          "retail",
+          "dining"
+        ],
+        "market_position": "premium"
+      },
+      "rag": {
+        "document_id": "DLD-RE-2024-ANNUAL",
+        "document_title": "Annual Report: Real Estate Sector Performance 2024",
+        "document_type": "PDF",
+        "document_url": "https://dubailand.gov.ae/media/c5ejvvoe/annual_report_2024_english.pdf",
+        "source_page": "https://dubailand.gov.ae/en/open-data/research/annual-report-real-estate-sector-performance-2024/",
+        "publisher": "Dubai Land Department",
+        "source_scope": "Dubai-wide real estate market performance, prices, transactions and market analysis",
+        "retrieval_text": "Downtown Dubai is a Dubai community. This synthetic benchmark record describes a 1-bedroom apartment with approximately 288 sq ft, an estimated sale price of AED 7,292,000, and estimated annual rent of AED 328,100. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0042",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Dubai Marina",
+      "district": "New Dubai",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 2,
+        "area_sqft": 75,
+        "estimated_sale_price_aed": 1129000,
+        "estimated_annual_rent_aed": 54200,
+        "price_per_sqft_aed": 15053.33,
+        "parking_spaces": 1,
+        "status": "under_construction"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Dubai Marina Walk",
+          "Marina Mall"
+        ],
+        "amenities": [
+          "Metro",
+          "Tram",
+          "waterfront",
+          "dining"
+        ],
+        "market_position": "mid_market"
+      },
+      "rag": {
+        "document_id": "DLD-RE-DATA",
+        "document_title": "Dubai Land Department Real Estate Data",
+        "document_type": "Web dataset",
+        "document_url": "https://dubailand.gov.ae/en/open-data/real-estate-data/",
+        "source_page": "https://dubailand.gov.ae/en/open-data/real-estate-data/",
+        "publisher": "Dubai Land Department",
+        "source_scope": "Transactions, rents, projects, valuations, land, buildings, units, brokers and developers",
+        "retrieval_text": "Dubai Marina is a Dubai community. This synthetic benchmark record describes a 2-bedroom apartment with approximately 75 sq ft, an estimated sale price of AED 1,129,000, and estimated annual rent of AED 54,200. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0043",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Jumeirah Village Circle",
+      "district": "New Dubai",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 3,
+        "area_sqft": 112,
+        "estimated_sale_price_aed": 927000,
+        "estimated_annual_rent_aed": 47300,
+        "price_per_sqft_aed": 8276.79,
+        "parking_spaces": 2,
+        "status": "ready"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Circle Mall"
+        ],
+        "amenities": [
+          "Bus",
+          "retail",
+          "schools",
+          "parks"
+        ],
+        "market_position": "growth"
+      },
+      "rag": {
+        "document_id": "DLD-PULSE-TRANS",
+        "document_title": "DLD Transactions Open Dataset",
+        "document_type": "Open-data dataset",
+        "document_url": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_transactions-open",
+        "source_page": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_transactions-open",
+        "publisher": "Dubai Land Department via Dubai Pulse",
+        "source_scope": "Real-estate transactions and related property attributes",
+        "retrieval_text": "Jumeirah Village Circle is a Dubai community. This synthetic benchmark record describes a 3-bedroom apartment with approximately 112 sq ft, an estimated sale price of AED 927,000, and estimated annual rent of AED 47,300. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0044",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Business Bay",
+      "district": "Central Dubai",
+      "property": {
+        "property_type": "villa",
+        "usage": "residential",
+        "bedrooms": 4,
+        "area_sqft": 149,
+        "estimated_sale_price_aed": 2610000,
+        "estimated_annual_rent_aed": 140900,
+        "price_per_sqft_aed": 17516.78,
+        "parking_spaces": 1,
+        "status": "off_plan"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Dubai Canal",
+          "Bay Avenue"
+        ],
+        "amenities": [
+          "Metro",
+          "canal",
+          "offices",
+          "retail"
+        ],
+        "market_position": "luxury"
+      },
+      "rag": {
+        "document_id": "DLD-PULSE-AREAS",
+        "document_title": "DLD Dubai Communities Lookup Dataset",
+        "document_type": "Open-data dataset",
+        "document_url": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_lkp_areas-open-api",
+        "source_page": "https://www.gslb.dubaipulse.gov.ae/organisation/dld/service/dld-transactions",
+        "publisher": "Dubai Land Department via Dubai Pulse",
+        "source_scope": "Lookup data for Dubai communities/areas",
+        "retrieval_text": "Business Bay is a Dubai community. This synthetic benchmark record describes a 4-bedroom villa with approximately 149 sq ft, an estimated sale price of AED 2,610,000, and estimated annual rent of AED 140,900. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0045",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Palm Jumeirah",
+      "district": "Coastal Dubai",
+      "property": {
+        "property_type": "townhouse",
+        "usage": "residential",
+        "bedrooms": 3,
+        "area_sqft": 186,
+        "estimated_sale_price_aed": 5441000,
+        "estimated_annual_rent_aed": 310100,
+        "price_per_sqft_aed": 29252.69,
+        "parking_spaces": 1,
+        "status": "ready"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Atlantis",
+          "Palm West Beach"
+        ],
+        "amenities": [
+          "Monorail",
+          "beach",
+          "resorts"
+        ],
+        "market_position": "premium"
+      },
+      "rag": {
+        "document_id": "DM-BUILDING-CODE",
+        "document_title": "Dubai Building Code",
+        "document_type": "Document / web reference",
+        "document_url": "https://www.dm.gov.ae/municipality-business/planning-and-construction/dubai-building-code-2/",
+        "source_page": "https://www.dm.gov.ae/municipality-business/planning-and-construction/dubai-building-code-2/",
+        "publisher": "Dubai Municipality",
+        "source_scope": "Building design, safety, welfare, environmental and construction requirements",
+        "retrieval_text": "Palm Jumeirah is a Dubai community. This synthetic benchmark record describes a 3-bedroom townhouse with approximately 186 sq ft, an estimated sale price of AED 5,441,000, and estimated annual rent of AED 310,100. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0046",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Dubai Hills Estate",
+      "district": "New Dubai",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 1,
+        "area_sqft": 223,
+        "estimated_sale_price_aed": 3118000,
+        "estimated_annual_rent_aed": 140300,
+        "price_per_sqft_aed": 13982.06,
+        "parking_spaces": 2,
+        "status": "under_construction"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Dubai Hills Mall",
+          "Dubai Hills Park"
+        ],
+        "amenities": [
+          "Schools",
+          "park",
+          "golf",
+          "retail"
+        ],
+        "market_position": "mid_market"
+      },
+      "rag": {
+        "document_id": "DLD-RE-2024-ANNUAL",
+        "document_title": "Annual Report: Real Estate Sector Performance 2024",
+        "document_type": "PDF",
+        "document_url": "https://dubailand.gov.ae/media/c5ejvvoe/annual_report_2024_english.pdf",
+        "source_page": "https://dubailand.gov.ae/en/open-data/research/annual-report-real-estate-sector-performance-2024/",
+        "publisher": "Dubai Land Department",
+        "source_scope": "Dubai-wide real estate market performance, prices, transactions and market analysis",
+        "retrieval_text": "Dubai Hills Estate is a Dubai community. This synthetic benchmark record describes a 1-bedroom apartment with approximately 223 sq ft, an estimated sale price of AED 3,118,000, and estimated annual rent of AED 140,300. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0047",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Dubai Creek Harbour",
+      "district": "Dubai Creek",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 2,
+        "area_sqft": 260,
+        "estimated_sale_price_aed": 4606000,
+        "estimated_annual_rent_aed": 221100,
+        "price_per_sqft_aed": 17715.38,
+        "parking_spaces": 1,
+        "status": "ready"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Creek Beach",
+          "Dubai Creek"
+        ],
+        "amenities": [
+          "Waterfront",
+          "retail",
+          "planned transit"
+        ],
+        "market_position": "growth"
+      },
+      "rag": {
+        "document_id": "DLD-RE-DATA",
+        "document_title": "Dubai Land Department Real Estate Data",
+        "document_type": "Web dataset",
+        "document_url": "https://dubailand.gov.ae/en/open-data/real-estate-data/",
+        "source_page": "https://dubailand.gov.ae/en/open-data/real-estate-data/",
+        "publisher": "Dubai Land Department",
+        "source_scope": "Transactions, rents, projects, valuations, land, buildings, units, brokers and developers",
+        "retrieval_text": "Dubai Creek Harbour is a Dubai community. This synthetic benchmark record describes a 2-bedroom apartment with approximately 260 sq ft, an estimated sale price of AED 4,606,000, and estimated annual rent of AED 221,100. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0048",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Arabian Ranches",
+      "district": "Dubailand",
+      "property": {
+        "property_type": "apartment",
+        "usage": "residential",
+        "bedrooms": 3,
+        "area_sqft": 297,
+        "estimated_sale_price_aed": 4439000,
+        "estimated_annual_rent_aed": 226400,
+        "price_per_sqft_aed": 14946.13,
+        "parking_spaces": 1,
+        "status": "off_plan"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Arabian Ranches Golf Club"
+        ],
+        "amenities": [
+          "Schools",
+          "golf",
+          "parks",
+          "community retail"
+        ],
+        "market_position": "luxury"
+      },
+      "rag": {
+        "document_id": "DLD-PULSE-TRANS",
+        "document_title": "DLD Transactions Open Dataset",
+        "document_type": "Open-data dataset",
+        "document_url": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_transactions-open",
+        "source_page": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_transactions-open",
+        "publisher": "Dubai Land Department via Dubai Pulse",
+        "source_scope": "Real-estate transactions and related property attributes",
+        "retrieval_text": "Arabian Ranches is a Dubai community. This synthetic benchmark record describes a 3-bedroom apartment with approximately 297 sq ft, an estimated sale price of AED 4,439,000, and estimated annual rent of AED 226,400. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0049",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Jumeirah Lake Towers",
+      "district": "New Dubai",
+      "property": {
+        "property_type": "villa",
+        "usage": "residential",
+        "bedrooms": 4,
+        "area_sqft": 84,
+        "estimated_sale_price_aed": 939000,
+        "estimated_annual_rent_aed": 50700,
+        "price_per_sqft_aed": 11178.57,
+        "parking_spaces": 2,
+        "status": "ready"
+      },
+      "community_profile": {
+        "landmarks": [
+          "DMCC",
+          "JLT Lakes"
+        ],
+        "amenities": [
+          "Metro",
+          "lakes",
+          "offices",
+          "retail"
+        ],
+        "market_position": "premium"
+      },
+      "rag": {
+        "document_id": "DLD-PULSE-AREAS",
+        "document_title": "DLD Dubai Communities Lookup Dataset",
+        "document_type": "Open-data dataset",
+        "document_url": "https://www.gslb.dubaipulse.gov.ae/data/dld-transactions/dld_lkp_areas-open-api",
+        "source_page": "https://www.gslb.dubaipulse.gov.ae/organisation/dld/service/dld-transactions",
+        "publisher": "Dubai Land Department via Dubai Pulse",
+        "source_scope": "Lookup data for Dubai communities/areas",
+        "retrieval_text": "Jumeirah Lake Towers is a Dubai community. This synthetic benchmark record describes a 4-bedroom villa with approximately 84 sq ft, an estimated sale price of AED 939,000, and estimated annual rent of AED 50,700. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    },
+    {
+      "id": "DX-RE-0050",
+      "data_status": "synthetic_rag_benchmark",
+      "country": "United Arab Emirates",
+      "emirate": "Dubai",
+      "city": "Dubai",
+      "community": "Dubai Sports City",
+      "district": "Dubailand",
+      "property": {
+        "property_type": "townhouse",
+        "usage": "residential",
+        "bedrooms": 3,
+        "area_sqft": 121,
+        "estimated_sale_price_aed": 1259000,
+        "estimated_annual_rent_aed": 71800,
+        "price_per_sqft_aed": 10404.96,
+        "parking_spaces": 1,
+        "status": "under_construction"
+      },
+      "community_profile": {
+        "landmarks": [
+          "Dubai International Stadium"
+        ],
+        "amenities": [
+          "Sports facilities",
+          "schools",
+          "retail"
+        ],
+        "market_position": "mid_market"
+      },
+      "rag": {
+        "document_id": "DM-BUILDING-CODE",
+        "document_title": "Dubai Building Code",
+        "document_type": "Document / web reference",
+        "document_url": "https://www.dm.gov.ae/municipality-business/planning-and-construction/dubai-building-code-2/",
+        "source_page": "https://www.dm.gov.ae/municipality-business/planning-and-construction/dubai-building-code-2/",
+        "publisher": "Dubai Municipality",
+        "source_scope": "Building design, safety, welfare, environmental and construction requirements",
+        "retrieval_text": "Dubai Sports City is a Dubai community. This synthetic benchmark record describes a 3-bedroom townhouse with approximately 121 sq ft, an estimated sale price of AED 1,259,000, and estimated annual rent of AED 71,800. Use the linked source document for authoritative Dubai-wide or dataset-level context.",
+        "source_note": "The property figures in this record are synthetic and must not be presented as an official DLD transaction."
+      }
+    }
+  ]
+}
