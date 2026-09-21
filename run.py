@@ -1,6 +1,7 @@
 import os
 import io
 import time
+import json
 from contextlib import redirect_stdout, redirect_stderr
 from dotenv import load_dotenv
 
@@ -84,6 +85,15 @@ from app.rag.chains.hybrid_rag_chain import (
 
 
 # =========================================================
+# CONVERSATIONAL MEMORY
+# =========================================================
+
+from app.memory.conversation_memory import (
+    ConversationMemory
+)
+
+
+# =========================================================
 # INITIALIZE ACOT
 # =========================================================
 
@@ -116,6 +126,10 @@ def initialize_acot():
 
     rag_chain = HybridRAGChain()
 
+    conversation_memory = ConversationMemory(
+        llm_client=query_planner._llm_client
+    )
+
     return {
         "structured_retriever": structured_retriever,
         "query_planner": query_planner,
@@ -124,7 +138,8 @@ def initialize_acot():
         "hybrid_retriever": hybrid_retriever,
         "context_builder": context_builder,
         "investment_analyzer": investment_analyzer,
-        "rag_chain": rag_chain
+        "rag_chain": rag_chain,
+        "conversation_memory": conversation_memory
     }
 
 
@@ -549,6 +564,362 @@ def print_entity_resolution(entity):
 
 
 # =========================================================
+# FRONTEND-READY RESPONSE FORMATTER
+# =========================================================
+
+def _json_safe(value):
+    """
+    Convert backend/database values into JSON-safe Python values.
+
+    This keeps the existing retrieval data untouched while making the
+    final response safe for a REST API or frontend client.
+    """
+
+    if value is None:
+        return None
+
+    if isinstance(value, (str, int, float, bool)):
+        return value
+
+    if isinstance(value, (list, tuple)):
+        return [
+            _json_safe(item)
+            for item in value
+        ]
+
+    if isinstance(value, dict):
+        return {
+            str(key): _json_safe(item)
+            for key, item in value.items()
+        }
+
+    # Handles Decimal, datetime, UUID, and other database values.
+    return str(value)
+
+
+def _format_bedrooms(record):
+    """
+    Return the bedroom range exactly from the available project data.
+    """
+
+    minimum = record.get("bedroom_min")
+    maximum = record.get("bedroom_max")
+
+    if minimum is None and maximum is None:
+        return None
+
+    if minimum is None:
+        return str(maximum)
+
+    if maximum is None:
+        return str(minimum)
+
+    if minimum == maximum:
+        return str(minimum)
+
+    return f"{minimum}-{maximum}"
+
+
+def _format_project_card(record):
+    """
+    Convert a project database row into a frontend-friendly project card.
+
+    Only fields that exist in the current database are exposed.
+    No rental yield, fair value, deal score, ROI, or other missing
+    investment metrics are invented here.
+    """
+
+    return {
+        "id": _json_safe(record.get("id")),
+        "name": record.get("name"),
+        "developer": record.get("developer_name"),
+        "developer_id": _json_safe(record.get("developer_id")),
+        "city": record.get("city"),
+        "community": record.get("community"),
+        "sub_community": record.get("sub_community"),
+        "price": _json_safe(record.get("price")),
+        "price_label": (
+            f"AED {record.get('price')}"
+            if record.get("price") is not None
+            else None
+        ),
+        "bedrooms": {
+            "min": _json_safe(record.get("bedroom_min")),
+            "max": _json_safe(record.get("bedroom_max")),
+            "label": _format_bedrooms(record),
+        },
+        "size_sqft": {
+            "min": _json_safe(record.get("size_min")),
+            "max": _json_safe(record.get("size_max")),
+        },
+        "property_types": _json_safe(
+            record.get("property_types") or []
+        ),
+        "status": record.get("status"),
+        "project_status": record.get("project_status"),
+        "pool_type": record.get("pool_type"),
+        "handover_time": _json_safe(
+            record.get("handover_time")
+        ),
+        "amenities": _json_safe(
+            record.get("amenities") or []
+        ),
+        "photos": _json_safe(
+            record.get("photos") or []
+        ),
+        "description": record.get("description"),
+        "brochure_url": record.get("brochure_url"),
+        "property_finder_url": record.get(
+            "property_finder_url"
+        ),
+        "source": record.get("source"),
+    }
+
+
+def _format_community_card(record):
+    """
+    Convert a community database row into a frontend-friendly card.
+    """
+
+    return {
+        "id": _json_safe(record.get("id")),
+        "name": record.get("name"),
+        "slug": record.get("slug"),
+        "city": record.get("city"),
+        "location": {
+            "latitude": _json_safe(record.get("latitude")),
+            "longitude": _json_safe(record.get("longitude")),
+        },
+        "inventory": {
+            "sell_properties_count": _json_safe(
+                record.get("sell_properties_count")
+            ),
+            "rent_properties_count": _json_safe(
+                record.get("rent_properties_count")
+            ),
+            "projects_count": _json_safe(
+                record.get("projects_count")
+            ),
+            "pool_projects_count": _json_safe(
+                record.get("pool_projects_count")
+            ),
+            "total_count": _json_safe(
+                record.get("total_count")
+            ),
+        },
+        "assigned_agents": _json_safe(
+            record.get("assigned_agents")
+        ),
+        "knowledge_text": record.get("knowledge_text"),
+        "source": record.get("source"),
+    }
+
+
+def _format_sub_community_card(record):
+    """
+    Convert a sub-community database row into a frontend-friendly card.
+    """
+
+    return {
+        "id": _json_safe(record.get("id")),
+        "name": record.get("name"),
+        "slug": record.get("slug"),
+        "city": record.get("city"),
+        "community": record.get("community"),
+        "community_slug": record.get("community_slug"),
+        "location": {
+            "latitude": _json_safe(record.get("latitude")),
+            "longitude": _json_safe(record.get("longitude")),
+        },
+        "photos": _json_safe(
+            record.get("photos") or []
+        ),
+        "knowledge_text": record.get("knowledge_text"),
+        "source": record.get("source"),
+    }
+
+
+def _format_document_card(record):
+    """
+    Convert a pgvector document result into a frontend-friendly source.
+    """
+
+    return {
+        "id": _json_safe(record.get("id")),
+        "document_id": _json_safe(
+            record.get("document_id")
+        ),
+        "title": record.get("document_title"),
+        "type": record.get("document_type"),
+        "publisher": record.get("publisher"),
+        "chunk_id": record.get("chunk_id"),
+        "similarity": _json_safe(
+            record.get("similarity")
+        ),
+        "url": record.get("document_url"),
+        "content": record.get("content"),
+    }
+
+
+def _detect_response_type(
+    question,
+    question_type,
+    structured_summary
+):
+    """
+    Determine the frontend response component from the actual result.
+
+    This is presentation metadata only. It does not affect retrieval.
+    """
+
+    question_lower = (question or "").lower()
+
+    projects = structured_summary.get(
+        "projects",
+        []
+    )
+    communities = structured_summary.get(
+        "community",
+        []
+    )
+    sub_communities = structured_summary.get(
+        "sub_communities",
+        []
+    )
+
+    if question_type == "investment":
+        return "investment_analysis"
+
+    if any(
+        phrase in question_lower
+        for phrase in (
+            "compare",
+            "comparison",
+            "difference between",
+            "vs ",
+            " versus "
+        )
+    ) and len(projects) >= 2:
+        return "project_comparison"
+
+    if projects:
+        if any(
+            phrase in question_lower
+            for phrase in (
+                "project",
+                "projects",
+                "property",
+                "properties",
+                "price",
+                "prices",
+                "bedroom",
+                "handover",
+                "amenit",
+                "developer"
+            )
+        ):
+            return "project_list"
+
+    if sub_communities:
+        return "sub_community_list"
+
+    if communities:
+        return "community_list"
+
+    return "general"
+
+
+def build_frontend_response(
+    question,
+    standalone_question,
+    answer,
+    question_type,
+    structured_summary,
+    documents,
+    investment_analysis=None,
+):
+    """
+    Build the single response object that a future frontend/API can consume.
+
+    The AI answer remains available as `answer`.
+    Structured database records are exposed as frontend-friendly `data`.
+    """
+
+    projects = structured_summary.get(
+        "projects",
+        []
+    ) or []
+
+    communities = structured_summary.get(
+        "community",
+        []
+    ) or []
+
+    sub_communities = structured_summary.get(
+        "sub_communities",
+        []
+    ) or []
+
+    formatted_projects = [
+        _format_project_card(project)
+        for project in projects
+        if isinstance(project, dict)
+    ]
+
+    formatted_communities = [
+        _format_community_card(community)
+        for community in communities
+        if isinstance(community, dict)
+    ]
+
+    formatted_sub_communities = [
+        _format_sub_community_card(sub_community)
+        for sub_community in sub_communities
+        if isinstance(sub_community, dict)
+    ]
+
+    formatted_documents = [
+        _format_document_card(document)
+        for document in documents
+        if isinstance(document, dict)
+    ]
+
+    response_type = _detect_response_type(
+        question,
+        question_type,
+        structured_summary,
+    )
+
+    return {
+        "status": "success",
+        "response_type": response_type,
+        "question": question,
+        "standalone_question": standalone_question,
+        "question_type": question_type,
+        "answer": answer,
+        "data": {
+            "communities": formatted_communities,
+            "projects": formatted_projects,
+            "sub_communities": formatted_sub_communities,
+            "documents": formatted_documents,
+            "investment_analysis": _json_safe(
+                investment_analysis
+            ),
+        },
+        "meta": {
+            "counts": {
+                "communities": len(formatted_communities),
+                "projects": len(formatted_projects),
+                "sub_communities": len(
+                    formatted_sub_communities
+                ),
+                "documents": len(formatted_documents),
+            }
+        },
+    }
+
+
+# =========================================================
 # PROCESS QUESTION
 # =========================================================
 
@@ -561,9 +932,19 @@ def ask_acot(
     context_builder = components["context_builder"]
     investment_analyzer = components["investment_analyzer"]
     rag_chain = components["rag_chain"]
+    conversation_memory = components["conversation_memory"]
+
+    # -----------------------------------------------------
+    # CONVERSATIONAL MEMORY
+    # -----------------------------------------------------
+
+    standalone_question = conversation_memory.rewrite_question(
+        question
+    )
 
     result = hybrid_retriever.retrieve(
-        question=question
+        question=standalone_question,
+        conversation_context=conversation_memory.context(),
     )
 
     question_type = result.get(
@@ -619,12 +1000,27 @@ def ask_acot(
     )
 
     answer = rag_chain.generate_answer(
-        question=question,
+        question=standalone_question,
         context=context,
         question_type=question_type
     )
 
-    return answer
+    conversation_memory.update(
+        user_question=question,
+        standalone_question=standalone_question,
+        answer=answer,
+        retrieval_result=result,
+    )
+
+    return build_frontend_response(
+        question=question,
+        standalone_question=standalone_question,
+        answer=answer,
+        question_type=question_type,
+        structured_summary=structured_summary,
+        documents=documents,
+        investment_analysis=investment_analysis,
+    )
 
 
 # =========================================================
@@ -666,7 +1062,7 @@ def main():
     while True:
 
         try:
-            question = input("\nAskAcot: ").strip()
+            question = input("\nQuestion: ").strip()
 
         except KeyboardInterrupt:
             print()
@@ -689,13 +1085,24 @@ def main():
         try:
             # Hide all internal ACOT/RAG/retriever/library output.
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                answer = ask_acot(
+                response = ask_acot(
                     question,
                     components
                 )
 
-            print("\nAcot Ans:")
-            print_answer_sequentially(answer)
+            print("\nACOT:")
+            print_answer_sequentially(
+                response.get("answer", "")
+            )
+
+            print("\n\nFRONTEND RESPONSE:")
+            print(
+                json.dumps(
+                    response,
+                    indent=2,
+                    ensure_ascii=False
+                )
+            )
             print()
 
         except Exception as e:

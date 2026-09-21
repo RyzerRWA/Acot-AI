@@ -24,6 +24,7 @@ Document data:
     document_chunks
 """
 
+import re
 from typing import Any, Dict, List, Optional
 
 
@@ -440,6 +441,63 @@ class HybridRetriever:
         }
 
     # ============================================================
+    # STRUCTURED RETRIEVAL BY MULTIPLE PROJECTS
+    # ============================================================
+
+    def _retrieve_by_projects(
+        self,
+        project_names: List[str],
+    ) -> Dict[str, Any]:
+        """
+        Retrieve multiple explicit projects while preserving the order
+        supplied by conversational memory.
+        """
+        merged_projects = []
+        seen_names = set()
+        communities = []
+        sub_communities = []
+        seen_community_names = set()
+        seen_subcommunity_names = set()
+
+        for project_name in project_names:
+            if not project_name:
+                continue
+
+            result = self._retrieve_by_project(
+                str(project_name)
+            )
+
+            for project in result.get("projects", []) or []:
+                name = str(project.get("name") or "").strip()
+                key = name.lower()
+
+                if name and key not in seen_names:
+                    merged_projects.append(project)
+                    seen_names.add(key)
+
+            for community in result.get("communities", []) or []:
+                name = str(community.get("name") or "").strip()
+                key = name.lower()
+
+                if name and key not in seen_community_names:
+                    communities.append(community)
+                    seen_community_names.add(key)
+
+            for subcommunity in result.get("sub_communities", []) or []:
+                name = str(subcommunity.get("name") or "").strip()
+                key = name.lower()
+
+                if name and key not in seen_subcommunity_names:
+                    sub_communities.append(subcommunity)
+                    seen_subcommunity_names.add(key)
+
+        return {
+            "communities": communities,
+            "projects": merged_projects,
+            "sub_communities": sub_communities,
+        }
+
+    # ============================================================
     # STRUCTURED RETRIEVAL BY COMMUNITY
     # ============================================================
 
@@ -653,6 +711,133 @@ class HybridRetriever:
             "sub_communities": result.get("sub_communities", []) or [],
         }
 
+    @staticmethod
+    def _requested_data_scope(
+        question: str,
+        query_plan=None,
+    ) -> Optional[List[str]]:
+        """
+        Work out which structured entity the user actually asked for.
+
+        The retriever can return related data internally, but the final
+        result should stay focused on what the user asked for.
+
+        Examples:
+            "show me communities" -> ["communities"]
+            "what projects are available there" -> ["projects"]
+
+        If the question clearly asks for more than one entity, keep both.
+        If the wording is too general, return None and keep the existing
+        result.
+        """
+
+        q = (question or "").lower()
+
+        # These phrases normally mean the user wants project/listing data,
+        # not the community record itself.
+        asks_projects = bool(
+            re.search(r"\bprojects?\b", q)
+        )
+
+        asks_communities = bool(
+            re.search(r"\bcommunities?\b", q)
+        )
+
+        asks_sub_communities = bool(
+            re.search(
+                r"\bsub[- ]communities?\b",
+                q,
+            )
+        )
+
+        asks_properties = bool(
+            re.search(r"\bproperties?\b", q)
+        )
+
+        scopes: List[str] = []
+
+        if asks_communities:
+            scopes.append("communities")
+
+        if asks_sub_communities:
+            scopes.append("sub_communities")
+
+        if asks_projects:
+            scopes.append("projects")
+
+        # There is no property/listing table in the current ACOT schema.
+        # Keep project data for property-style questions because projects
+        # are the closest available structured source.
+        if asks_properties and not scopes:
+            scopes.append("projects")
+
+        if scopes:
+            return scopes
+
+        # QueryPlan is only a fallback. We do not depend on it when the
+        # user's wording already tells us the requested entity.
+        if query_plan is not None:
+            entity_type = str(
+                getattr(query_plan, "entity_type", "") or ""
+            ).lower().strip()
+
+            mapping = {
+                "community": ["communities"],
+                "communities": ["communities"],
+                "sub_community": ["sub_communities"],
+                "sub_communities": ["sub_communities"],
+                "project": ["projects"],
+                "projects": ["projects"],
+                "property": ["projects"],
+                "properties": ["projects"],
+            }
+
+            return mapping.get(entity_type)
+
+        return None
+
+    @staticmethod
+    def _apply_data_scope(
+        structured_result: Dict[str, Any],
+        question: str,
+        query_plan=None,
+    ) -> Dict[str, Any]:
+        """
+        Keep only the structured collections needed for the question.
+
+        Retrieval methods may fetch parent/related records to resolve
+        hierarchy. Those records should not automatically become part
+        of the answer context.
+        """
+
+        scope = HybridRetriever._requested_data_scope(
+            question,
+            query_plan=query_plan,
+        )
+
+        if not scope:
+            return structured_result
+
+        allowed = set(scope)
+
+        return {
+            "communities": (
+                structured_result.get("communities", [])
+                if "communities" in allowed
+                else []
+            ),
+            "projects": (
+                structured_result.get("projects", [])
+                if "projects" in allowed
+                else []
+            ),
+            "sub_communities": (
+                structured_result.get("sub_communities", [])
+                if "sub_communities" in allowed
+                else []
+            ),
+        }
+
     # ============================================================
     # STRUCTURED RETRIEVAL
     # ============================================================
@@ -664,6 +849,8 @@ class HybridRetriever:
         filters: Optional[
             Dict[str, Any]
         ] = None,
+        conversation_context: Optional[Dict[str, Any]] = None,
+        query_plan=None,
     ) -> Dict[str, Any]:
 
         if not self.structured_retriever:
@@ -680,10 +867,74 @@ class HybridRetriever:
         try:
 
             # ----------------------------------------------------
+            # MULTI-PROJECT COMPARISON / INVESTMENT FOLLOW-UP
+            # ----------------------------------------------------
+            active_candidates = (
+                (conversation_context or {}).get(
+                    "active_candidates"
+                )
+                or []
+            )
+
+            candidate_names = [
+                str(item.get("name")).strip()
+                for item in active_candidates
+                if isinstance(item, dict)
+                and item.get("name")
+            ]
+
+            question_lower = (question or "").lower()
+
+            referenced_candidates = [
+                name
+                for name in candidate_names
+                if name.lower() in question_lower
+            ]
+
+            wants_multi_project = (
+                len(referenced_candidates) >= 2
+                and (
+                    (
+                        query_plan
+                        and (
+                            getattr(query_plan, "needs_comparison", False)
+                            or getattr(query_plan, "needs_ranking", False)
+                        )
+                    )
+                    or any(
+                        term in question_lower
+                        for term in (
+                            "compare",
+                            "comparison",
+                            "versus",
+                            " vs ",
+                            "better",
+                            "invest",
+                            "investment",
+                            "investing",
+                        )
+                    )
+                )
+            )
+
+            if wants_multi_project:
+
+                # Preserve candidate order from the previous verified result.
+                ordered_names = [
+                    name
+                    for name in candidate_names
+                    if name in referenced_candidates
+                ]
+
+                result = self._retrieve_by_projects(
+                    ordered_names
+                )
+
+            # ----------------------------------------------------
             # PROJECT
             # ----------------------------------------------------
 
-            if (
+            elif (
                 resolved_entity
                 and
                 resolved_entity.entity_type
@@ -751,6 +1002,16 @@ class HybridRetriever:
                     result.get("projects", []),
                     filters,
                 )
+            )
+
+            # A community lookup may internally fetch its projects and
+            # sub-communities so the hierarchy is available. Do not pass
+            # all of that related data to the answer layer when the user
+            # asked for only one entity type.
+            result = self._apply_data_scope(
+                result,
+                question,
+                query_plan=query_plan,
             )
 
             return result
@@ -1126,6 +1387,9 @@ class HybridRetriever:
                     resolved_entity=
                         resolved_entity,
                     filters=filters,
+                    conversation_context=
+                        conversation_context,
+                    query_plan=query_plan,
                 )
             )
 

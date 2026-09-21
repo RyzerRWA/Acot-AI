@@ -1,4 +1,4 @@
-﻿import time
+import time
 
 from google import genai
 
@@ -21,13 +21,29 @@ class GeminiClient:
         # changing the rest of the ACOT codebase.
         self.fallback_model = None
 
+        # Retry only genuinely temporary failures.
+        # Keep delays short so a demo does not get stuck for minutes.
         self.max_retries = 3
-        self.retry_delays = (1.5, 3.0, 5.0)
+        self.retry_delays = (2.0, 4.0)
 
     def _is_retryable_error(self, error: Exception) -> bool:
         """Return True only for failures that are normally temporary."""
         message = str(error).lower()
 
+        # Quota exhaustion / permission failures should fail immediately.
+        # Retrying them does not restore free-tier quota or project access.
+        permanent_terms = (
+            "quota exceeded",
+            "resource exhausted",
+            "project has been denied access",
+            "permission_denied",
+            "403",
+        )
+
+        if any(term in message for term in permanent_terms):
+            return False
+
+        # Retry only temporary service failures and timeouts.
         retryable_terms = (
             "503",
             "service unavailable",
@@ -36,9 +52,6 @@ class GeminiClient:
             "overloaded",
             "timeout",
             "timed out",
-            "429",
-            "rate limit",
-            "resource exhausted",
         )
 
         return any(term in message for term in retryable_terms)
@@ -88,9 +101,24 @@ class GeminiClient:
                 except Exception as error:
                     last_error = error
 
-                    # Do not waste demo time retrying authentication,
-                    # permission, invalid-model, or other permanent failures.
+                    # Quota, permission, authentication, and model errors
+                    # should fail immediately instead of sleeping/retrying.
                     if not self._is_retryable_error(error):
+                        message = str(error)
+                        lowered = message.lower()
+
+                        if "quota" in lowered or "resource exhausted" in lowered:
+                            raise RuntimeError(
+                                "Gemini free-tier quota/rate limit reached. "
+                                "Wait for the quota window to reset or use a "
+                                "project/tier with available quota."
+                            ) from error
+
+                        if "403" in lowered or "permission_denied" in lowered:
+                            raise RuntimeError(
+                                f"Gemini project access denied: {error}"
+                            ) from error
+
                         raise RuntimeError(
                             f"Gemini generation failed: {error}"
                         ) from error

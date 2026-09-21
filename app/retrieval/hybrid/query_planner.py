@@ -281,7 +281,9 @@ class QueryPlanner:
 
     FOLLOW_UP_PATTERNS = (
         r"^\s*(what about|how about|and|also|then what|what if)\b",
-        r"^\s*(compare them|compare those|the first two|the second one|that one)\b",
+        r"^\s*(compare them|compare those|compare these|the first two|the second one|that one)\b",
+        r"^\s*compare\s+\d+\s*(?:and|&|,)\s*\d+\b",
+        r"\b(?:the\s+)?(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\b",
         r"^\s*(why|how much|what price|what rent|what about)\b",
     )
 

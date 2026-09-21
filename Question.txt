@@ -3,6 +3,17 @@
 3. What is the handover date, developer, and bedroom range of Sky Edition at Seahaven?
 4. What amenities and facilities are available at Sky Edition at Seahaven?
 5. What makes Sky Edition at Seahaven different from other projects in the available data?
-6. What projects are available in Dubai Marina?
-7. Is Dubai Marina a good investment based on the available data?
-8. I'm looking for a rental investment in Dubai Marina with a budget of AED 2 million. What options do you recommend?
+6. What projects are available in Dubai?
+7. Is Dubai a good investment based on the available data?
+8.show me the best properties in Jumeirah Village Circle?
+
+#Testing Question
+Show me the projects in Jumeirah Village Circle.
+
+2.Which of these have 2-bedroom options?
+
+3.What are their starting prices?
+
+4.What amenities do those projects offer according to their documents?
+
+5.Compare the first and second ones based on price, bedroom range, handover date, and documented amenities.
