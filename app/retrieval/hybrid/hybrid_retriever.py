@@ -276,6 +276,24 @@ class HybridRetriever:
                 "bedroom_max"
             )
 
+            # Support normalized project records where bedroom information
+            # is stored as:
+            # {
+            #     "bedrooms": {
+            #         "min": 0,
+            #         "max": 3
+            #     }
+            # }
+            if bedroom_min is None or bedroom_max is None:
+                bedrooms = project.get("bedrooms")
+
+                if isinstance(bedrooms, dict):
+                    if bedroom_min is None:
+                        bedroom_min = bedrooms.get("min")
+
+                    if bedroom_max is None:
+                        bedroom_max = bedrooms.get("max")
+
             if min_bedrooms is not None:
 
                 if bedroom_max is None:
@@ -895,27 +913,45 @@ class HybridRetriever:
             # Detect references to the previous candidate list
             # --------------------------------------------------------
 
-            # Conversation memory keeps the verified project list from the
-            # previous turn. Follow-up questions such as:
-            #   - "Which of these have 2-bedroom options?"
-            #   - "What are their starting prices?"
-            #   - "Which ones have the lowest price?"
-            # refer to that same candidate list even when the project names
-            # are not repeated in the current question.
+            # ConversationMemory stores the verified candidate list from
+            # the previous turn. A follow-up can refer to that list without
+            # repeating any project name.
+            #
+            # Examples:
+            #   "Which of these have 2 bedroom options?"
+            #   "What are their starting prices?"
+            #   "Which ones have the lowest price?"
+            #   "Show me those projects"
+            #
+            # In these cases the retriever must use ALL previous candidates
+            # in the exact order stored by ConversationMemory.
             candidate_list_reference = any(
-                phrase in question_lower
-                for phrase in (
-                    "these projects",
-                    "those projects",
-                    "these properties",
-                    "those properties",
-                    "which of these",
-                    "which ones",
-                    "which one",
-                    "their",
-                    "them",
-                )
-            )
+    phrase in question_lower
+    for phrase in (
+        "these projects",
+        "those projects",
+        "these properties",
+        "those properties",
+        "these project",
+        "those project",
+        "these property",
+        "those property",
+
+        # IMPORTANT: these survive ConversationMemory rewriting
+        "which of the projects",
+        "which of the properties",
+        "which projects",
+        "which properties",
+        "what are the projects",
+        "what are the properties",
+
+        "which of these",
+        "which ones",
+        "which one",
+        "their",
+        "them",
+    )
+)
 
             # Explicit project names in the current question.
             explicit_multi_project_reference = (
@@ -927,8 +963,16 @@ class HybridRetriever:
                 (
                     query_plan
                     and (
-                        getattr(query_plan, "needs_comparison", False)
-                        or getattr(query_plan, "needs_ranking", False)
+                        getattr(
+                            query_plan,
+                            "needs_comparison",
+                            False,
+                        )
+                        or getattr(
+                            query_plan,
+                            "needs_ranking",
+                            False,
+                        )
                     )
                 )
                 or any(
@@ -957,19 +1001,53 @@ class HybridRetriever:
 
             if wants_multi_project:
 
-                # If the user refers to the previous candidate list without
-                # repeating project names, retrieve the complete list in the
-                # exact order stored by ConversationMemory.
-                if candidate_list_reference and not referenced_candidates:
-                    ordered_names = candidate_names
-                else:
-                    # Otherwise retrieve only the explicitly referenced
-                    # projects while preserving their previous order.
+                # ----------------------------------------------------
+                # Previous candidate-list follow-up
+                # ----------------------------------------------------
+                #
+                # If the user says "these", "which ones", "their", etc.,
+                # retrieve the complete previous candidate list.
+                #
+                # Do NOT depend on the rewritten question containing the
+                # project names. ConversationMemory may rewrite:
+                #
+                #   "Which of these have 2 bedroom options?"
+                #
+                # into:
+                #
+                #   "Which of the projects in Jumeirah Village Circle
+                #    have 2 bedroom options?"
+                #
+                # The rewritten question intentionally does not contain
+                # Serenz/Samana Waves/etc., so the active candidate list
+                # must be used directly.
+                if candidate_list_reference:
+                    ordered_names = list(candidate_names)
+
+                # ----------------------------------------------------
+                # Explicit multi-project reference
+                # ----------------------------------------------------
+                #
+                # Example:
+                #   "Compare Serenz and Azizi Ruby"
+                #
+                # Preserve the original candidate order rather than
+                # changing the order based on price/name/etc.
+                elif explicit_multi_project_reference:
                     ordered_names = [
                         name
                         for name in candidate_names
                         if name in referenced_candidates
                     ]
+
+                # ----------------------------------------------------
+                # Comparison/ranking/investment fallback
+                # ----------------------------------------------------
+                #
+                # If the planner identifies a comparison/ranking query
+                # and there is an active candidate list, use that list.
+                else:
+                    ordered_names = list(candidate_names)
 
                 result = self._retrieve_by_projects(
                     ordered_names
