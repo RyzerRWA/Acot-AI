@@ -891,40 +891,85 @@ class HybridRetriever:
                 if name.lower() in question_lower
             ]
 
-            wants_multi_project = (
+            # --------------------------------------------------------
+            # Detect references to the previous candidate list
+            # --------------------------------------------------------
+
+            # Conversation memory keeps the verified project list from the
+            # previous turn. Follow-up questions such as:
+            #   - "Which of these have 2-bedroom options?"
+            #   - "What are their starting prices?"
+            #   - "Which ones have the lowest price?"
+            # refer to that same candidate list even when the project names
+            # are not repeated in the current question.
+            candidate_list_reference = any(
+                phrase in question_lower
+                for phrase in (
+                    "these projects",
+                    "those projects",
+                    "these properties",
+                    "those properties",
+                    "which of these",
+                    "which ones",
+                    "which one",
+                    "their",
+                    "them",
+                )
+            )
+
+            # Explicit project names in the current question.
+            explicit_multi_project_reference = (
                 len(referenced_candidates) >= 2
+            )
+
+            # Normal comparison / ranking / investment questions.
+            comparison_reference = (
+                (
+                    query_plan
+                    and (
+                        getattr(query_plan, "needs_comparison", False)
+                        or getattr(query_plan, "needs_ranking", False)
+                    )
+                )
+                or any(
+                    term in question_lower
+                    for term in (
+                        "compare",
+                        "comparison",
+                        "versus",
+                        " vs ",
+                        "better",
+                        "invest",
+                        "investment",
+                        "investing",
+                    )
+                )
+            )
+
+            wants_multi_project = (
+                bool(candidate_names)
                 and (
-                    (
-                        query_plan
-                        and (
-                            getattr(query_plan, "needs_comparison", False)
-                            or getattr(query_plan, "needs_ranking", False)
-                        )
-                    )
-                    or any(
-                        term in question_lower
-                        for term in (
-                            "compare",
-                            "comparison",
-                            "versus",
-                            " vs ",
-                            "better",
-                            "invest",
-                            "investment",
-                            "investing",
-                        )
-                    )
+                    candidate_list_reference
+                    or explicit_multi_project_reference
+                    or comparison_reference
                 )
             )
 
             if wants_multi_project:
 
-                # Preserve candidate order from the previous verified result.
-                ordered_names = [
-                    name
-                    for name in candidate_names
-                    if name in referenced_candidates
-                ]
+                # If the user refers to the previous candidate list without
+                # repeating project names, retrieve the complete list in the
+                # exact order stored by ConversationMemory.
+                if candidate_list_reference and not referenced_candidates:
+                    ordered_names = candidate_names
+                else:
+                    # Otherwise retrieve only the explicitly referenced
+                    # projects while preserving their previous order.
+                    ordered_names = [
+                        name
+                        for name in candidate_names
+                        if name in referenced_candidates
+                    ]
 
                 result = self._retrieve_by_projects(
                     ordered_names

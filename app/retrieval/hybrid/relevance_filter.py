@@ -92,7 +92,6 @@ class RelevanceFilter:
 
                     continue
 
-
             # -------------------------
             # BUILDING QUESTION
             # -------------------------
@@ -107,8 +106,6 @@ class RelevanceFilter:
 
                     continue
 
-
             filtered_results.append(item)
-
 
         return filtered_results

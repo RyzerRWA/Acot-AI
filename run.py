@@ -1095,14 +1095,14 @@ def main():
                 response.get("answer", "")
             )
 
-            print("\n\nFRONTEND RESPONSE:")
-            print(
-                json.dumps(
-                    response,
-                    indent=2,
-                    ensure_ascii=False
-                )
-            )
+            #print("\n\nFRONTEND RESPONSE:")
+            #print(
+                #json.dumps(
+                    #response,
+                    #indent=2,
+                    #ensure_ascii=False
+                #)
+            #)
             print()
 
         except Exception as e:

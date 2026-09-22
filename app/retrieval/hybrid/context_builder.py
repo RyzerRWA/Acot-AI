@@ -151,7 +151,6 @@ information such as projects, communities, developers,
 prices, bedrooms, property types, handover dates and URLs.
 
 """
-
         # ========================================================
         # PROJECTS
         # ========================================================
@@ -163,7 +162,6 @@ prices, bedrooms, property types, handover dates and URLs.
 PROJECTS
 
 """
-
             for index, project in enumerate(
                 projects,
                 start=1
@@ -424,7 +422,6 @@ PROJECTS
 COMMUNITIES
 
 """
-
             for index, community in enumerate(
                 communities,
                 start=1
@@ -474,7 +471,6 @@ COMMUNITIES
 SUB-COMMUNITIES
 
 """
-
             for index, sub in enumerate(
                 sub_communities,
                 start=1
