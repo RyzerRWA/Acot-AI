@@ -1,0 +1,34 @@
+steps:
+  # Build Docker image
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "build"
+      - "-t"
+      - "me-central1-docker.pkg.dev/kinetic-axle-442714-m6/cloud-run-source-deploy/acot-ai/acot-ai:$COMMIT_SHA"
+      - "."
+
+  # Push Docker image
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "push"
+      - "me-central1-docker.pkg.dev/kinetic-axle-442714-m6/cloud-run-source-deploy/acot-ai/acot-ai:$COMMIT_SHA"
+
+  # Deploy to Cloud Run
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: gcloud
+    args:
+      - "run"
+      - "deploy"
+      - "acot-ai"
+      - "--image"
+      - "me-central1-docker.pkg.dev/kinetic-axle-442714-m6/cloud-run-source-deploy/acot-ai/acot-ai:$COMMIT_SHA"
+      - "--region"
+      - "me-central1"
+      - "--platform"
+      - "managed"
+
+images:
+  - "me-central1-docker.pkg.dev/kinetic-axle-442714-m6/cloud-run-source-deploy/acot-ai/acot-ai:$COMMIT_SHA"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
