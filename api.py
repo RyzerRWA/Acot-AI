@@ -181,7 +181,7 @@ def root():
 # HEALTH CHECK
 # ============================================================
 
-@app.get("/api/health")
+@app.get("/api/healths")
 def health_check():
 
     return {
