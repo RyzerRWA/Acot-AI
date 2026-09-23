@@ -490,6 +490,18 @@ class QueryPlanner:
             conversation_context=conversation_context,
         )
 
+        # ------------------------------------------------------------
+        # FAST PATH: simple structured/database questions
+        # ------------------------------------------------------------
+        # These queries can be understood deterministically from the
+        # rule-based planner. Avoid spending a Gemini call just to
+        # classify a request that only needs PostgreSQL data.
+        if self._is_simple_structured_plan(rule_plan):
+            rule_plan.reasoning.append(
+                "Deterministic structured-query fast path used; LLM planning skipped."
+            )
+            return rule_plan
+
         if not self.use_llm or self._llm_client is None:
             if self._llm_error:
                 rule_plan.reasoning.append(
@@ -518,6 +530,35 @@ class QueryPlanner:
                 f"LLM planning failed; deterministic planning used: {exc}"
             )
             return rule_plan
+
+    @staticmethod
+    def _is_simple_structured_plan(plan: QueryPlan) -> bool:
+        """Return True for deterministic database-only requests.
+
+        These requests should not consume an LLM planning call because the
+        rule planner already extracts their intent/entity/filter requirements.
+        Complex analytical, ranking, comparison, prediction, and document
+        queries continue through the LLM semantic planner.
+        """
+        if plan is None:
+            return False
+
+        if plan.intent != "search":
+            return False
+
+        if not plan.needs_structured_data:
+            return False
+
+        if (
+            plan.needs_documents
+            or plan.needs_analytics
+            or plan.needs_prediction
+            or plan.needs_ranking
+            or plan.needs_comparison
+        ):
+            return False
+
+        return True
 
     def _llm_plan(
         self,

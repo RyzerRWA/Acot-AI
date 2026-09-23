@@ -1362,12 +1362,72 @@ Rules:
         # ---------------------------------------------------------
         # Extract candidates from the latest result.
         # ---------------------------------------------------------
+        # Keep the previously verified multi-project candidate list when
+        # the user asks about ONE project that is already inside that list.
+        # Example:
+        #   1) Show me the projects in Jumeirah Village
+        #   2) What is the handover date of Azizi Ruby?
+        #   3) Which of these have 2 bedroom options?
+        #
+        # In step 2, the active entity should become Azizi Ruby, but the
+        # candidate list must remain the original project list so that
+        # "which of these" still refers to all previously shown projects.
         candidates = self._extract_candidates(
             retrieval_result
         )
 
+        previous_candidates = list(
+            self.active_candidates or []
+        )
+
+        preserve_previous_project_list = False
+
+        if (
+            previous_candidates
+            and len(previous_candidates) > 1
+            and len(candidates) == 1
+        ):
+            only_candidate = candidates[0]
+
+            candidate_type = self._normalise(
+                only_candidate.get("entity_type")
+            )
+
+            candidate_name = self._get_name(
+                only_candidate
+            )
+
+            if candidate_type == "project" and candidate_name:
+                searchable_question = " ".join(
+                    [
+                        str(user_question or ""),
+                        str(standalone_question or ""),
+                    ]
+                ).lower()
+
+                previous_project_names = {
+                    self._get_name(item).strip().lower()
+                    for item in previous_candidates
+                    if isinstance(item, dict)
+                    and self._normalise(
+                        item.get("entity_type")
+                    ) == "project"
+                    and self._get_name(item)
+                }
+
+                # Preserve only when the single project is explicitly
+                # selected from the previous candidate list.
+                preserve_previous_project_list = (
+                    candidate_name.strip().lower()
+                    in previous_project_names
+                    and candidate_name.strip().lower()
+                    in searchable_question
+                )
+
         if candidates:
-            self.active_candidates = candidates
+            if not preserve_previous_project_list:
+                self.active_candidates = candidates
+            # Otherwise keep the previous multi-project list intact.
 
         # ---------------------------------------------------------
         # If there is exactly one project, make it the active

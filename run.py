@@ -920,6 +920,307 @@ def build_frontend_response(
 
 
 # =========================================================
+# FAST STRUCTURED ANSWER
+# =========================================================
+
+def _is_fast_structured_question(
+    question,
+    question_type,
+    structured_summary,
+    documents,
+):
+    """
+    Identify simple database-only questions that do not need Gemini for
+    the final answer. Retrieval has already verified the records.
+    """
+
+    if documents:
+        return False
+
+    if question_type in {
+        "investment",
+        "comparison",
+        "ranking",
+        "calculation",
+        "prediction",
+        "document",
+    }:
+        return False
+
+    q = (question or "").lower().strip()
+
+    # Complex/knowledge-heavy wording stays on the RAG path.
+    blocked_terms = (
+        "invest",
+        "investment",
+        "roi",
+        "yield",
+        "forecast",
+        "predict",
+        "compare",
+        "comparison",
+        "versus",
+        " vs ",
+        "best",
+        "top ",
+        "recommend",
+        "brochure",
+        "document",
+        "building code",
+        "amenities",
+        "amenity",
+        "security",
+        "features",
+        "interior",
+        "interiors",
+        "finishes",
+        "floor plan",
+        "floor plans",
+        "layout",
+        "layouts",
+        "view",
+        "views",
+    )
+
+    if any(term in q for term in blocked_terms):
+        return False
+
+    structured_terms = (
+        "project",
+        "projects",
+        "property",
+        "properties",
+        "price",
+        "prices",
+        "cost",
+        "bedroom",
+        "bedrooms",
+        "developer",
+        "developers",
+        "handover",
+        "status",
+        "size",
+        "sqft",
+        "square foot",
+        "available",
+    )
+
+    if not any(term in q for term in structured_terms):
+        return False
+
+    return bool(
+        structured_summary.get("projects")
+        or structured_summary.get("community")
+        or structured_summary.get("sub_communities")
+    )
+
+
+def _build_fast_structured_answer(
+    question,
+    structured_summary,
+):
+    """
+    Build a concise, grounded answer directly from PostgreSQL records.
+    No Gemini call is made for this path.
+    """
+
+    q = (question or "").lower()
+    projects = structured_summary.get("projects", []) or []
+    communities = structured_summary.get("community", []) or []
+    sub_communities = structured_summary.get("sub_communities", []) or []
+
+    if projects:
+        lines = []
+
+        wants_bedrooms = any(
+            term in q
+            for term in ("bedroom", "bedrooms")
+        )
+        wants_handover = "handover" in q
+        wants_developer = any(
+            term in q
+            for term in ("developer", "developers")
+        )
+        wants_status = "status" in q
+        wants_price = any(
+            term in q
+            for term in ("price", "prices", "cost")
+        )
+
+        # Field-specific follow-up answers.
+        if len(projects) == 1:
+            project = projects[0]
+            name = project.get("name") or "Unknown project"
+
+            if wants_bedrooms:
+                bedroom_label = _format_bedrooms(project)
+                value = (
+                    bedroom_label
+                    if bedroom_label is not None
+                    else "Not available"
+                )
+                return f"{name} offers {value} bedrooms."
+
+            if wants_handover:
+                value = project.get("handover_time")
+                if value is None:
+                    return f"Handover date for {name} is not available in the current data."
+                return f"{name} handover date: {value}"
+
+            if wants_developer:
+                value = project.get("developer_name")
+                value = (
+                    str(value).strip()
+                    if value is not None and str(value).strip()
+                    else "Not available"
+                )
+                return f"{name} developer: {value}"
+
+            if wants_status:
+                status = project.get("status")
+                project_status = project.get("project_status")
+
+                if status and project_status:
+                    return (
+                        f"{name} status: {status}; "
+                        f"project status: {project_status}"
+                    )
+
+                value = status or project_status or "Not available"
+                return f"{name} status: {value}"
+
+            if wants_price:
+                value = project.get("price")
+                value = (
+                    f"AED {value}"
+                    if value is not None
+                    else "Not available"
+                )
+                return f"{name} starting price: {value}"
+
+        # Multi-project field-specific answers.
+        if wants_bedrooms:
+            lines = [
+                f"Found {len(projects)} project(s) matching your request:"
+            ]
+            for index, project in enumerate(projects, start=1):
+                name = project.get("name") or "Unknown project"
+                bedroom_label = _format_bedrooms(project)
+                bedroom_text = (
+                    bedroom_label
+                    if bedroom_label is not None
+                    else "Not available"
+                )
+                lines.append(
+                    f"{index}. {name} | Bedrooms: {bedroom_text}"
+                )
+            return "\n".join(lines)
+
+        if wants_handover:
+            lines = [
+                f"Found {len(projects)} project(s) matching your request:"
+            ]
+            for index, project in enumerate(projects, start=1):
+                name = project.get("name") or "Unknown project"
+                value = project.get("handover_time")
+                value = value if value is not None else "Not available"
+                lines.append(
+                    f"{index}. {name} | Handover: {value}"
+                )
+            return "\n".join(lines)
+
+        if wants_developer:
+            lines = [
+                f"Found {len(projects)} project(s) matching your request:"
+            ]
+            for index, project in enumerate(projects, start=1):
+                name = project.get("name") or "Unknown project"
+                developer = project.get("developer_name")
+                developer_text = (
+                    str(developer).strip()
+                    if developer is not None and str(developer).strip()
+                    else "Not available"
+                )
+                lines.append(
+                    f"{index}. {name} | Developer: {developer_text}"
+                )
+            return "\n".join(lines)
+
+        if wants_price:
+            lines = [
+                f"Found {len(projects)} project(s) matching your request:"
+            ]
+            for index, project in enumerate(projects, start=1):
+                name = project.get("name") or "Unknown project"
+                price = project.get("price")
+                price_text = (
+                    f"AED {price}" if price is not None else "Not available"
+                )
+                lines.append(
+                    f"{index}. {name} | Starting price: {price_text}"
+                )
+            return "\n".join(lines)
+
+        # Default project-list answer.
+        lines = [
+            f"Found {len(projects)} project(s) matching your request:"
+        ]
+
+        for index, project in enumerate(projects, start=1):
+            name = project.get("name") or "Unknown project"
+            developer = project.get("developer_name")
+            developer_text = (
+                str(developer).strip()
+                if developer is not None and str(developer).strip()
+                else "Not available"
+            )
+
+            price = project.get("price")
+            price_text = (
+                f"AED {price}" if price is not None else "Not available"
+            )
+
+            bedroom_label = _format_bedrooms(project)
+            bedroom_text = (
+                bedroom_label
+                if bedroom_label is not None
+                else "Not available"
+            )
+
+            lines.append(
+                f"{index}. {name} | Developer: {developer_text} | "
+                f"Starting price: {price_text} | Bedrooms: {bedroom_text}"
+            )
+
+        return "\n".join(lines)
+
+    if sub_communities:
+        lines = [
+            f"Found {len(sub_communities)} sub-community(s) matching your request:"
+        ]
+        for index, record in enumerate(sub_communities, start=1):
+            lines.append(
+                f"{index}. {record.get('name') or 'Unknown sub-community'}"
+            )
+        return "\n".join(lines)
+
+    if communities:
+        lines = [
+            f"Found {len(communities)} community(s) matching your request:"
+        ]
+        for index, record in enumerate(communities, start=1):
+            name = record.get("name") or "Unknown community"
+            city = record.get("city")
+            if city:
+                lines.append(f"{index}. {name} | City: {city}")
+            else:
+                lines.append(f"{index}. {name}")
+        return "\n".join(lines)
+
+    return "No matching structured records were found."
+
+
+# =========================================================
 # PROCESS QUESTION
 # =========================================================
 
@@ -989,21 +1290,38 @@ def ask_acot(
         except Exception:
             investment_analysis = None
 
-    context = context_builder.build_context(
-        structured_summary=structured_summary,
-        investment_analysis=investment_analysis,
-        document_results=documents,
-        community_results=structured_data.get(
-            "community",
-            []
-        )
-    )
-
-    answer = rag_chain.generate_answer(
+    # -----------------------------------------------------
+    # FAST PATH: structured database answer
+    # -----------------------------------------------------
+    # Simple project/community/filter questions do not need the final
+    # Gemini generation step. This reduces latency and token usage while
+    # keeping the answer fully grounded in retrieved Supabase data.
+    if _is_fast_structured_question(
         question=standalone_question,
-        context=context,
-        question_type=question_type
-    )
+        question_type=question_type,
+        structured_summary=structured_summary,
+        documents=documents,
+    ):
+        answer = _build_fast_structured_answer(
+            question=standalone_question,
+            structured_summary=structured_summary,
+        )
+    else:
+        context = context_builder.build_context(
+            structured_summary=structured_summary,
+            investment_analysis=investment_analysis,
+            document_results=documents,
+            community_results=structured_data.get(
+                "community",
+                []
+            )
+        )
+
+        answer = rag_chain.generate_answer(
+            question=standalone_question,
+            context=context,
+            question_type=question_type
+        )
 
     conversation_memory.update(
         user_question=question,

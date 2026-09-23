@@ -88,6 +88,7 @@ class ResolvedEntity:
             "reasoning": self.reasoning,
         }
 
+
 # ============================================================
 # ENTITY RESOLVER
 # ============================================================
@@ -230,6 +231,7 @@ class EntityResolver:
 
         aliases = {
             "jvc": "jumeirah village circle",
+            "jumeirah village": "jumeirah village circle",
         }
 
         return aliases.get(

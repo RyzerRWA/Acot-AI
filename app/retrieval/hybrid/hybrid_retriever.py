@@ -1370,6 +1370,20 @@ class HybridRetriever:
                 query_plan.needs_documents
             )
 
+            # Fast-path for structured-only follow-up questions.
+            # If the user asks for database fields such as price, bedrooms,
+            # projects, developers, handover, etc., do not call pgvector
+            # unless the question explicitly asks for document/brochure data.
+            # This prevents unnecessary Supabase document RPC calls for
+            # questions such as: "Which of these have 2 bedroom options?"
+            if (
+                self._needs_structured_data_from_question(question)
+                and not self._document_terms(question)
+                and str(query_plan.intent or "").lower()
+                not in {"document"}
+            ):
+                needs_documents = False
+
             filters = (
                 query_plan.filters
                 or {}

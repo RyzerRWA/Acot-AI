@@ -209,6 +209,23 @@ class InvestmentAnalyzer:
         )
 
         # =============================================
+        # ACOT SCORE + AI RECOMMENDATION
+        # =============================================
+
+        acot_score = self._calculate_acot_score(
+            scoring.get("score", 0),
+            yield_analysis=yield_analysis,
+            development_analysis=development_analysis
+        )
+
+        ai_recommendation = self._build_ai_recommendation(
+            verdict=scoring.get("verdict", "Neutral"),
+            confidence=confidence_analysis.get("level", "Low"),
+            yield_analysis=yield_analysis,
+            development_analysis=development_analysis
+        )
+
+        # =============================================
         # FINAL RESULT
         # =============================================
 
@@ -239,6 +256,15 @@ class InvestmentAnalyzer:
             "investment_score": scoring[
                 "score"
             ],
+
+            # Frontend-ready 0-100 ACOT score.
+            # This is a normalized representation of the existing
+            # investment score; no new market assumptions are added.
+            "acot_score": acot_score,
+
+            # Recommendation generated from the deterministic ACOT
+            # investment signals, without an additional Gemini call.
+            "ai_recommendation": ai_recommendation,
 
             "score_breakdown": scoring[
                 "score_breakdown"
@@ -284,6 +310,114 @@ class InvestmentAnalyzer:
 
             "data_limitations": limitations
         }
+
+    # =================================================
+    # ACOT SCORE
+    # =================================================
+
+    def _calculate_acot_score(
+        self,
+        investment_score,
+        yield_analysis,
+        development_analysis
+    ):
+        """
+        Normalize the existing ACOT investment score to 0-100.
+
+        Existing investment_score range:
+            -3 .. +3
+
+        Normalized ACOT score:
+            0 .. 100
+
+        The normalization does not introduce any new market data.
+        """
+
+        if not isinstance(investment_score, (int, float)):
+            return None
+
+        has_signal = (
+            bool(yield_analysis.get("available"))
+            or bool(development_analysis.get("statuses"))
+        )
+
+        if not has_signal:
+            return None
+
+        score = max(-3.0, min(3.0, float(investment_score)))
+        normalized = ((score + 3.0) / 6.0) * 100.0
+
+        return {
+            "value": int(round(normalized)),
+            "max": 100,
+            "source_score": score,
+            "formula": "normalized from existing -3..+3 investment score",
+        }
+
+    # =================================================
+    # AI RECOMMENDATION
+    # =================================================
+
+    def _build_ai_recommendation(
+        self,
+        verdict,
+        confidence,
+        yield_analysis,
+        development_analysis
+    ):
+        """
+        Build a concise recommendation from the existing ACOT signals.
+
+        This intentionally avoids a second LLM/Gemini call, so adding the
+        recommendation does not increase API usage or latency.
+        """
+
+        verdict_text = str(verdict or "Neutral")
+        confidence_text = str(confidence or "Low")
+
+        if verdict_text == "Attractive":
+            recommendation = (
+                "Available investment signals are positive. "
+                "Validate pricing, rental assumptions, and current market data "
+                "before making a final decision."
+            )
+
+        elif verdict_text == "Moderately Attractive":
+            recommendation = (
+                "Available signals are moderately positive. "
+                "Further validation of rental performance, pricing, and project "
+                "status is recommended."
+            )
+
+        elif verdict_text == "Moderately Risky":
+            recommendation = (
+                "Available signals indicate caution. Review development exposure "
+                "and validate rental and market assumptions before proceeding."
+            )
+
+        elif verdict_text == "High Risk":
+            recommendation = (
+                "Available signals indicate elevated risk. Additional property, "
+                "rental, and market due diligence is recommended."
+            )
+
+        else:
+            recommendation = (
+                "Available evidence is mixed or limited. Gather additional rental "
+                "and market data before relying on the current assessment."
+            )
+
+        if confidence_text == "Low":
+            recommendation += (
+                " Confidence is low because the available sample is limited."
+            )
+
+        return {
+            "text": recommendation,
+            "verdict": verdict_text,
+            "confidence": confidence_text,
+        }
+
 
     # =================================================
     # RENTAL YIELD ANALYSIS

@@ -1,30 +1,67 @@
 """
 ACOT Hybrid Context Builder
 
-Builds the final grounded context from:
+Builds compact, grounded context for the RAG/LLM layer from:
 
 1. Supabase PostgreSQL structured data
 2. Supabase pgvector document chunks
 
-Expected input from HybridRetriever:
-
-{
-    "route": "...",
-    "question_type": "...",
-    "project_name": "...",
-    "community_name": "...",
-    "communities": [...],
-    "projects": [...],
-    "sub_communities": [...],
-    "documents": [...]
-}
+Optimization goals:
+- Preserve project/community/sub-community ordering.
+- Keep the fields needed for factual answers.
+- Remove unnecessary IDs, coordinates, URLs, and duplicate metadata from
+  the Gemini prompt.
+- Bound long description/knowledge/document text so prompt size stays small.
+- Keep the existing build_context() interface compatible with run.py.
 """
 
 
 class HybridContextBuilder:
 
+    # Keep long database text bounded so simple requests do not send huge
+    # descriptions/knowledge fields to Gemini.
+    MAX_DESCRIPTION_CHARS = 800
+    MAX_KNOWLEDGE_CHARS = 1200
+    MAX_DOCUMENT_CHARS = 3500
+
     def __init__(self):
         pass
+
+    # ============================================================
+    # HELPERS
+    # ============================================================
+
+    @staticmethod
+    def _compact_text(value, max_chars):
+        """Return a compact single-line text value with a safe length."""
+        if value is None:
+            return None
+
+        text = str(value).strip()
+
+        if not text:
+            return None
+
+        if len(text) <= max_chars:
+            return text
+
+        return text[:max_chars].rstrip() + "..."
+
+    @staticmethod
+    def _list_text(value):
+        """Convert list-like database fields into compact readable text."""
+        if not value:
+            return None
+
+        if isinstance(value, (list, tuple)):
+            values = [str(item).strip() for item in value if str(item).strip()]
+            return ", ".join(values) if values else None
+
+        return str(value).strip() or None
+
+    @staticmethod
+    def _value(value, default="N/A"):
+        return default if value is None or value == "" else value
 
     # ============================================================
     # MAIN METHOD
@@ -39,19 +76,26 @@ class HybridContextBuilder:
         community_results=None,
     ):
         """
-        Build one combined context.
+        Build one compact combined context.
 
-        Supports both the new single-result interface and the older
+        Supports both the new single-result interface and the existing
         keyword-based interface used by run.py.
         """
 
-        # Normalize old run.py arguments into the canonical retrieval result.
+        # Normalize existing run.py arguments into the canonical structure.
         if retrieval_result is None:
             structured_summary = structured_summary or {}
+
             retrieval_result = {
-                "communities": structured_summary.get("community", []) or [],
-                "projects": structured_summary.get("projects", []) or [],
-                "sub_communities": structured_summary.get("sub_communities", []) or [],
+                "communities": structured_summary.get(
+                    "community", []
+                ) or [],
+                "projects": structured_summary.get(
+                    "projects", []
+                ) or [],
+                "sub_communities": structured_summary.get(
+                    "sub_communities", []
+                ) or [],
                 "documents": document_results or [],
             }
 
@@ -60,35 +104,30 @@ class HybridContextBuilder:
 
         context_parts = []
 
-        # ========================================================
-        # STRUCTURED DATA
-        # ========================================================
-
         structured_context = self._build_structured_context(
             retrieval_result
         )
 
         if structured_context:
-            context_parts.append(
-                structured_context
-            )
-
-        # ========================================================
-        # PGVECTOR DOCUMENT DATA
-        # ========================================================
+            context_parts.append(structured_context)
 
         document_context = self._build_document_context(
             retrieval_result
         )
 
         if document_context:
-            context_parts.append(
-                document_context
+            context_parts.append(document_context)
+
+        # Include investment analysis when a caller supplies it.
+        # This keeps the builder compatible with future direct callers,
+        # while run.py can continue to use its existing interface.
+        if investment_analysis:
+            investment_context = self._build_investment_context(
+                investment_analysis
             )
 
-        # ========================================================
-        # FINAL CONTEXT
-        # ========================================================
+            if investment_context:
+                context_parts.append(investment_context)
 
         if not context_parts:
             return "No relevant information was retrieved."
@@ -99,38 +138,23 @@ class HybridContextBuilder:
     # STRUCTURED CONTEXT
     # ============================================================
 
-    def _build_structured_context(
-        self,
-        retrieval_result,
-    ):
+    def _build_structured_context(self, retrieval_result):
 
         communities = (
-            retrieval_result.get(
-                "communities",
-                []
-            )
+            retrieval_result.get("communities", [])
+            or retrieval_result.get("community", [])
             or []
         )
 
         projects = (
-            retrieval_result.get(
-                "projects",
-                []
-            )
+            retrieval_result.get("projects", [])
             or []
         )
 
         sub_communities = (
-            retrieval_result.get(
-                "sub_communities",
-                []
-            )
+            retrieval_result.get("sub_communities", [])
             or []
         )
-
-        # --------------------------------------------------------
-        # Nothing structured
-        # --------------------------------------------------------
 
         if not (
             communities
@@ -139,452 +163,278 @@ class HybridContextBuilder:
         ):
             return ""
 
-        context = """
+        context_parts = [
+            "SUPABASE STRUCTURED REAL ESTATE DATA",
+            "",
+            "Use this as the primary source for structured facts.",
+            "Project order below is authoritative and must be preserved.",
+            "",
+        ]
 
-SUPABASE STRUCTURED REAL ESTATE DATA
-
-The following information was retrieved directly from the
-Supabase PostgreSQL database.
-
-Use this as the primary source for structured real-estate
-information such as projects, communities, developers,
-prices, bedrooms, property types, handover dates and URLs.
-
-"""
         # ========================================================
         # PROJECTS
         # ========================================================
 
         if projects:
+            context_parts.extend([
+                "PROJECTS",
+                "",
+            ])
 
-            context += """
+            for index, project in enumerate(projects, start=1):
 
-PROJECTS
-
-"""
-            for index, project in enumerate(
-                projects,
-                start=1
-            ):
-
-                context += (
-                    f"PROJECT {index}\n\n"
+                name = self._value(
+                    project.get("name")
                 )
 
-                context += (
-                    f"Project ID:\n"
-                    f"{project.get('id', 'N/A')}\n\n"
+                developer = self._value(
+                    project.get("developer_name")
                 )
 
-                context += (
-                    f"Project Name:\n"
-                    f"{project.get('name', 'N/A')}\n\n"
+                city = self._value(
+                    project.get("city")
                 )
 
-                context += (
-                    f"Description:\n"
-                    f"{project.get('description', 'N/A')}\n\n"
+                community = self._value(
+                    project.get("community")
                 )
 
-                context += (
-                    f"Status:\n"
-                    f"{project.get('status', 'N/A')}\n\n"
+                sub_community = self._value(
+                    project.get("sub_community")
                 )
 
-                context += (
-                    f"Project Status:\n"
-                    f"{project.get('project_status', 'N/A')}\n\n"
-                )
+                price = project.get("price")
 
-                context += (
-                    f"Developer:\n"
-                    f"{project.get('developer_name', 'N/A')}\n\n"
-                )
+                if price is None:
+                    price_text = "N/A"
+                else:
+                    price_text = f"AED {price}"
 
-                context += (
-                    f"Developer ID:\n"
-                    f"{project.get('developer_id', 'N/A')}\n\n"
-                )
+                bedroom_min = project.get("bedroom_min")
+                bedroom_max = project.get("bedroom_max")
 
-                context += (
-                    f"City:\n"
-                    f"{project.get('city', 'N/A')}\n\n"
-                )
-
-                context += (
-                    f"Community:\n"
-                    f"{project.get('community', 'N/A')}\n\n"
-                )
-
-                context += (
-                    f"Sub-community:\n"
-                    f"{project.get('sub_community', 'N/A')}\n\n"
-                )
-
-                context += (
-                    f"Latitude:\n"
-                    f"{project.get('latitude', 'N/A')}\n\n"
-                )
-
-                context += (
-                    f"Longitude:\n"
-                    f"{project.get('longitude', 'N/A')}\n\n"
-                )
-
-                # ------------------------------------------------
-                # Price
-                # ------------------------------------------------
-
-                price = project.get(
-                    "price"
-                )
-
-                if price is not None:
-
-                    context += (
-                        f"Price:\n"
-                        f"AED {price}\n\n"
+                if (
+                    bedroom_min is None
+                    and bedroom_max is None
+                ):
+                    bedrooms_text = "N/A"
+                elif bedroom_min is None:
+                    bedrooms_text = str(bedroom_max)
+                elif bedroom_max is None:
+                    bedrooms_text = str(bedroom_min)
+                elif bedroom_min == bedroom_max:
+                    bedrooms_text = str(bedroom_min)
+                else:
+                    bedrooms_text = (
+                        f"{bedroom_min}-{bedroom_max}"
                     )
 
-                else:
+                size_min = project.get("size_min")
+                size_max = project.get("size_max")
 
-                    context += (
-                        "Price:\n"
-                        "N/A\n\n"
+                if size_min is None and size_max is None:
+                    size_text = "N/A"
+                elif size_min is None:
+                    size_text = f"{size_max} sqft"
+                elif size_max is None:
+                    size_text = f"{size_min} sqft"
+                else:
+                    size_text = (
+                        f"{size_min}-{size_max} sqft"
                     )
 
-                # ------------------------------------------------
-                # Size
-                # ------------------------------------------------
-
-                context += (
-                    f"Minimum Size:\n"
-                    f"{project.get('size_min', 'N/A')} sqft\n\n"
+                property_types = self._list_text(
+                    project.get("property_types")
                 )
 
-                context += (
-                    f"Maximum Size:\n"
-                    f"{project.get('size_max', 'N/A')} sqft\n\n"
+                amenities = self._list_text(
+                    project.get("amenities")
                 )
 
-                # ------------------------------------------------
-                # Bedrooms
-                # ------------------------------------------------
-
-                context += (
-                    f"Minimum Bedrooms:\n"
-                    f"{project.get('bedroom_min', 'N/A')}\n\n"
+                description = self._compact_text(
+                    project.get("description"),
+                    self.MAX_DESCRIPTION_CHARS,
                 )
 
-                context += (
-                    f"Maximum Bedrooms:\n"
-                    f"{project.get('bedroom_max', 'N/A')}\n\n"
+                knowledge = self._compact_text(
+                    project.get("knowledge_text"),
+                    self.MAX_KNOWLEDGE_CHARS,
                 )
 
-                # ------------------------------------------------
-                # Property Types
-                # ------------------------------------------------
+                context_parts.extend([
+                    f"PROJECT {index}",
+                    f"Name: {name}",
+                    f"Developer: {developer}",
+                    f"City: {city}",
+                    f"Community: {community}",
+                    f"Sub-community: {sub_community}",
+                    f"Price: {price_text}",
+                    f"Bedrooms: {bedrooms_text}",
+                    f"Size: {size_text}",
+                    f"Property Types: {property_types or 'N/A'}",
+                    f"Status: {self._value(project.get('status'))}",
+                    (
+                        "Project Status: "
+                        f"{self._value(project.get('project_status'))}"
+                    ),
+                    (
+                        "Handover: "
+                        f"{self._value(project.get('handover_time'))}"
+                    ),
+                    f"Amenities: {amenities or 'N/A'}",
+                ])
 
-                property_types = project.get(
-                    "property_types"
-                )
-
-                if property_types:
-
-                    if isinstance(
-                        property_types,
-                        list
-                    ):
-
-                        property_types_text = (
-                            ", ".join(
-                                str(x)
-                                for x in property_types
-                            )
-                        )
-
-                    else:
-
-                        property_types_text = str(
-                            property_types
-                        )
-
-                else:
-
-                    property_types_text = "N/A"
-
-                context += (
-                    f"Property Types:\n"
-                    f"{property_types_text}\n\n"
-                )
-
-                # ------------------------------------------------
-                # Pool Type
-                # ------------------------------------------------
-
-                context += (
-                    f"Pool Type:\n"
-                    f"{project.get('pool_type', 'N/A')}\n\n"
-                )
-
-                # ------------------------------------------------
-                # Handover
-                # ------------------------------------------------
-
-                context += (
-                    f"Handover:\n"
-                    f"{project.get('handover_time', 'N/A')}\n\n"
-                )
-
-                # ------------------------------------------------
-                # Amenities codes
-                # ------------------------------------------------
-
-                amenities = project.get(
-                    "amenities"
-                )
-
-                if amenities:
-
-                    if isinstance(
-                        amenities,
-                        list
-                    ):
-
-                        amenities_text = (
-                            ", ".join(
-                                str(x)
-                                for x in amenities
-                            )
-                        )
-
-                    else:
-
-                        amenities_text = str(
-                            amenities
-                        )
-
-                else:
-
-                    amenities_text = "N/A"
-
-                context += (
-                    f"Amenities:\n"
-                    f"{amenities_text}\n\n"
-                )
-
-                # ------------------------------------------------
-                # URLs
-                # ------------------------------------------------
-
-                context += (
-                    f"Brochure URL:\n"
-                    f"{project.get('brochure_url', 'N/A')}\n\n"
-                )
-
-                context += (
-                    f"Property Finder URL:\n"
-                    f"{project.get('property_finder_url', 'N/A')}\n\n"
-                )
-
-                context += (
-                    f"Source:\n"
-                    f"{project.get('source', 'N/A')}\n\n"
-                )
-
-                # ------------------------------------------------
-                # Knowledge text
-                # ------------------------------------------------
-
-                knowledge_text = project.get(
-                    "knowledge_text"
-                )
-
-                if knowledge_text:
-
-                    context += (
-                        "Knowledge:\n"
-                        f"{knowledge_text}\n\n"
+                if description:
+                    context_parts.append(
+                        f"Description: {description}"
                     )
 
-                context += (
-                    "------------------------\n\n"
-                )
+                if knowledge:
+                    context_parts.append(
+                        f"Knowledge: {knowledge}"
+                    )
+
+                context_parts.extend([
+                    "",
+                    "------------------------",
+                    "",
+                ])
 
         # ========================================================
         # COMMUNITIES
         # ========================================================
 
         if communities:
+            context_parts.extend([
+                "COMMUNITIES",
+                "",
+            ])
 
-            context += """
-
-COMMUNITIES
-
-"""
             for index, community in enumerate(
                 communities,
-                start=1
+                start=1,
             ):
 
-                context += (
-                    f"COMMUNITY {index}\n\n"
+                knowledge = self._compact_text(
+                    community.get("knowledge_text"),
+                    self.MAX_KNOWLEDGE_CHARS,
                 )
 
-                context += (
-                    f"Community ID:\n"
-                    f"{community.get('id', 'N/A')}\n\n"
+                context_parts.extend([
+                    f"COMMUNITY {index}",
+                    f"Name: {self._value(community.get('name'))}",
+                    f"Slug: {self._value(community.get('slug'))}",
+                    f"City: {self._value(community.get('city'))}",
+                ])
+
+                # Keep useful inventory information but omit IDs,
+                # coordinates and other metadata from the LLM prompt.
+                inventory_fields = (
+                    "sell_properties_count",
+                    "rent_properties_count",
+                    "projects_count",
+                    "pool_projects_count",
+                    "total_count",
                 )
 
-                context += (
-                    f"Name:\n"
-                    f"{community.get('name', 'N/A')}\n\n"
-                )
+                inventory = []
 
-                context += (
-                    f"Slug:\n"
-                    f"{community.get('slug', 'N/A')}\n\n"
-                )
+                for field in inventory_fields:
+                    value = community.get(field)
 
-                context += (
-                    f"City:\n"
-                    f"{community.get('city', 'N/A')}\n\n"
-                )
+                    if value is not None:
+                        inventory.append(
+                            f"{field}={value}"
+                        )
 
-                context += (
-                    f"Knowledge:\n"
-                    f"{community.get('knowledge_text', 'N/A')}\n\n"
-                )
+                if inventory:
+                    context_parts.append(
+                        "Inventory: " + ", ".join(inventory)
+                    )
 
-                context += (
-                    "------------------------\n\n"
-                )
+                if knowledge:
+                    context_parts.append(
+                        f"Knowledge: {knowledge}"
+                    )
+
+                context_parts.extend([
+                    "",
+                    "------------------------",
+                    "",
+                ])
 
         # ========================================================
-        # SUB COMMUNITIES
+        # SUB-COMMUNITIES
         # ========================================================
 
         if sub_communities:
+            context_parts.extend([
+                "SUB-COMMUNITIES",
+                "",
+            ])
 
-            context += """
-
-SUB-COMMUNITIES
-
-"""
             for index, sub in enumerate(
                 sub_communities,
-                start=1
+                start=1,
             ):
 
-                context += (
-                    f"SUB-COMMUNITY {index}\n\n"
+                knowledge = self._compact_text(
+                    sub.get("knowledge_text"),
+                    self.MAX_KNOWLEDGE_CHARS,
                 )
 
-                context += (
-                    f"Name:\n"
-                    f"{sub.get('name', 'N/A')}\n\n"
-                )
+                context_parts.extend([
+                    f"SUB-COMMUNITY {index}",
+                    f"Name: {self._value(sub.get('name'))}",
+                    (
+                        "Community: "
+                        f"{self._value(sub.get('community'))}"
+                    ),
+                    f"City: {self._value(sub.get('city'))}",
+                ])
 
-                context += (
-                    f"Community:\n"
-                    f"{sub.get('community', 'N/A')}\n\n"
-                )
+                if knowledge:
+                    context_parts.append(
+                        f"Knowledge: {knowledge}"
+                    )
 
-                context += (
-                    f"City:\n"
-                    f"{sub.get('city', 'N/A')}\n\n"
-                )
+                context_parts.extend([
+                    "",
+                    "------------------------",
+                    "",
+                ])
 
-                context += (
-                    f"Knowledge:\n"
-                    f"{sub.get('knowledge_text', 'N/A')}\n\n"
-                )
-
-                context += (
-                    "------------------------\n\n"
-                )
-
-        return context
+        return "\n".join(context_parts).strip()
 
     # ============================================================
     # DOCUMENT CONTEXT
     # ============================================================
 
-    def _build_document_context(
-        self,
-        retrieval_result,
-    ):
+    def _build_document_context(self, retrieval_result):
 
         documents = (
-            retrieval_result.get(
-                "documents",
-                []
-            )
+            retrieval_result.get("documents", [])
             or []
         )
 
         if not documents:
             return ""
 
-        context = """
-
-SUPABASE PGVECTOR DOCUMENT KNOWLEDGE
-
-The following information was retrieved from document chunks
-stored in Supabase pgvector.
-
-Use this information for document-specific questions such as
-amenities, security features, interiors, finishes, views,
-floor plans, dimensions and facilities.
-
-Do not invent information that is not present in these
-retrieved document chunks.
-
-"""
+        context_parts = [
+            "SUPABASE PGVECTOR DOCUMENT KNOWLEDGE",
+            "",
+            "Use these retrieved document chunks only for "
+            "document-specific facts.",
+            "",
+        ]
 
         seen_chunks = set()
+        output_index = 0
 
-        for index, item in enumerate(
-            documents,
-            start=1
-        ):
+        for item in documents:
 
-            document_id = item.get(
-                "document_id"
-            )
-
-            document_title = item.get(
-                "document_title",
-                "Unknown Document"
-            )
-
-            document_url = item.get(
-                "document_url",
-                ""
-            )
-
-            document_type = item.get(
-                "document_type",
-                "unknown"
-            )
-
-            publisher = item.get(
-                "publisher",
-                "Unknown Publisher"
-            )
-
-            chunk_id = item.get(
-                "chunk_id"
-            )
-
-            content = item.get(
-                "content",
-                ""
-            )
-
-            similarity = item.get(
-                "similarity"
-            )
+            document_id = item.get("document_id")
+            chunk_id = item.get("chunk_id")
 
             unique_key = (
                 document_id,
@@ -594,53 +444,109 @@ retrieved document chunks.
             if unique_key in seen_chunks:
                 continue
 
-            seen_chunks.add(
-                unique_key
+            seen_chunks.add(unique_key)
+            output_index += 1
+
+            title = self._value(
+                item.get("document_title"),
+                "Unknown Document",
             )
 
-            context += (
-                f"\nDOCUMENT CHUNK {index}\n\n"
+            document_type = self._value(
+                item.get("document_type"),
+                "unknown",
             )
 
-            context += (
-                f"Document ID:\n"
-                f"{document_id or 'N/A'}\n\n"
+            publisher = self._value(
+                item.get("publisher"),
+                "Unknown Publisher",
             )
 
-            context += (
-                f"Document Title:\n"
-                f"{document_title}\n\n"
+            content = self._compact_text(
+                item.get("content"),
+                self.MAX_DOCUMENT_CHARS,
             )
 
-            context += (
-                f"Document Type:\n"
-                f"{document_type}\n\n"
-            )
+            if not content:
+                continue
 
-            context += (
-                f"Publisher:\n"
-                f"{publisher}\n\n"
-            )
+            similarity = item.get("similarity")
 
-            if similarity is not None:
+            if similarity is None:
+                similarity_text = "N/A"
+            else:
+                try:
+                    similarity_text = f"{float(similarity):.4f}"
+                except (TypeError, ValueError):
+                    similarity_text = str(similarity)
 
-                context += (
-                    f"Similarity:\n"
-                    f"{similarity:.4f}\n\n"
+            context_parts.extend([
+                f"DOCUMENT CHUNK {output_index}",
+                f"Title: {title}",
+                f"Type: {document_type}",
+                f"Publisher: {publisher}",
+                f"Similarity: {similarity_text}",
+                f"Content: {content}",
+                "",
+                "------------------------",
+                "",
+            ])
+
+        if output_index == 0:
+            return ""
+
+        return "\n".join(context_parts).strip()
+
+    # ============================================================
+    # INVESTMENT CONTEXT
+    # ============================================================
+
+    def _build_investment_context(self, investment_analysis):
+
+        if not isinstance(investment_analysis, dict):
+            return ""
+
+        fields = (
+            ("Investment Verdict", "investment_verdict"),
+            ("Investment Score", "investment_score"),
+            ("Confidence", "confidence"),
+            ("Summary", "summary"),
+            ("Gross Estimated Rental Yield", "gross_rental_yield"),
+            ("Records Found", "records_found"),
+            ("Data Limitations", "limitations"),
+        )
+
+        lines = [
+            "ACOT INVESTMENT ANALYSIS",
+            "",
+        ]
+
+        added = False
+
+        for label, key in fields:
+            value = investment_analysis.get(key)
+
+            if value is None or value == "":
+                continue
+
+            if isinstance(value, (list, tuple)):
+                value = ", ".join(
+                    str(item)
+                    for item in value
                 )
 
-            context += (
-                f"Source URL:\n"
-                f"{document_url}\n\n"
+            value = self._compact_text(
+                value,
+                self.MAX_KNOWLEDGE_CHARS,
             )
 
-            context += (
-                "Content:\n"
-                f"{content}\n\n"
-            )
+            if value:
+                lines.append(
+                    f"{label}: {value}"
+                )
+                added = True
 
-            context += (
-                "------------------------\n"
-            )
+        if not added:
+            return ""
 
-        return context
+        return "\n".join(lines)
