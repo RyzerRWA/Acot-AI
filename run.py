@@ -1,9 +1,11 @@
 import os
+import re
 import io
 import time
 import json
 from contextlib import redirect_stdout, redirect_stderr
 from dotenv import load_dotenv
+from supabase import create_client, Client
 
 # =========================================================
 # ENVIRONMENT
@@ -1008,6 +1010,13 @@ def _is_fast_structured_question(
     if not any(term in q for term in structured_terms):
         return False
 
+    # A conversational filter may produce zero matching projects while
+    # still retaining the previous projects as filter evidence. Keep this
+    # on the deterministic fast path so ACOT can explain the no-match
+    # result without another LLM call.
+    if structured_summary.get("filter_no_match"):
+        return True
+
     return bool(
         structured_summary.get("projects")
         or structured_summary.get("community")
@@ -1028,6 +1037,69 @@ def _build_fast_structured_answer(
     projects = structured_summary.get("projects", []) or []
     communities = structured_summary.get("community", []) or []
     sub_communities = structured_summary.get("sub_communities", []) or []
+
+    # ---------------------------------------------------------
+    # CONVERSATIONAL FILTER: ZERO MATCHES
+    # ---------------------------------------------------------
+    # Example:
+    #   Q1: Show me projects in Dubai Marina
+    #   Q2: Which of these have 2 bedroom options?
+    #
+    # `projects` is intentionally empty because no candidate matched the
+    # filter. `filter_evidence_projects` contains the previous candidates
+    # so we can explain the result using the real Supabase data.
+    if structured_summary.get("filter_no_match"):
+        evidence_projects = (
+            structured_summary.get(
+                "filter_evidence_projects",
+                []
+            )
+            or []
+        )
+
+        bedroom_match = re.search(
+            r"\b(\d+)\s*(?:-?\s*)bed(?:room)?s?\b",
+            q,
+        )
+
+        if bedroom_match and evidence_projects:
+            requested_bedrooms = int(
+                bedroom_match.group(1)
+            )
+
+            lines = [
+                f"No retrieved projects have "
+                f"{requested_bedrooms}-bedroom options."
+            ]
+
+            for project in evidence_projects:
+                name = project.get("name") or "Unknown project"
+                bedroom_label = _format_bedrooms(project)
+
+                if bedroom_label is not None:
+                    lines.append(
+                        f"{name} offers {bedroom_label} bedrooms."
+                    )
+                else:
+                    lines.append(
+                        f"{name} does not have bedroom information "
+                        f"available in the current data."
+                    )
+
+            return "\n".join(lines)
+
+        # Generic fallback for other conversational filters.
+        if evidence_projects:
+            names = [
+                project.get("name") or "Unknown project"
+                for project in evidence_projects
+            ]
+            return (
+                "None of the previously retrieved projects matched "
+                "the requested filter. Previous candidates: "
+                + ", ".join(names)
+                + "."
+            )
 
     if projects:
         lines = []
@@ -1275,7 +1347,21 @@ def ask_acot(
         "sub_communities": structured_data.get(
             "sub_communities",
             []
-        )
+        ),
+        "filter_no_match": result.get(
+            "filter_no_match",
+            structured_data.get(
+                "filter_no_match",
+                False
+            )
+        ),
+        "filter_evidence_projects": result.get(
+            "filter_evidence_projects",
+            structured_data.get(
+                "filter_evidence_projects",
+                []
+            )
+        ) or [],
     }
 
     investment_analysis = None
