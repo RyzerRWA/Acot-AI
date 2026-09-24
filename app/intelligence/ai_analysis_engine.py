@@ -599,38 +599,12 @@ class AIAnalysisEngine:
             )
         )
 
-        if score >= 80:
-            confidence = "High"
+        # Always return a numeric ACOT score.
+        # The score measures evidence coverage/quality,
+        # not investment quality or market performance.
+        score = max(5, min(score, 100))
 
-        elif score >= 60:
-            confidence = "Medium"
-
-        else:
-            confidence = "Low"
-
-        return {
-            "score": score,
-            "scale": 100,
-            "confidence": confidence,
-            "basis": {
-                "evidence_completeness":
-                    evidence_completeness,
-                "entity_coverage":
-                    entity_coverage,
-                "query_fit":
-                    query_fit,
-                "source_diversity":
-                    source_diversity,
-            },
-            "description": (
-                "ACOT Score represents the "
-                "quality and completeness of "
-                "the retrieved evidence for "
-                "this analysis. It is not a "
-                "guaranteed investment return "
-                "or market prediction."
-            ),
-        }
+        return score
 
     # =========================================================
     # RECOMMENDATION
@@ -768,58 +742,69 @@ class AIAnalysisEngine:
             )
 
         # -----------------------------------------------------
-        # AI solution
+        # Confidence + deterministic AI solution fallback
         # -----------------------------------------------------
 
-        if projects:
-
-            ai_solution = (
-                "Use the retrieved project data "
-                "to evaluate the user's stated "
-                "requirements. The available "
-                "evidence can support comparison "
-                "of price, bedrooms, developer, "
-                "property type, status, and "
-                "handover where those fields exist."
+        if score >= 80:
+            confidence = "High"
+            recommendation_summary = (
+                "Strong relevant evidence was retrieved for this analysis."
             )
-
-        elif communities:
-
-            ai_solution = (
-                "Use the retrieved community "
-                "inventory and location data "
-                "as the basis for the analysis. "
-                "Additional project or document "
-                "evidence should be retrieved "
-                "before making a more detailed "
-                "analysis."
+        elif score >= 60:
+            confidence = "Medium"
+            recommendation_summary = (
+                "A good amount of relevant evidence was retrieved, "
+                "although some information may still be incomplete."
             )
-
+        elif score >= 40:
+            confidence = "Low"
+            recommendation_summary = (
+                "Some relevant evidence was retrieved, but the "
+                "available information is incomplete."
+            )
         else:
+            confidence = "Low"
+            recommendation_summary = (
+                "Very limited relevant evidence was retrieved. "
+                "The result should be treated as preliminary."
+            )
 
+        if projects:
+            project_names = [p.get("name") for p in projects if p.get("name")]
+            if len(project_names) == 1:
+                ai_solution = (
+                    f"The retrieved evidence contains the project {project_names[0]}. "
+                    "Use the available project attributes such as price, bedrooms, "
+                    "developer, property type, status, and handover to address the "
+                    "user's request. Missing attributes should be verified from "
+                    "additional ACOT evidence."
+                )
+            else:
+                ai_solution = (
+                    f"The retrieved evidence contains {len(project_names)} projects. "
+                    "Use the available project attributes to address the user's "
+                    "request and compare only fields supported by the retrieved evidence."
+                )
+        elif communities:
             ai_solution = (
-                "Retrieve relevant ACOT structured "
-                "and document evidence before "
-                "generating an analysis."
+                f"The retrieved evidence contains {len(communities)} community record(s). "
+                "Use the available community inventory and location information to "
+                "address the request. Retrieve project-level or document evidence "
+                "when additional detail is required."
+            )
+        else:
+            ai_solution = (
+                "Very limited relevant ACOT evidence was found. Refine the entity or "
+                "query and retrieve additional structured records or supporting "
+                "documents before making a detailed assessment."
             )
 
         return {
-            "summary": (
-                "The ACOT recommendation is "
-                "based only on the retrieved "
-                "evidence."
-            ),
-            "positive_factors":
-                positive_factors,
-            "considerations":
-                considerations,
-            "ai_solution":
-                ai_solution,
-            "confidence":
-                score.get(
-                    "confidence",
-                    "Low"
-                ),
+            "summary": recommendation_summary,
+            "positive_factors": positive_factors,
+            "considerations": considerations,
+            "ai_solution": ai_solution,
+            "confidence": confidence,
         }
 
     # =========================================================
@@ -852,7 +837,7 @@ DOCUMENT EVIDENCE:
 {json.dumps(documents, indent=2, default=str)}
 
 ACOT SCORE:
-{json.dumps(score, indent=2, default=str)}
+{score}
 
 RULES:
 1. Never invent property, community, price, rental, ROI,
@@ -862,9 +847,23 @@ RULES:
 4. Provide useful positive factors supported by evidence.
 5. Do not claim that something is a good investment merely
    because it exists in the data.
-6. Do not create unsupported numerical scores.
+6. Do not create or modify the ACOT score.
 7. The supplied ACOT score is an evidence-coverage score.
 8. Keep the analysis concise and structured.
+9. The ai_solution must directly address the user's question using only the supplied evidence.
+10. If evidence is missing, explain what can and cannot be concluded and state what additional evidence is needed.
+11. Identify the entity type of every retrieved entity.
+12. A project and a community are different entities.
+13. If the question compares a project with a community,
+    explicitly state that they are different entity levels.
+14. If one compared entity is a community, summarize the
+    relevant projects retrieved for that community.
+15. Do not omit retrieved entities when they are relevant
+    to the comparison.
+16. Do not treat a community as if it were a single project.
+17. Do not make unsupported judgments such as "better",
+    "best", "more attractive", or "better investment".
+18. Base every comparison point on the supplied evidence.
 
 Return ONLY valid JSON:
 
