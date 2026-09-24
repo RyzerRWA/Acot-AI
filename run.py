@@ -982,6 +982,16 @@ def _is_fast_structured_question(
         "layouts",
         "view",
         "views",
+        "different",
+        "what makes",
+        "stand out",
+        "explain",
+        "describe",
+        "why ",
+        "how does",
+        "facilities",
+        "overview",
+        "details",
     )
 
     if any(term in q for term in blocked_terms):
