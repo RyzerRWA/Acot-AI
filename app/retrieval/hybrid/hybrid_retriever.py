@@ -29,6 +29,25 @@ from typing import Any, Dict, List, Optional
 
 
 class HybridRetriever:
+
+    # ============================================================
+    # ENTITY ALIASES
+    # ============================================================
+    # Canonical names used by the structured database.
+    ENTITY_ALIASES = {
+        "community": {
+            "jvc": "Jumeirah Village Circle",
+            "jumeirah village": "Jumeirah Village Circle",
+            "jumeirah village circle": "Jumeirah Village Circle",
+            "dubai marina": "Dubai Marina",
+        },
+        "project": {},
+        "property": {},
+        "developer": {},
+        "sub_community": {},
+        "city": {},
+    }
+
     """
     Main retrieval layer for ACOT.
 
@@ -138,6 +157,430 @@ class HybridRetriever:
             "projects": [],
             "sub_communities": [],
         }
+
+    # ============================================================
+    # ENTITY NORMALIZATION
+    # ============================================================
+
+    @classmethod
+    def _normalize_entity_name(
+        cls,
+        entity_type: str,
+        entity_name: str,
+    ) -> str:
+        """Normalize a user-facing alias to a canonical database name."""
+        entity_type = str(entity_type or "").strip().lower()
+        entity_name = str(entity_name or "").strip()
+
+        if not entity_name:
+            return ""
+
+        aliases = cls.ENTITY_ALIASES.get(entity_type, {})
+        return aliases.get(entity_name.lower(), entity_name)
+
+    def _extract_comparison_candidates(
+        self,
+        question: str,
+        query_plan=None,
+    ) -> List[str]:
+        """Return explicit entities participating in a comparison.
+
+        Prefer planner candidates, then supplement them from the natural
+        language comparison itself. This is intentionally conservative: it
+        only extracts the entity slots around common comparison operators.
+        """
+        candidates = []
+
+        planned = (
+            getattr(query_plan, "entity_candidates", None) or []
+            if query_plan is not None
+            else []
+        )
+        for value in planned:
+            value = str(value or "").strip()
+            if value and value not in candidates:
+                candidates.append(value)
+
+        q = (question or "").strip()
+        if not q:
+            return candidates
+
+        # Examples handled:
+        #   Compare A and B
+        #   Compare A vs B
+        #   Compare A versus B
+        #   Compare A & B
+        match = re.search(
+            r"^\s*compare\s+(.+?)\s+(?:and|vs\.?|versus|&)\s+(.+?)\s*$",
+            q,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            extracted = [match.group(1).strip(), match.group(2).strip()]
+            for value in extracted:
+                if value and value not in candidates:
+                    candidates.append(value)
+
+        return candidates
+
+    def _resolve_one_comparison_entity(
+        self,
+        candidate: str,
+        planned_entity_type: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve one comparison candidate independently.
+
+        Unlike the old implementation, a comparison is allowed to contain
+        different entity types, e.g. a project + a community.
+        """
+        requested_name = str(candidate or "").strip()
+        if not requested_name:
+            return None
+
+        # ------------------------------------------------------------
+        # 1. Explicit aliases are authoritative.
+        # ------------------------------------------------------------
+        candidate_lower = requested_name.lower()
+        for entity_type, aliases in self.ENTITY_ALIASES.items():
+            canonical = aliases.get(candidate_lower)
+            if canonical:
+                return {
+                    "entity_type": entity_type,
+                    "requested_name": requested_name,
+                    "resolved_name": canonical,
+                }
+
+        # ------------------------------------------------------------
+        # 2. Explicit planner type is useful only for this candidate.
+        #    It must NOT force the type of every comparison candidate.
+        # ------------------------------------------------------------
+        valid_types = {
+            "community",
+            "project",
+            "property",
+            "developer",
+            "sub_community",
+            "city",
+        }
+        planned_type = str(planned_entity_type or "").strip().lower()
+
+        # ------------------------------------------------------------
+        # 3. Resolve against the actual structured database.
+        #    Exact entity existence beats LLM classification.
+        # ------------------------------------------------------------
+        if self.structured_retriever is not None:
+            if planned_type in {"project", "property"}:
+                try:
+                    matches = (
+                        self.structured_retriever.search_projects_by_name(
+                            requested_name
+                        ) or []
+                    )
+                    if matches:
+                        return {
+                            "entity_type": "project" if planned_type == "project" else "property",
+                            "requested_name": requested_name,
+                            "resolved_name": str(
+                                matches[0].get("name") or requested_name
+                            ).strip(),
+                        }
+                except Exception:
+                    pass
+
+            if planned_type == "community":
+                try:
+                    matches = (
+                        self.structured_retriever.search_community(
+                            requested_name
+                        ) or []
+                    )
+                    if matches:
+                        return {
+                            "entity_type": "community",
+                            "requested_name": requested_name,
+                            "resolved_name": str(
+                                matches[0].get("name") or requested_name
+                            ).strip(),
+                        }
+                except Exception:
+                    pass
+
+            # Generic entity probing. Order matters because project names are
+            # often also described using location words.
+            try:
+                project_matches = (
+                    self.structured_retriever.search_projects_by_name(
+                        requested_name
+                    ) or []
+                )
+                if project_matches:
+                    return {
+                        "entity_type": "project",
+                        "requested_name": requested_name,
+                        "resolved_name": str(
+                            project_matches[0].get("name") or requested_name
+                        ).strip(),
+                    }
+            except Exception:
+                pass
+
+            try:
+                community_matches = (
+                    self.structured_retriever.search_community(
+                        requested_name
+                    ) or []
+                )
+                if community_matches:
+                    return {
+                        "entity_type": "community",
+                        "requested_name": requested_name,
+                        "resolved_name": str(
+                            community_matches[0].get("name") or requested_name
+                        ).strip(),
+                    }
+            except Exception:
+                pass
+
+        # ------------------------------------------------------------
+        # 4. If the planner supplied a type but DB lookup could not verify
+        #    it, keep the candidate as a typed entity only when the type is
+        #    unambiguous. Retrieval will then determine whether data exists.
+        # ------------------------------------------------------------
+        if planned_type in valid_types:
+            return {
+                "entity_type": planned_type,
+                "requested_name": requested_name,
+                "resolved_name": self._normalize_entity_name(
+                    planned_type,
+                    requested_name,
+                ),
+            }
+
+        return None
+
+    def _resolve_comparison_entities(
+        self,
+        question: str,
+        query_plan=None,
+    ) -> List[Dict[str, Any]]:
+        """Resolve every explicit comparison candidate independently."""
+        if query_plan is not None and not getattr(
+            query_plan, "needs_comparison", False
+        ):
+            return []
+
+        candidates = self._extract_comparison_candidates(
+            question=question,
+            query_plan=query_plan,
+        )
+
+        if len(candidates) < 2:
+            return []
+
+        planned_type = str(
+            getattr(query_plan, "entity_type", "") or ""
+        ).strip().lower() if query_plan is not None else ""
+
+        resolved = []
+        seen = set()
+
+        for candidate in candidates:
+            entity = self._resolve_one_comparison_entity(
+                candidate=candidate,
+                planned_entity_type=planned_type,
+            )
+            if not entity:
+                print(
+                    "Comparison entity could not be resolved:",
+                    candidate,
+                )
+                continue
+
+            entity_type = entity["entity_type"]
+            resolved_name = entity["resolved_name"]
+            key = (entity_type, str(resolved_name).lower())
+            if key in seen:
+                continue
+
+            seen.add(key)
+            resolved.append(entity)
+
+        return resolved
+
+    # ============================================================
+    # GENERIC COMPARISON RETRIEVAL
+    # ============================================================
+
+    def _retrieve_single_entity_for_comparison(
+        self,
+        entity_type: str,
+        entity_name: str,
+    ) -> Dict[str, Any]:
+        """Dispatch one comparison entity to the appropriate retriever."""
+        entity_type = str(entity_type or "").strip().lower()
+        entity_name = str(entity_name or "").strip()
+
+        if not entity_name:
+            return self._empty_structured_result()
+
+        if entity_type == "community":
+            return self._retrieve_by_community(entity_name)
+
+        if entity_type == "project":
+            return self._retrieve_by_project(entity_name)
+
+        # ACOT currently has no separate property/listing table;
+        # project records are the structured source for property-style data.
+        if entity_type == "property":
+            return self._retrieve_by_project(entity_name)
+
+        if entity_type == "city":
+            return self._retrieve_by_city(entity_name)
+
+        if entity_type == "developer":
+            return self._retrieve_by_developer(entity_name)
+
+        if entity_type == "sub_community":
+            return self._retrieve_by_sub_community(entity_name)
+
+        return self._empty_structured_result()
+
+    def _retrieve_comparison_entities(
+        self,
+        entities: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Retrieve multiple explicit entities independently and preserve ownership."""
+        comparison_entities = []
+        merged_communities = []
+        merged_projects = []
+        merged_sub_communities = []
+
+        seen_communities = set()
+        seen_projects = set()
+        seen_sub_communities = set()
+
+        for entity in entities:
+            entity_type = str(entity.get("entity_type") or "").strip().lower()
+            requested_name = str(entity.get("requested_name") or "").strip()
+            resolved_name = str(entity.get("resolved_name") or requested_name).strip()
+
+            if not resolved_name:
+                continue
+
+            print(
+                "\nComparison entity:",
+                entity_type,
+                "| requested:", requested_name,
+                "| resolved:", resolved_name,
+            )
+
+            data = self._retrieve_single_entity_for_comparison(
+                entity_type=entity_type,
+                entity_name=resolved_name,
+            )
+            data = self._normalize_structured_result(data)
+
+            comparison_entities.append({
+                "entity_type": entity_type,
+                "requested_name": requested_name,
+                "resolved_name": resolved_name,
+                "data": data,
+            })
+
+            for community in data.get("communities", []) or []:
+                name = str(community.get("name") or "").strip()
+                key = name.lower()
+                if name and key not in seen_communities:
+                    merged_communities.append(community)
+                    seen_communities.add(key)
+
+            for project in data.get("projects", []) or []:
+                project_id = project.get("id")
+                name = str(project.get("name") or "").strip()
+                key = str(project_id) if project_id is not None else name.lower()
+                if key and key not in seen_projects:
+                    merged_projects.append(project)
+                    seen_projects.add(key)
+
+            for subcommunity in data.get("sub_communities", []) or []:
+                sub_id = subcommunity.get("id")
+                name = str(subcommunity.get("name") or "").strip()
+                key = str(sub_id) if sub_id is not None else name.lower()
+                if key and key not in seen_sub_communities:
+                    merged_sub_communities.append(subcommunity)
+                    seen_sub_communities.add(key)
+
+        return {
+            "comparison": True,
+            "comparison_entities": comparison_entities,
+            "communities": merged_communities,
+            "projects": merged_projects,
+            "sub_communities": merged_sub_communities,
+        }
+
+    # ============================================================
+    # DEVELOPER RETRIEVAL
+    # ============================================================
+
+    def _retrieve_by_developer(
+        self,
+        developer_name: str,
+    ) -> Dict[str, Any]:
+        """Retrieve projects by developer name from the current schema."""
+        if not self.structured_retriever:
+            return self._empty_structured_result()
+
+        try:
+            supabase = self.structured_retriever.supabase
+            response = (
+                supabase
+                .table("projects")
+                .select("*")
+                .ilike("developer_name", f"%{developer_name}%")
+                .limit(1000)
+                .execute()
+            )
+
+            return {
+                "communities": [],
+                "projects": response.data or [],
+                "sub_communities": [],
+            }
+        except Exception as exc:
+            print("Developer retrieval error:", exc)
+            return self._empty_structured_result()
+
+    # ============================================================
+    # SUB-COMMUNITY RETRIEVAL
+    # ============================================================
+
+    def _retrieve_by_sub_community(
+        self,
+        sub_community_name: str,
+    ) -> Dict[str, Any]:
+        """Retrieve sub-community records from the current schema."""
+        if not self.structured_retriever:
+            return self._empty_structured_result()
+
+        try:
+            supabase = self.structured_retriever.supabase
+            response = (
+                supabase
+                .table("sub_communities")
+                .select("*")
+                .ilike("name", f"%{sub_community_name}%")
+                .limit(1000)
+                .execute()
+            )
+
+            return {
+                "communities": [],
+                "projects": [],
+                "sub_communities": response.data or [],
+            }
+        except Exception as exc:
+            print("Sub-community retrieval error:", exc)
+            return self._empty_structured_result()
 
     # ============================================================
     # APPLY PROJECT FILTERS
@@ -727,6 +1170,19 @@ class HybridRetriever:
             ),
             "projects": result.get("projects", []) or [],
             "sub_communities": result.get("sub_communities", []) or [],
+            "comparison": bool(result.get("comparison", False)),
+            "comparison_entities": (
+                result.get("comparison_entities", []) or []
+            ),
+            # Evidence retained when a conversational filter produces
+            # zero matches. This lets ACOT explain why nothing matched
+            # instead of incorrectly saying that no project data exists.
+            "filter_no_match": bool(
+                result.get("filter_no_match", False)
+            ),
+            "filter_evidence_projects": (
+                result.get("filter_evidence_projects", []) or []
+            ),
         }
 
     @staticmethod
@@ -838,6 +1294,10 @@ class HybridRetriever:
 
         allowed = set(scope)
 
+        # Preserve retrieval metadata even when data-scope filtering
+        # removes related collections. In particular, conversational
+        # zero-match filters need their original candidate projects as
+        # evidence for the final answer.
         return {
             "communities": (
                 structured_result.get("communities", [])
@@ -853,6 +1313,22 @@ class HybridRetriever:
                 structured_result.get("sub_communities", [])
                 if "sub_communities" in allowed
                 else []
+            ),
+            "comparison": bool(
+                structured_result.get("comparison", False)
+            ),
+            "comparison_entities": (
+                structured_result.get("comparison_entities", []) or []
+            ),
+            "filter_no_match": bool(
+                structured_result.get("filter_no_match", False)
+            ),
+            "filter_evidence_projects": (
+                structured_result.get(
+                    "filter_evidence_projects",
+                    []
+                )
+                or []
             ),
         }
 
@@ -999,7 +1475,30 @@ class HybridRetriever:
                 )
             )
 
-            if wants_multi_project:
+            # ----------------------------------------------------
+            # EXPLICIT MULTI-ENTITY COMPARISON
+            # ----------------------------------------------------
+            comparison_entities = self._resolve_comparison_entities(
+                question=question,
+                query_plan=query_plan,
+            )
+
+            explicit_multi_entity_comparison = (
+                len(comparison_entities) >= 2
+            )
+
+            if explicit_multi_entity_comparison:
+
+                print("\n================================")
+                print("MULTI-ENTITY COMPARISON")
+                print("================================")
+                print("Entities:", comparison_entities)
+
+                result = self._retrieve_comparison_entities(
+                    comparison_entities
+                )
+
+            elif wants_multi_project:
 
                 # ----------------------------------------------------
                 # Previous candidate-list follow-up
@@ -1120,11 +1619,32 @@ class HybridRetriever:
             # APPLY FILTERS
             # ----------------------------------------------------
 
-            result["projects"] = (
-                self._apply_project_filters(
-                    result.get("projects", []),
-                    filters,
-                )
+            original_projects = list(
+                result.get("projects", []) or []
+            )
+
+            filtered_projects = self._apply_project_filters(
+                original_projects,
+                filters,
+            )
+
+            # For a conversational candidate-list follow-up, keep the
+            # original projects as evidence when the requested filter
+            # matches none of them. The actual `projects` collection stays
+            # filtered (empty), so downstream data is never presented as a
+            # false match.
+            filter_no_match = (
+                bool(original_projects)
+                and not filtered_projects
+                and bool(filters)
+                and wants_multi_project
+                and not explicit_multi_entity_comparison
+            )
+
+            result["projects"] = filtered_projects
+            result["filter_no_match"] = filter_no_match
+            result["filter_evidence_projects"] = (
+                original_projects if filter_no_match else []
             )
 
             # A community lookup may internally fetch its projects and
@@ -1649,6 +2169,23 @@ class HybridRetriever:
 
             "sub_communities":
                 sub_communities,
+
+            "filter_no_match":
+                bool(
+                    structured_result.get(
+                        "filter_no_match",
+                        False
+                    )
+                ) if needs_structured else False,
+
+            "filter_evidence_projects":
+                (
+                    structured_result.get(
+                        "filter_evidence_projects",
+                        []
+                    )
+                    or []
+                ) if needs_structured else [],
         }
 
         # ========================================================
@@ -1755,6 +2292,19 @@ class HybridRetriever:
 
             "documents":
                 documents,
+
+            # Filter diagnostics/evidence for conversational follow-ups.
+            "filter_no_match":
+                structured_data.get(
+                    "filter_no_match",
+                    False
+                ),
+
+            "filter_evidence_projects":
+                structured_data.get(
+                    "filter_evidence_projects",
+                    []
+                ),
 
             # Compatibility
             "structured_data":

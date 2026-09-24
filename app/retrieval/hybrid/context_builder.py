@@ -20,7 +20,7 @@ class HybridContextBuilder:
 
     # Keep long database text bounded so simple requests do not send huge
     # descriptions/knowledge fields to Gemini.
-    MAX_DESCRIPTION_CHARS = 800
+    MAX_DESCRIPTION_CHARS = 2200
     MAX_KNOWLEDGE_CHARS = 1200
     MAX_DOCUMENT_CHARS = 3500
 
