@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from run import initialize_acot, ask_acot
 from app.memory.conversation_memory import ConversationMemory
+from app.intelligence.ai_analysis_engine import AIAnalysisEngine
 
 
 # ============================================================
@@ -65,6 +66,11 @@ def get_api_components():
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             _api_components = initialize_acot()
 
+        # Reuse the same OpenRouter-backed LLM client used by QueryPlanner.
+        _api_components["ai_analysis_engine"] = AIAnalysisEngine(
+            llm=_api_components["query_planner"]._llm_client
+        )
+
         print("ACOT backend initialized successfully.")
 
     return _api_components
@@ -92,76 +98,171 @@ def get_session_components(session_id: str):
 
 
 # ============================================================
-# BUILD SHORT AI SUMMARY
+# AI ANALYSIS SUMMARY
 # ============================================================
 
-def build_ai_summary(response):
+def _normalize_analysis_data(data):
+    """Normalize retriever project fields for AIAnalysisEngine scoring."""
+    if not isinstance(data, dict):
+        return {}
+
+    normalized = dict(data)
+
+    projects = []
+    for project in data.get("projects", []) or []:
+        if not isinstance(project, dict):
+            continue
+
+        item = dict(project)
+
+        # AIAnalysisEngine expects developer_name, while the retriever may
+        # return developer. Preserve the original field as well.
+        if item.get("developer_name") is None and item.get("developer") is not None:
+            item["developer_name"] = item.get("developer")
+
+        # AIAnalysisEngine expects bedroom_min / bedroom_max.
+        bedrooms = item.get("bedrooms")
+        if isinstance(bedrooms, dict):
+            if item.get("bedroom_min") is None:
+                item["bedroom_min"] = bedrooms.get("min")
+            if item.get("bedroom_max") is None:
+                item["bedroom_max"] = bedrooms.get("max")
+
+        projects.append(item)
+
+    normalized["projects"] = projects
+    return normalized
+
+
+def build_ai_summary(question, response, ai_analysis_engine):
+    """
+    Run the ACOT AI Analysis Engine for analytical queries.
+
+    The engine is used for comparison, ranking, analysis, and investment
+    queries. Documents are always initialized locally so a missing document
+    result cannot cause a NameError.
+    """
 
     data = response.get("data", {})
 
-    investment_analysis = data.get(
-        "investment_analysis"
+    if not isinstance(data, dict):
+        data = {}
+
+    # ---------------------------------------------------------
+    # Normalize project fields for AIAnalysisEngine
+    # ---------------------------------------------------------
+    normalized_projects = []
+
+    for project in data.get("projects", []) or []:
+        if not isinstance(project, dict):
+            continue
+
+        project = dict(project)
+
+        # Your Supabase/output format may use "developer".
+        # AIAnalysisEngine also understands "developer_name".
+        if (
+            project.get("developer_name") is None
+            and project.get("developer") is not None
+        ):
+            project["developer_name"] = project["developer"]
+
+        # Your output uses:
+        # bedrooms: {"min": 3, "max": 4, "label": "3-4"}
+        # AIAnalysisEngine scoring also checks bedroom_min/max.
+        bedrooms = project.get("bedrooms")
+
+        if isinstance(bedrooms, dict):
+            if project.get("bedroom_min") is None:
+                project["bedroom_min"] = bedrooms.get("min")
+
+            if project.get("bedroom_max") is None:
+                project["bedroom_max"] = bedrooms.get("max")
+
+        normalized_projects.append(project)
+
+    data["projects"] = normalized_projects
+
+    # ---------------------------------------------------------
+    # Documents -- ALWAYS initialize this locally
+    # ---------------------------------------------------------
+    documents = data.get("documents", [])
+
+    if not isinstance(documents, list):
+        documents = []
+
+    # ---------------------------------------------------------
+    # Determine question type
+    # ---------------------------------------------------------
+    question_type = (
+        response.get("question_type")
+        or "analysis"
     )
 
-    # --------------------------------------------------------
-    # Normal search / non-investment question
-    # --------------------------------------------------------
-
-    if not investment_analysis:
-
-        return {
-            "acot_score": None,
-            "recommendation": (
-                "Investment analysis is not applicable to this query."
-            )
-        }
-
-    # --------------------------------------------------------
-    # Get existing ACOT investment score
-    # --------------------------------------------------------
-
-    score = investment_analysis.get(
-        "investment_score"
-    )
-
-    verdict = investment_analysis.get(
-        "investment_verdict"
-    )
-
-    confidence = investment_analysis.get(
-        "confidence"
-    )
-
-    # --------------------------------------------------------
-    # Build short recommendation
-    # --------------------------------------------------------
-
-    if score == 0 and confidence == "Low":
-
-        recommendation = (
-            "Insufficient data for an investment decision."
-        )
-
-    elif verdict:
-
-        recommendation = verdict
-
-    else:
-
-        recommendation = (
-            "Investment recommendation is unavailable."
-        )
-
-    # --------------------------------------------------------
-    # Final AI summary
-    # --------------------------------------------------------
-
-    return {
-        "acot_score": score,
-        "recommendation": recommendation
+    supported_types = {
+        "comparison",
+        "ranking",
+        "analysis",
+        "investment",
     }
 
+    # Simple search/information queries do not need the
+    # AI analysis engine.
+    if question_type not in supported_types:
+        return {
+            "data": data,
+            "data_description": {},
+            "acot_recommendation": {},
+            "acot_score": None,
+        }
 
+    # ---------------------------------------------------------
+    # Run the actual ACOT AI Analysis Engine
+    # ---------------------------------------------------------
+    try:
+        analysis = ai_analysis_engine.analyze(
+            question=question,
+            structured_summary=data,
+            documents=documents,
+            question_type=question_type,
+        )
+
+        if not isinstance(analysis, dict):
+            return {
+                "data": data,
+                "data_description": {},
+                "acot_recommendation": {},
+                "acot_score": None,
+            }
+
+        return analysis
+
+    except Exception as exc:
+        print(
+            f"AI Analysis Engine error: {exc}"
+        )
+
+        # Keep the API alive even if LLM analysis fails.
+        return {
+            "data": data,
+            "data_description": {},
+            "acot_recommendation": {
+                "summary": (
+                    "AI analysis could not be generated. "
+                    "The retrieved ACOT data is still available."
+                ),
+                "positive_factors": [],
+                "considerations": [
+                    str(exc)
+                ],
+                "ai_solution": (
+                    "Review the retrieved structured "
+                    "evidence directly."
+                ),
+                "confidence": "Low",
+            },
+            "acot_score": None,
+        }
 # ============================================================
 # ROOT ENDPOINT
 # ============================================================
@@ -237,7 +338,9 @@ def ask_endpoint(request: AskRequest):
         # ----------------------------------------------------
 
         response["ai_summary"] = build_ai_summary(
-            response
+            question=question,
+            response=response,
+            ai_analysis_engine=components["ai_analysis_engine"],
         )
 
         # ----------------------------------------------------

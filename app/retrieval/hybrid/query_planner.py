@@ -179,6 +179,23 @@ class QueryPlanner:
         "projects",
     )
 
+    # ============================================================
+    # KNOWN ENTITY ALIASES
+    # ============================================================
+    ENTITY_ALIASES = {
+        "community": {
+            "jvc": "Jumeirah Village Circle",
+            "jumeirah village": "Jumeirah Village Circle",
+            "jumeirah village circle": "Jumeirah Village Circle",
+            "dubai marina": "Dubai Marina",
+        },
+        "project": {},
+        "property": {},
+        "developer": {},
+        "sub_community": {},
+        "city": {},
+    }
+
     DOCUMENT_TERMS = (
         "brochure",
         "document",
@@ -287,6 +304,25 @@ class QueryPlanner:
         r"^\s*(why|how much|what price|what rent|what about)\b",
     )
 
+    @classmethod
+    def _extract_known_entity_candidates(
+        cls,
+        question: str,
+    ) -> List[str]:
+        """Detect known entity aliases/names from the question."""
+        q = (question or "").strip().lower()
+        if not q:
+            return []
+
+        found = []
+        for aliases in cls.ENTITY_ALIASES.values():
+            for alias in sorted(aliases, key=len, reverse=True):
+                if re.search(rf"\b{re.escape(alias)}\b", q, flags=re.IGNORECASE):
+                    canonical = aliases[alias]
+                    if canonical not in found:
+                        found.append(canonical)
+        return found
+
     def _rule_plan(
         self,
         question: str,
@@ -303,6 +339,17 @@ class QueryPlanner:
             )
 
         plan = QueryPlan()
+
+        # ------------------------------------------------------------
+        # Known entity candidates
+        # ------------------------------------------------------------
+        known_entity_candidates = self._extract_known_entity_candidates(q)
+        if known_entity_candidates:
+            plan.entity_candidates = self._dedupe(known_entity_candidates)
+            plan.reasoning.append(
+                "Known entity candidates detected: "
+                f"{plan.entity_candidates}."
+            )
 
         # ------------------------------------------------------------
         # Conversation dependency
@@ -613,6 +660,10 @@ Rules:
 5. If the user asks to compare things, mark comparison as needed.
 6. Preserve follow-up meaning from the conversation context when provided.
 7. entity_candidates should contain useful names only, not filler words.
+8. For comparison questions, return ALL explicitly mentioned entities in entity_candidates, preserving their order.
+9. entity_candidates may contain communities, projects, properties, developers, sub-communities, or cities.
+10. Do not invent entities that are not mentioned or supported by the conversation context.
+
 """
 
         response = self._llm_client.generate(prompt)

@@ -4,41 +4,44 @@ import time
 from collections import OrderedDict
 from threading import Lock
 
-from google import genai
-from google.genai import types
+from openai import OpenAI
 
-from app.core.config import GEMINI_API_KEY
+from app.core.config import AICREDITS_API_KEY, AICREDITS_BASE_URL
 
 
 class GeminiClient:
     """
-    Gemini client for ACOT with:
-    - configurable primary model
-    - multiple fallback models
-    - short retries for temporary 503/timeout errors
-    - immediate failure for quota/permission errors
-    - bounded output tokens
-    - in-memory response cache
+    ACOT LLM client using AICredits.
+
+    The class name remains GeminiClient so the rest of ACOT
+    keeps calling the same generate() method.
+
+    AICredits is an OpenAI-compatible gateway:
+        https://api.aicredits.in/v1
     """
 
     def __init__(self):
-        if not GEMINI_API_KEY:
-            raise ValueError("GEMINI_API_KEY is not configured.")
+        if not AICREDITS_API_KEY:
+            raise ValueError(
+                "AICREDITS_API_KEY is not configured."
+            )
 
-        self.client = genai.Client(api_key=GEMINI_API_KEY)
-
-        # Primary model.
-        self.model = os.getenv(
-            "GEMINI_MODEL",
-            "gemini-3.6-flash",
+        self.client = OpenAI(
+            base_url=AICREDITS_BASE_URL,
+            api_key=AICREDITS_API_KEY,
         )
 
-        # Fallback chain.
-        # Flash-Lite is intentionally early because Google positions it
-        # for high-throughput / low-latency workloads.
+        self.model = os.getenv(
+            "AICREDITS_MODEL",
+            os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
+        )
+
         configured_fallbacks = os.getenv(
-            "GEMINI_FALLBACK_MODELS",
-            "gemini-3.5-flash-lite,gemini-3.5-flash,gemini-2.5-flash",
+            "AICREDITS_FALLBACK_MODELS",
+            os.getenv(
+                "OPENROUTER_FALLBACK_MODELS",
+                "google/gemini-2.5-flash",
+            ),
         )
 
         fallback_models = [
@@ -48,21 +51,24 @@ class GeminiClient:
         ]
 
         self.models = []
+
         for model in [self.model] + fallback_models:
             if model and model not in self.models:
                 self.models.append(model)
 
-        # Keep retries short. We want to fail over to another model quickly
-        # instead of repeatedly waiting on a model that is under load.
+        # Retry configuration
         self.max_retries = 2
         self.retry_delays = (1.0,)
 
-        # Bound output size.
+        # Output token limit
         self.max_output_tokens = int(
-            os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "900")
+            os.getenv(
+                "AICREDITS_MAX_OUTPUT_TOKENS",
+                os.getenv("OPENROUTER_MAX_OUTPUT_TOKENS", os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "900")),
+            )
         )
 
-        # Response cache.
+        # Response cache
         self.cache_enabled = True
         self.cache_ttl_seconds = 300
         self.cache_max_entries = 100
@@ -73,39 +79,49 @@ class GeminiClient:
     def _is_retryable_error(self, error: Exception) -> bool:
         message = str(error).lower()
 
-        # These should not be retried in a tight loop.
+        # Permanent errors
         permanent_terms = (
-            "quota exceeded",
-            "resource exhausted",
-            "project has been denied access",
-            "permission_denied",
-            "403",
             "401",
+            "403",
+            "404",
             "invalid api key",
-            "api key not valid",
-            "not found",
+            "authentication",
+            "unauthorized",
+            "forbidden",
             "invalid model",
+            "model not found",
+            "insufficient credits",
         )
 
         if any(term in message for term in permanent_terms):
             return False
 
-        # Temporary service/capacity errors.
+        # Temporary errors
         retryable_terms = (
+            "429",
+            "500",
+            "502",
             "503",
-            "service unavailable",
-            "temporarily unavailable",
-            "high demand",
-            "overloaded",
+            "504",
+            "rate limit",
             "timeout",
             "timed out",
-            "504",
-            "deadline exceeded",
+            "temporarily unavailable",
+            "overloaded",
+            "capacity",
+            "no text content",
+            "empty response",
+            "empty message",
+            "no choices",
         )
 
         return any(term in message for term in retryable_terms)
 
-    def _cache_key(self, prompt: str, model: str) -> str:
+    def _cache_key(
+        self,
+        prompt: str,
+        model: str,
+    ) -> str:
         raw = f"{model}\n{prompt}".encode("utf-8")
         return hashlib.sha256(raw).hexdigest()
 
@@ -128,14 +144,23 @@ class GeminiClient:
                 return None
 
             self._cache.move_to_end(key)
+
             return value
 
-    def _set_cached(self, key: str, value: str):
+    def _set_cached(
+        self,
+        key: str,
+        value: str,
+    ):
         if not self.cache_enabled:
             return
 
         with self._cache_lock:
-            self._cache[key] = (time.time(), value)
+            self._cache[key] = (
+                time.time(),
+                value,
+            )
+
             self._cache.move_to_end(key)
 
             while len(self._cache) > self.cache_max_entries:
@@ -145,59 +170,143 @@ class GeminiClient:
         with self._cache_lock:
             self._cache.clear()
 
-    def _generate_with_model(self, model: str, prompt: str, max_output_tokens=None):
-        response = self.client.models.generate_content(
+    def _generate_with_model(
+        self,
+        model: str,
+        prompt: str,
+        max_output_tokens=None,
+    ):
+        response = self.client.chat.completions.create(
             model=model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                max_output_tokens=(
-                    max_output_tokens
-                    if max_output_tokens is not None
-                    else self.max_output_tokens
-                ),
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
+            max_tokens=(
+                max_output_tokens
+                if max_output_tokens is not None
+                else self.max_output_tokens
             ),
         )
 
         if not response:
-            raise RuntimeError("Gemini returned an empty response.")
-
-        if not response.text:
-            raise RuntimeError("Gemini returned no text content.")
-
-        return response.text.strip()
-
-    def _format_error(self, model: str, error: Exception) -> str:
-        message = str(error)
-
-        lowered = message.lower()
-
-        if "quota" in lowered or "resource exhausted" in lowered:
-            return (
-                "Gemini quota/rate limit reached for the current project. "
-                "Check the active project/tier and AI Studio rate limits."
+            raise RuntimeError(
+                "AICredits returned an empty response."
             )
 
-        if "403" in lowered or "permission_denied" in lowered:
-            return f"Gemini project access denied for model '{model}': {message}"
+        if not response.choices:
+            raise RuntimeError(
+                "AICredits returned no choices."
+            )
 
-        return f"Gemini generation failed on model '{model}': {message}"
+        message = response.choices[0].message
 
-    def generate(self, prompt: str, max_output_tokens=None):
+        if not message:
+            raise RuntimeError(
+                "AICredits returned an empty message."
+            )
+
+        content = self._message_text(message)
+
+        if not content:
+            raise RuntimeError(
+                "AICredits returned no text content."
+            )
+
+        return content.strip()
+
+    @staticmethod
+    def _message_text(message) -> str:
+        content = getattr(message, "content", None)
+
+        if isinstance(content, str):
+            return content
+
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                    continue
+                text = getattr(item, "text", None)
+                if text is None and isinstance(item, dict):
+                    text = item.get("text") or item.get("content")
+                if text:
+                    parts.append(str(text))
+            return "\n".join(parts)
+
+        return ""
+
+    def _format_error(
+        self,
+        model: str,
+        error: Exception,
+    ) -> str:
+        message = str(error)
+        lowered = message.lower()
+
+        if (
+            "429" in lowered
+            or "rate limit" in lowered
+        ):
+            return (
+                f"AICredits rate limit reached "
+                f"for model '{model}': {message}"
+            )
+
+        if (
+            "401" in lowered
+            or "403" in lowered
+            or "authentication" in lowered
+            or "unauthorized" in lowered
+        ):
+            return (
+                f"AICredits authentication/access "
+                f"error for model '{model}': {message}"
+            )
+
+        return (
+            f"AICredits generation failed on "
+            f"model '{model}': {message}"
+        )
+
+    def generate(
+        self,
+        prompt: str,
+        max_output_tokens=None,
+    ):
         if not prompt:
-            raise ValueError("Prompt cannot be empty.")
+            raise ValueError(
+                "Prompt cannot be empty."
+            )
 
         last_error = None
 
-        for model_index, model in enumerate(self.models):
-            cache_key = self._cache_key(prompt, model)
-            cached = self._get_cached(cache_key)
+        for model_index, model in enumerate(
+            self.models
+        ):
+            cache_key = self._cache_key(
+                prompt,
+                model,
+            )
+
+            cached = self._get_cached(
+                cache_key
+            )
 
             if cached is not None:
-                print(f"Gemini cache hit: {model}")
+                print(
+                    f"AICredits cache hit: {model}"
+                )
                 return cached
 
-            for attempt in range(self.max_retries):
+            for attempt in range(
+                self.max_retries
+            ):
                 try:
+
                     if attempt > 0:
                         delay = self.retry_delays[
                             min(
@@ -207,48 +316,73 @@ class GeminiClient:
                         ]
 
                         print(
-                            f"Gemini temporary failure on {model}. "
-                            f"Retrying in {delay:.1f}s "
-                            f"(attempt {attempt + 1}/{self.max_retries})..."
+                            f"AICredits temporary "
+                            f"failure on {model}. "
+                            f"Retrying in "
+                            f"{delay:.1f}s "
+                            f"(attempt "
+                            f"{attempt + 1}/"
+                            f"{self.max_retries})..."
                         )
 
                         time.sleep(delay)
 
-                    response = self._generate_with_model(
-                        model=model,
-                        prompt=prompt,
-                        max_output_tokens=max_output_tokens,
+                    response = (
+                        self._generate_with_model(
+                            model=model,
+                            prompt=prompt,
+                            max_output_tokens=(
+                                max_output_tokens
+                            ),
+                        )
                     )
 
-                    self._set_cached(cache_key, response)
+                    self._set_cached(
+                        cache_key,
+                        response,
+                    )
+
                     return response
 
                 except Exception as error:
                     last_error = error
 
-                    # Permanent problems should stop immediately.
-                    if not self._is_retryable_error(error):
+                    # Permanent errors:
+                    # do not retry.
+                    if not self._is_retryable_error(
+                        error
+                    ):
                         raise RuntimeError(
-                            self._format_error(model, error)
+                            self._format_error(
+                                model,
+                                error,
+                            )
                         ) from error
 
-                    # For temporary 503/high-demand errors, retry this model
-                    # only once, then fail over.
+                    # Retry temporary errors once.
                     if attempt == 0:
                         continue
 
                     break
 
-            # Move quickly to the next model after temporary failures.
-            if model_index < len(self.models) - 1:
-                next_model = self.models[model_index + 1]
+            # Move to next fallback model.
+            if (
+                model_index
+                < len(self.models) - 1
+            ):
+                next_model = self.models[
+                    model_index + 1
+                ]
 
                 print(
-                    f"Gemini model '{model}' is temporarily unavailable. "
-                    f"Falling back to '{next_model}'."
+                    f"AICredits model "
+                    f"'{model}' is temporarily "
+                    f"unavailable. Falling back "
+                    f"to '{next_model}'."
                 )
 
         raise RuntimeError(
-            "Gemini generation failed on all configured models. "
+            "AICredits generation failed on "
+            "all configured models. "
             f"Last error: {last_error}"
         ) from last_error
