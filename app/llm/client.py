@@ -217,6 +217,45 @@ class GeminiClient:
 
         return content.strip()
 
+    def _stream_with_model(
+        self,
+        model: str,
+        prompt: str,
+        max_output_tokens=None,
+    ):
+        stream = self.client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
+            max_tokens=(
+                max_output_tokens
+                if max_output_tokens is not None
+                else self.max_output_tokens
+            ),
+            stream=True,
+        )
+
+        if not stream:
+            raise RuntimeError(
+                "AICredits returned an empty response."
+            )
+
+        for chunk in stream:
+            if not chunk or not getattr(chunk, "choices", None):
+                continue
+
+            delta = getattr(chunk.choices[0], "delta", None)
+            if delta is None:
+                continue
+
+            text = self._message_text(delta)
+            if text:
+                yield text
+
     @staticmethod
     def _message_text(message) -> str:
         content = getattr(message, "content", None)
@@ -366,6 +405,146 @@ class GeminiClient:
                     break
 
             # Move to next fallback model.
+            if (
+                model_index
+                < len(self.models) - 1
+            ):
+                next_model = self.models[
+                    model_index + 1
+                ]
+
+                print(
+                    f"AICredits model "
+                    f"'{model}' is temporarily "
+                    f"unavailable. Falling back "
+                    f"to '{next_model}'."
+                )
+
+        raise RuntimeError(
+            "AICredits generation failed on "
+            "all configured models. "
+            f"Last error: {last_error}"
+        ) from last_error
+
+    def stream(
+        self,
+        prompt: str,
+        max_output_tokens=None,
+    ):
+        """Yield answer text as the model produces it.
+
+        Fallback models are used only before the first token. The finished
+        text is cached after a complete stream, matching generate().
+        """
+
+        if not prompt:
+            raise ValueError(
+                "Prompt cannot be empty."
+            )
+
+        last_error = None
+
+        for model_index, model in enumerate(
+            self.models
+        ):
+            cache_key = self._cache_key(
+                prompt,
+                model,
+            )
+
+            cached = self._get_cached(
+                cache_key
+            )
+
+            if cached is not None:
+                print(
+                    f"AICredits cache hit: {model}"
+                )
+                yield cached
+                return
+
+            for attempt in range(
+                self.max_retries
+            ):
+                started = False
+
+                try:
+                    if attempt > 0:
+                        delay = self.retry_delays[
+                            min(
+                                attempt - 1,
+                                len(self.retry_delays) - 1,
+                            )
+                        ]
+
+                        print(
+                            f"AICredits temporary "
+                            f"failure on {model}. "
+                            f"Retrying in "
+                            f"{delay:.1f}s "
+                            f"(attempt "
+                            f"{attempt + 1}/"
+                            f"{self.max_retries})..."
+                        )
+
+                        time.sleep(delay)
+
+                    pieces = []
+
+                    for delta in self._stream_with_model(
+                        model=model,
+                        prompt=prompt,
+                        max_output_tokens=(
+                            max_output_tokens
+                        ),
+                    ):
+                        if not delta:
+                            continue
+
+                        started = True
+                        pieces.append(delta)
+                        yield delta
+
+                    response = "".join(pieces).strip()
+
+                    if not response:
+                        raise RuntimeError(
+                            "AICredits returned no text content."
+                        )
+
+                    self._set_cached(
+                        cache_key,
+                        response,
+                    )
+
+                    return
+
+                except Exception as error:
+                    last_error = error
+
+                    if started:
+                        raise RuntimeError(
+                            self._format_error(
+                                model,
+                                error,
+                            )
+                        ) from error
+
+                    if not self._is_retryable_error(
+                        error
+                    ):
+                        raise RuntimeError(
+                            self._format_error(
+                                model,
+                                error,
+                            )
+                        ) from error
+
+                    if attempt == 0:
+                        continue
+
+                    break
+
             if (
                 model_index
                 < len(self.models) - 1

@@ -1306,20 +1306,21 @@ def _build_fast_structured_answer(
 # PROCESS QUESTION
 # =========================================================
 
-def ask_acot(
+def _prepare_acot_turn(
     question,
     components
 ):
+    """Retrieve evidence and choose the fast or model answer path.
+
+    Conversation memory is not updated here. The caller updates it only
+    after the full answer exists.
+    """
 
     hybrid_retriever = components["hybrid_retriever"]
     context_builder = components["context_builder"]
     investment_analyzer = components["investment_analyzer"]
     rag_chain = components["rag_chain"]
     conversation_memory = components["conversation_memory"]
-
-    # -----------------------------------------------------
-    # CONVERSATIONAL MEMORY
-    # -----------------------------------------------------
 
     standalone_question = conversation_memory.rewrite_question(
         question
@@ -1386,23 +1387,21 @@ def ask_acot(
         except Exception:
             investment_analysis = None
 
-    # -----------------------------------------------------
-    # FAST PATH: structured database answer
-    # -----------------------------------------------------
-    # Simple project/community/filter questions do not need the final
-    # Gemini generation step. This reduces latency and token usage while
-    # keeping the answer fully grounded in retrieved Supabase data.
-    if _is_fast_structured_question(
+    use_fast = _is_fast_structured_question(
         question=standalone_question,
         question_type=question_type,
         structured_summary=structured_summary,
         documents=documents,
-    ):
-        answer = _build_fast_structured_answer(
+    )
+
+    if use_fast:
+        fast_answer = _build_fast_structured_answer(
             question=standalone_question,
             structured_summary=structured_summary,
         )
+        context = None
     else:
+        fast_answer = None
         context = context_builder.build_context(
             structured_summary=structured_summary,
             investment_analysis=investment_analysis,
@@ -1413,27 +1412,124 @@ def ask_acot(
             )
         )
 
-        answer = rag_chain.generate_answer(
-            question=standalone_question,
-            context=context,
-            question_type=question_type
-        )
+    return {
+        "question": question,
+        "standalone_question": standalone_question,
+        "question_type": question_type,
+        "structured_summary": structured_summary,
+        "documents": documents,
+        "investment_analysis": investment_analysis,
+        "retrieval_result": result,
+        "rag_chain": rag_chain,
+        "conversation_memory": conversation_memory,
+        "use_fast": use_fast,
+        "fast_answer": fast_answer,
+        "context": context,
+    }
 
-    conversation_memory.update(
-        user_question=question,
-        standalone_question=standalone_question,
+
+def _finalize_acot_turn(prepared, answer):
+    prepared["conversation_memory"].update(
+        user_question=prepared["question"],
+        standalone_question=prepared["standalone_question"],
         answer=answer,
-        retrieval_result=result,
+        retrieval_result=prepared["retrieval_result"],
     )
 
     return build_frontend_response(
-        question=question,
-        standalone_question=standalone_question,
+        question=prepared["question"],
+        standalone_question=prepared["standalone_question"],
         answer=answer,
-        question_type=question_type,
-        structured_summary=structured_summary,
-        documents=documents,
-        investment_analysis=investment_analysis,
+        question_type=prepared["question_type"],
+        structured_summary=prepared["structured_summary"],
+        documents=prepared["documents"],
+        investment_analysis=prepared["investment_analysis"],
+    )
+
+
+def ask_acot(
+    question,
+    components
+):
+    prepared = _prepare_acot_turn(
+        question,
+        components
+    )
+
+    if prepared["use_fast"]:
+        answer = prepared["fast_answer"]
+    else:
+        answer = prepared["rag_chain"].generate_answer(
+            question=prepared["standalone_question"],
+            context=prepared["context"],
+            question_type=prepared["question_type"]
+        )
+
+    return _finalize_acot_turn(
+        prepared,
+        answer
+    )
+
+
+def stream_acot(
+    question,
+    components
+):
+    """Yield status, answer deltas, then the finished response payload.
+
+    Fast structured answers are a single delta because they are built from
+    database records. Model answers yield each token delta. Memory is
+    updated only after the full answer is assembled.
+    """
+
+    yield (
+        "status",
+        {"stage": "retrieving"}
+    )
+
+    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+        prepared = _prepare_acot_turn(
+            question,
+            components
+        )
+
+    if prepared["use_fast"]:
+        answer = prepared["fast_answer"] or ""
+        if answer:
+            yield (
+                "delta",
+                {"text": answer}
+            )
+    else:
+        parts = []
+
+        for delta in prepared["rag_chain"].stream_answer(
+            question=prepared["standalone_question"],
+            context=prepared["context"],
+            question_type=prepared["question_type"]
+        ):
+            if not delta:
+                continue
+
+            parts.append(delta)
+            yield (
+                "delta",
+                {"text": delta}
+            )
+
+        answer = "".join(parts).strip()
+
+        if not answer:
+            raise RuntimeError(
+                "LLM returned an empty answer."
+            )
+
+    yield (
+        "done",
+        _finalize_acot_turn(
+            prepared,
+            answer
+        )
     )
 
 

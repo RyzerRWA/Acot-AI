@@ -1,11 +1,13 @@
 import io
+import json
 from contextlib import redirect_stdout, redirect_stderr
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from run import initialize_acot, ask_acot
+from run import initialize_acot, ask_acot, stream_acot
 from app.memory.conversation_memory import ConversationMemory
 from app.intelligence.ai_analysis_engine import AIAnalysisEngine
 
@@ -355,6 +357,67 @@ def ask_endpoint(request: AskRequest):
             status_code=500,
             detail=f"ACOT processing error: {str(exc)}"
         )
+
+
+def _sse_event(event, data):
+    payload = json.dumps(
+        data,
+        ensure_ascii=False,
+        default=str,
+    )
+    return f"event: {event}\ndata: {payload}\n\n"
+
+
+@app.post("/api/ask/stream")
+def ask_stream_endpoint(request: AskRequest):
+
+    question = request.question.strip()
+
+    if not question:
+        raise HTTPException(
+            status_code=400,
+            detail="Question cannot be empty."
+        )
+
+    def events():
+        try:
+            components = get_session_components(
+                request.session_id
+            )
+
+            for event_name, data in stream_acot(
+                question,
+                components
+            ):
+                if event_name == "done" and isinstance(data, dict):
+                    data = dict(data)
+                    data["ai_summary"] = build_ai_summary(
+                        question=question,
+                        response=data,
+                        ai_analysis_engine=components["ai_analysis_engine"],
+                    )
+
+                yield _sse_event(event_name, data)
+
+        except Exception as exc:
+            yield _sse_event(
+                "error",
+                {
+                    "message": (
+                        f"ACOT processing error: {str(exc)}"
+                    )
+                },
+            )
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ============================================================

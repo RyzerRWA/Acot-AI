@@ -51,7 +51,7 @@ class HybridRAGChain:
             + "\n\n[Additional retrieved context omitted to keep the answer focused.]"
         )
 
-    def generate_answer(
+    def _build_answer_prompt(
         self,
         question: str,
         context: str,
@@ -237,6 +237,20 @@ Now answer the user directly using ONLY the supplied evidence.
             1000,
         )
 
+        return prompt, max_output_tokens
+
+    def generate_answer(
+        self,
+        question: str,
+        context: str,
+        question_type: str = "general",
+    ):
+        prompt, max_output_tokens = self._build_answer_prompt(
+            question,
+            context,
+            question_type,
+        )
+
         response = self.llm.generate(
             prompt,
             max_output_tokens=max_output_tokens,
@@ -246,3 +260,30 @@ Now answer the user directly using ONLY the supplied evidence.
             raise RuntimeError("LLM returned an empty answer.")
 
         return response.strip()
+
+    def stream_answer(
+        self,
+        question: str,
+        context: str,
+        question_type: str = "general",
+    ):
+        prompt, max_output_tokens = self._build_answer_prompt(
+            question,
+            context,
+            question_type,
+        )
+
+        parts = []
+
+        for delta in self.llm.stream(
+            prompt,
+            max_output_tokens=max_output_tokens,
+        ):
+            if not delta:
+                continue
+
+            parts.append(delta)
+            yield delta
+
+        if not "".join(parts).strip():
+            raise RuntimeError("LLM returned an empty answer.")
