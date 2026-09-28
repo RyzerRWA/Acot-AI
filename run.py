@@ -1490,21 +1490,112 @@ def ask_acot(
     )
 
 
+def _iter_typewriter_pieces(text):
+    """Split a finished database answer into small typewriter pieces."""
+
+    tokens = re.findall(r"\S+\s*|\n+", text or "")
+    if not tokens:
+        if text:
+            yield text
+        return
+
+    group_size = 1 if len(tokens) <= 80 else max(1, len(tokens) // 40)
+    buffer = []
+    for token in tokens:
+        buffer.append(token)
+        if len(buffer) >= group_size:
+            yield "".join(buffer)
+            buffer = []
+    if buffer:
+        yield "".join(buffer)
+
+
+def _stream_sources(prepared):
+    sources = []
+    projects = prepared["structured_summary"].get("projects") or []
+    for project in projects[:6]:
+        if not isinstance(project, dict):
+            continue
+        title = project.get("name") or "Project"
+        bits = [
+            project.get("community"),
+            project.get("developer_name") or project.get("developer"),
+        ]
+        excerpt = " · ".join(
+            str(bit).strip()
+            for bit in bits
+            if bit is not None and str(bit).strip()
+        )
+        sources.append({
+            "title": title,
+            "excerpt": excerpt[:240],
+        })
+    return sources
+
+
+def _followup_questions(prepared):
+    projects = [
+        project
+        for project in (prepared["structured_summary"].get("projects") or [])
+        if isinstance(project, dict)
+    ]
+    if len(projects) >= 2:
+        return [
+            "What are their starting prices?",
+            "What amenities do those projects offer according to their documents?",
+            "Compare the first and second ones based on price, bedroom range, and handover date.",
+        ]
+    if len(projects) == 1:
+        name = projects[0].get("name") or "this project"
+        return [
+            f"What is the starting price of {name}?",
+            f"What is the handover date of {name}?",
+            f"What amenities does {name} offer?",
+        ]
+    return []
+
+
+def _slim_stream_response(response):
+    """Drop brochure essays from the stream so the last event stays small."""
+
+    if not isinstance(response, dict):
+        return response
+
+    slim = dict(response)
+    data = dict(slim.get("data") or {})
+    projects = []
+    for project in data.get("projects") or []:
+        if not isinstance(project, dict):
+            continue
+        item = dict(project)
+        item.pop("description", None)
+        photos = item.get("photos")
+        if isinstance(photos, list):
+            item["photos"] = photos[:4]
+        projects.append(item)
+    data["projects"] = projects
+    slim["data"] = data
+
+    summary = slim.get("ai_summary")
+    if isinstance(summary, dict) and isinstance(summary.get("data"), dict):
+        summary = dict(summary)
+        summary_data = dict(summary["data"])
+        summary_data["projects"] = projects
+        summary["data"] = summary_data
+        slim["ai_summary"] = summary
+    return slim
+
+
 def stream_acot(
     question,
     components
 ):
-    """Yield status, answer deltas, then the finished response payload.
+    """Yield typed stream events: meta, delta, followups, then done.
 
-    Fast structured answers are a single delta because they are built from
-    database records. Model answers yield each token delta. Memory is
-    updated only after the full answer is assembled.
+    Database answers are split into small pieces so the client can show
+    them like a typewriter. Model answers keep the provider's own tokens.
+    Memory is updated only after the full answer is assembled.
     """
-
-    yield (
-        "status",
-        {"stage": "retrieving"}
-    )
 
     with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
         prepared = _prepare_acot_turn(
@@ -1512,14 +1603,23 @@ def stream_acot(
             components
         )
 
+    yield (
+        "meta",
+        {
+            "type": "meta",
+            "sources": _stream_sources(prepared),
+        }
+    )
+
     answer_started = time.perf_counter()
     if prepared["use_fast"]:
         answer = prepared["fast_answer"] or ""
-        if answer:
+        for piece in _iter_typewriter_pieces(answer):
             yield (
                 "delta",
-                {"text": answer}
+                {"type": "delta", "text": piece}
             )
+            time.sleep(0.02)
     else:
         parts = []
 
@@ -1534,7 +1634,7 @@ def stream_acot(
             parts.append(delta)
             yield (
                 "delta",
-                {"text": delta}
+                {"type": "delta", "text": delta}
             )
 
         answer = "".join(parts).strip()
@@ -1543,6 +1643,13 @@ def stream_acot(
             raise RuntimeError(
                 "LLM returned an empty answer."
             )
+
+    followups = _followup_questions(prepared)
+    if followups:
+        yield (
+            "followups",
+            {"type": "followups", "questions": followups}
+        )
 
     yield (
         "done",

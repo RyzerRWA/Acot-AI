@@ -389,8 +389,9 @@ class AICreditsClient:
     ):
         """Yield answer text as the model produces it.
 
-        Fallback models are used only before the first token. The finished
-        text is cached after a complete stream, matching generate().
+        Uses the same single model as generate(). A failure before the
+        first token is retried once. The finished text is cached only
+        after a complete stream.
         """
 
         if not prompt:
@@ -398,126 +399,109 @@ class AICreditsClient:
                 "Prompt cannot be empty."
             )
 
+        model = self.model
+        cache_key = self._cache_key(
+            prompt,
+            model,
+        )
+
+        cached = self._get_cached(
+            cache_key
+        )
+
+        if cached is not None:
+            print(
+                f"AICredits cache hit: {model}"
+            )
+            yield cached
+            return
+
         last_error = None
 
-        for model_index, model in enumerate(
-            self.models
+        for attempt in range(
+            self.max_retries
         ):
-            cache_key = self._cache_key(
-                prompt,
-                model,
-            )
+            started = False
 
-            cached = self._get_cached(
-                cache_key
-            )
-
-            if cached is not None:
-                print(
-                    f"AICredits cache hit: {model}"
-                )
-                yield cached
-                return
-
-            for attempt in range(
-                self.max_retries
-            ):
-                started = False
-
-                try:
-                    if attempt > 0:
-                        delay = self.retry_delays[
-                            min(
-                                attempt - 1,
-                                len(self.retry_delays) - 1,
-                            )
-                        ]
-
-                        print(
-                            f"AICredits temporary "
-                            f"failure on {model}. "
-                            f"Retrying in "
-                            f"{delay:.1f}s "
-                            f"(attempt "
-                            f"{attempt + 1}/"
-                            f"{self.max_retries})..."
+            try:
+                if attempt > 0:
+                    delay = self.retry_delays[
+                        min(
+                            attempt - 1,
+                            len(self.retry_delays) - 1,
                         )
+                    ]
 
-                        time.sleep(delay)
-
-                    pieces = []
-
-                    for delta in self._stream_with_model(
-                        model=model,
-                        prompt=prompt,
-                        max_output_tokens=(
-                            max_output_tokens
-                        ),
-                    ):
-                        if not delta:
-                            continue
-
-                        started = True
-                        pieces.append(delta)
-                        yield delta
-
-                    response = "".join(pieces).strip()
-
-                    if not response:
-                        raise RuntimeError(
-                            "AICredits returned no text content."
-                        )
-
-                    self._set_cached(
-                        cache_key,
-                        response,
+                    print(
+                        f"AICredits temporary "
+                        f"failure on {model}. "
+                        f"Retrying in "
+                        f"{delay:.1f}s "
+                        f"(attempt "
+                        f"{attempt + 1}/"
+                        f"{self.max_retries})..."
                     )
 
-                    return
+                    time.sleep(delay)
 
-                except Exception as error:
-                    last_error = error
+                pieces = []
 
-                    if started:
-                        raise RuntimeError(
-                            self._format_error(
-                                model,
-                                error,
-                            )
-                        ) from error
-
-                    if not self._is_retryable_error(
-                        error
-                    ):
-                        raise RuntimeError(
-                            self._format_error(
-                                model,
-                                error,
-                            )
-                        ) from error
-
-                    if attempt == 0:
+                for delta in self._stream_with_model(
+                    model=model,
+                    prompt=prompt,
+                    max_output_tokens=(
+                        max_output_tokens
+                    ),
+                ):
+                    if not delta:
                         continue
 
-                    break
+                    started = True
+                    pieces.append(delta)
+                    yield delta
 
-            if (
-                model_index
-                < len(self.models) - 1
-            ):
-                next_model = self.models[
-                    model_index + 1
-                ]
+                response = "".join(pieces).strip()
 
-                print(
-                    f"AICredits model "
-                    f"'{model}' is temporarily "
-                    f"unavailable. Falling back "
-                    f"to '{next_model}'."
+                if not response:
+                    raise RuntimeError(
+                        "AICredits returned no text content."
+                    )
+
+                self._set_cached(
+                    cache_key,
+                    response,
                 )
+
+                return
+
+            except Exception as error:
+                last_error = error
+
+                if started:
+                    raise RuntimeError(
+                        self._format_error(
+                            model,
+                            error,
+                        )
+                    ) from error
+
+                if not self._is_retryable_error(
+                    error
+                ):
+                    raise RuntimeError(
+                        self._format_error(
+                            model,
+                            error,
+                        )
+                    ) from error
+
+                if attempt == 0:
+                    continue
+
+                break
 
         raise RuntimeError(
             "AICredits generation failed on "
-            "all configured models. "
+            f"model '{model}'. "
             f"Last error: {last_error}"
         ) from last_error

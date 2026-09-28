@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from run import initialize_acot, ask_acot, stream_acot
+from run import initialize_acot, ask_acot, stream_acot, _slim_stream_response
 from app.memory.conversation_memory import ConversationMemory
 from app.intelligence.ai_analysis_engine import AIAnalysisEngine
 
@@ -372,13 +372,13 @@ def ask_endpoint(request: AskRequest):
         )
 
 
-def _sse_event(event, data):
-    payload = json.dumps(
-        data,
+def _sse_data(payload):
+    body = json.dumps(
+        payload,
         ensure_ascii=False,
         default=str,
     )
-    return f"event: {event}\ndata: {payload}\n\n"
+    return f"data: {body}\n\n"
 
 
 @app.post("/api/ask/stream")
@@ -402,6 +402,10 @@ def ask_stream_endpoint(request: AskRequest):
                 question,
                 components
             ):
+                if event_name == "meta" and isinstance(data, dict):
+                    data = dict(data)
+                    data["session_id"] = request.session_id
+
                 if event_name == "done" and isinstance(data, dict):
                     data = dict(data)
                     data["ai_summary"] = build_ai_summary(
@@ -409,13 +413,26 @@ def ask_stream_endpoint(request: AskRequest):
                         response=data,
                         ai_analysis_engine=components["ai_analysis_engine"],
                     )
+                    data = _slim_stream_response(data)
+                    yield _sse_data({
+                        "type": "done",
+                        "response": data,
+                    })
+                    continue
 
-                yield _sse_event(event_name, data)
+                if isinstance(data, dict) and data.get("type"):
+                    yield _sse_data(data)
+                    continue
+
+                yield _sse_data({
+                    "type": event_name,
+                    **(data if isinstance(data, dict) else {"text": data}),
+                })
 
         except Exception as exc:
-            yield _sse_event(
-                "error",
+            yield _sse_data(
                 {
+                    "type": "error",
                     "message": (
                         f"ACOT processing error: {str(exc)}"
                     )
