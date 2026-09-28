@@ -15,6 +15,8 @@ Optimization goals:
 - Keep the existing build_context() interface compatible with run.py.
 """
 
+from datetime import datetime
+
 
 class HybridContextBuilder:
 
@@ -62,6 +64,17 @@ class HybridContextBuilder:
     @staticmethod
     def _value(value, default="N/A"):
         return default if value is None or value == "" else value
+
+    @staticmethod
+    def _handover_text(value):
+        if value is None or value == "":
+            return "N/A"
+        text = str(value).strip()
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return text
+        return parsed.strftime("%B %Y")
 
     # ============================================================
     # MAIN METHOD
@@ -138,6 +151,34 @@ class HybridContextBuilder:
     # STRUCTURED CONTEXT
     # ============================================================
 
+    def _project_fact_line(self, project):
+        name = self._value(project.get("name"))
+        developer = self._value(project.get("developer_name") or project.get("developer"))
+        price = project.get("price")
+        if isinstance(price, (int, float)):
+            price_text = f"AED {int(price):,}" if float(price).is_integer() else f"AED {price:,.0f}"
+        elif price is None:
+            price_text = "N/A"
+        else:
+            price_text = f"AED {price}"
+
+        bedroom_min = project.get("bedroom_min")
+        bedroom_max = project.get("bedroom_max")
+        if bedroom_min is None and bedroom_max is None:
+            bedrooms_text = "N/A"
+        elif bedroom_min == bedroom_max or bedroom_max is None:
+            bedrooms_text = str(bedroom_min)
+        elif bedroom_min is None:
+            bedrooms_text = str(bedroom_max)
+        else:
+            bedrooms_text = f"{bedroom_min}-{bedroom_max}"
+
+        handover = self._handover_text(project.get("handover_time"))
+        return (
+            f"{name} | Developer: {developer} | Price: {price_text} | "
+            f"Bedrooms: {bedrooms_text} | Handover: {handover}"
+        )
+
     def _build_structured_context(self, retrieval_result):
 
         communities = (
@@ -178,6 +219,20 @@ class HybridContextBuilder:
         if projects:
             context_parts.extend([
                 "PROJECTS",
+                "",
+                "COMPLETE PROJECT FACTS",
+                "Every retrieved project is listed here. Use every row, in this order.",
+                "",
+            ])
+
+            for index, project in enumerate(projects, start=1):
+                context_parts.append(
+                    f"{index}. {self._project_fact_line(project)}"
+                )
+
+            context_parts.extend([
+                "",
+                "PROJECT DETAIL",
                 "",
             ])
 
@@ -279,7 +334,7 @@ class HybridContextBuilder:
                     ),
                     (
                         "Handover: "
-                        f"{self._value(project.get('handover_time'))}"
+                        f"{self._handover_text(project.get('handover_time'))}"
                     ),
                     f"Amenities: {amenities or 'N/A'}",
                 ])

@@ -4,6 +4,7 @@ import io
 import time
 import json
 from contextlib import redirect_stdout, redirect_stderr
+from datetime import datetime
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
@@ -47,6 +48,10 @@ from app.retrieval.hybrid.query_planner import (
 
 from app.retrieval.hybrid.entity_resolver import (
     EntityResolver
+)
+from app.retrieval.hybrid.question_text import (
+    collapse_stretched_letters,
+    prepare_user_question,
 )
 
 
@@ -622,6 +627,83 @@ def _format_bedrooms(record):
     return f"{minimum}-{maximum}"
 
 
+def _bedroom_bounds(project):
+    minimum = project.get("bedroom_min")
+    maximum = project.get("bedroom_max")
+    bedrooms = project.get("bedrooms")
+
+    if isinstance(bedrooms, dict):
+        if minimum is None:
+            minimum = bedrooms.get("min")
+        if maximum is None:
+            maximum = bedrooms.get("max")
+
+    return minimum, maximum
+
+
+def _format_bedroom_phrase(project):
+    minimum, maximum = _bedroom_bounds(project)
+
+    if minimum is None and maximum is None:
+        return None
+
+    if minimum == 0 and maximum not in (None, 0):
+        noun = "bedroom" if maximum == 1 else "bedrooms"
+        return f"Studios to {maximum} {noun}"
+
+    if minimum == 0:
+        return "Studios"
+
+    if minimum is None:
+        return f"{maximum} bedrooms"
+
+    if maximum is None or minimum == maximum:
+        noun = "bedroom" if minimum == 1 else "bedrooms"
+        return f"{minimum} {noun}"
+
+    return f"{minimum} to {maximum} bedrooms"
+
+
+def _format_aed(value):
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        cleaned = value.replace("AED", "").replace(",", "").strip()
+        if not cleaned:
+            return None
+        try:
+            value = float(cleaned)
+        except ValueError:
+            return value
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if number.is_integer():
+        return f"AED {int(number):,}"
+
+    return f"AED {number:,.0f}"
+
+
+def _format_handover_month(value):
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+    return parsed.strftime("%B %Y")
+
+
 def _format_project_card(record):
     """
     Convert a project database row into a frontend-friendly project card.
@@ -804,23 +886,8 @@ def _detect_response_type(
     ) and len(projects) >= 2:
         return "project_comparison"
 
-    if projects:
-        if any(
-            phrase in question_lower
-            for phrase in (
-                "project",
-                "projects",
-                "property",
-                "properties",
-                "price",
-                "prices",
-                "bedroom",
-                "handover",
-                "amenit",
-                "developer"
-            )
-        ):
-            return "project_list"
+    if question_type == "search" and projects:
+        return "project_list"
 
     if sub_communities:
         return "sub_community_list"
@@ -932,98 +999,20 @@ def _is_fast_structured_question(
     documents,
 ):
     """
-    Identify simple database-only questions that do not need the model for
-    the final answer. Retrieval has already verified the records.
+    Use the database template only for a browse/search that already has rows.
+
+    Price, bedroom, handover, comparison, and other follow-ups stay on the
+    model path so the reply is written instead of reprinted as a hit list.
     """
+
+    del question
+
+    if question_type != "search":
+        return False
 
     if documents:
         return False
 
-    if question_type in {
-        "investment",
-        "comparison",
-        "ranking",
-        "calculation",
-        "prediction",
-        "document",
-    }:
-        return False
-
-    q = (question or "").lower().strip()
-
-    # Complex/knowledge-heavy wording stays on the RAG path.
-    blocked_terms = (
-        "invest",
-        "investment",
-        "roi",
-        "yield",
-        "forecast",
-        "predict",
-        "compare",
-        "comparison",
-        "versus",
-        " vs ",
-        "best",
-        "top ",
-        "recommend",
-        "brochure",
-        "document",
-        "building code",
-        "amenities",
-        "amenity",
-        "security",
-        "features",
-        "interior",
-        "interiors",
-        "finishes",
-        "floor plan",
-        "floor plans",
-        "layout",
-        "layouts",
-        "view",
-        "views",
-        "different",
-        "what makes",
-        "stand out",
-        "explain",
-        "describe",
-        "why ",
-        "how does",
-        "facilities",
-        "overview",
-        "details",
-    )
-
-    if any(term in q for term in blocked_terms):
-        return False
-
-    structured_terms = (
-        "project",
-        "projects",
-        "property",
-        "properties",
-        "price",
-        "prices",
-        "cost",
-        "bedroom",
-        "bedrooms",
-        "developer",
-        "developers",
-        "handover",
-        "status",
-        "size",
-        "sqft",
-        "square foot",
-        "available",
-    )
-
-    if not any(term in q for term in structured_terms):
-        return False
-
-    # A conversational filter may produce zero matching projects while
-    # still retaining the previous projects as filter evidence. Keep this
-    # on the deterministic fast path so ACOT can explain the no-match
-    # result without another LLM call.
     if structured_summary.get("filter_no_match"):
         return True
 
@@ -1243,36 +1232,43 @@ def _build_fast_structured_answer(
                 )
             return "\n".join(lines)
 
-        # Default project-list answer.
+        # Default browse answer.
         lines = [
-            f"Found {len(projects)} project(s) matching your request:"
+            _browse_intro(
+                projects,
+                ambiguous_label=structured_summary.get("ambiguous_label"),
+            ),
+            "",
         ]
 
-        for index, project in enumerate(projects, start=1):
+        for project in projects:
             name = project.get("name") or "Unknown project"
-            developer = project.get("developer_name")
+            developer = project.get("developer_name") or project.get("developer")
             developer_text = (
                 str(developer).strip()
                 if developer is not None and str(developer).strip()
-                else "Not available"
+                else ""
             )
+            sentence = f"- **{name}**"
+            sentence += f" by {developer_text}." if developer_text else "."
 
-            price = project.get("price")
-            price_text = (
-                f"AED {price}" if price is not None else "Not available"
-            )
+            details = []
+            price_text = _format_aed(project.get("price"))
+            if price_text:
+                details.append(f"Starting price {price_text}.")
 
-            bedroom_label = _format_bedrooms(project)
-            bedroom_text = (
-                bedroom_label
-                if bedroom_label is not None
-                else "Not available"
-            )
+            bedroom_text = _format_bedroom_phrase(project)
+            if bedroom_text:
+                details.append(f"{bedroom_text}.")
 
-            lines.append(
-                f"{index}. {name} | Developer: {developer_text} | "
-                f"Starting price: {price_text} | Bedrooms: {bedroom_text}"
-            )
+            handover_text = _format_handover_month(project.get("handover_time"))
+            if handover_text:
+                details.append(f"Handover {handover_text}.")
+
+            if details:
+                sentence = f"{sentence} {' '.join(details)}"
+
+            lines.append(sentence)
 
         return "\n".join(lines)
 
@@ -1299,7 +1295,222 @@ def _build_fast_structured_answer(
                 lines.append(f"{index}. {name}")
         return "\n".join(lines)
 
-    return "No matching structured records were found."
+    return _missing_data_answer(structured_summary)
+
+
+# =========================================================
+# SMALL TALK
+# =========================================================
+
+_SMALL_TALK_KINDS = {
+    "hi": "greeting",
+    "hello": "greeting",
+    "hey": "greeting",
+    "good morning": "greeting",
+    "good evening": "greeting",
+    "good afternoon": "greeting",
+    "thanks": "thanks",
+    "thank you": "thanks",
+    "bye": "bye",
+    "goodbye": "bye",
+    "who are you": "identity",
+    "what are you": "identity",
+    "what can you do": "capabilities",
+    "what do you do": "capabilities",
+    "how can you help": "capabilities",
+    "help": "capabilities",
+}
+
+_STARTER_CHIPS = (
+    "Show me projects in Jumeirah Village Circle.",
+    "What can you do?",
+    "Who are you?",
+)
+
+
+def _normalize_chat_text(question):
+    text = collapse_stretched_letters(question or "").strip().lower()
+    text = text.replace("\u2019", "'")
+    text = re.sub(r"[!?.]+$", "", text).strip()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def _unique_field(projects, key):
+    values = []
+    for project in projects:
+        raw = project.get(key)
+        if raw is None and key == "developer_name":
+            raw = project.get("developer")
+        text = str(raw).strip() if raw is not None else ""
+        if text and text not in values:
+            values.append(text)
+    return values
+
+
+def _price_range_clause(projects):
+    prices = []
+    for project in projects:
+        value = project.get("price")
+        if value is None:
+            continue
+        try:
+            if isinstance(value, str):
+                value = value.replace("AED", "").replace(",", "").strip()
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        prices.append(number)
+
+    if not prices:
+        return ""
+
+    low = min(prices)
+    high = max(prices)
+    if low == high:
+        return f", with a starting price of {_format_aed(low)}"
+    return (
+        f", with starting prices from {_format_aed(low)} "
+        f"to {_format_aed(high)}"
+    )
+
+
+def _browse_intro(projects, ambiguous_label=None):
+    """Open a project list in one sentence."""
+
+    count = len(projects)
+    noun = "project" if count == 1 else "projects"
+    all_active = all(
+        str(project.get("status") or "").strip().upper() == "ACTIVE"
+        for project in projects
+    )
+    active = "active " if all_active else ""
+
+    if ambiguous_label and count > 1:
+        return f"{ambiguous_label} matches {count} {noun}. Here they are:"
+
+    communities = _unique_field(projects, "community")
+    developers = _unique_field(projects, "developer_name")
+    price_clause = _price_range_clause(projects)
+
+    if count == 1:
+        name = projects[0].get("name") or "This project"
+        place = f" in {communities[0]}" if communities else ""
+        kind = f"{active}project".strip()
+        article = "an" if kind.startswith("active") else "a"
+        return (
+            f"{name} is {article} {kind}{place}. "
+            "Here is what is on record:"
+        )
+
+    if len(communities) == 1:
+        return (
+            f"I found {count} {active}{noun} in {communities[0]}"
+            f"{price_clause}. Here is a short look at each one:"
+        )
+
+    if len(developers) == 1:
+        return (
+            f"I found {count} {active}{developers[0]} {noun}"
+            f"{price_clause}. Here is a short look at each one:"
+        )
+
+    return (
+        f"I found {count} {active}{noun}{price_clause}. "
+        "Here is a short look at each one:"
+    )
+
+
+def _missing_data_answer(structured_summary):
+    subject = str(
+        structured_summary.get("understood_subject") or ""
+    ).strip()
+    closest = str(structured_summary.get("closest_match") or "").strip()
+    kind = structured_summary.get("understood_kind") or "place"
+
+    if not subject:
+        return "I don't have a match for that in the current data."
+
+    if kind == "project":
+        return (
+            f"I don't have a project called {subject} "
+            "in the current data."
+        )
+
+    if kind == "developer":
+        return (
+            f"I don't have {subject} projects in the current data."
+        )
+
+    if kind == "developer_community":
+        return f"I don't have {subject} in the current data."
+
+    if kind == "pattern":
+        return (
+            f"I don't have projects matching {subject} "
+            "in the current data."
+        )
+
+    if closest:
+        return (
+            f"I don't have projects in {subject}. "
+            f"The closest community I do have is {closest}."
+        )
+
+    return (
+        f"I don't have projects in {subject} in the current data."
+    )
+
+
+def _classify_small_talk(question):
+    """Return a small-talk kind when the whole message is a greeting or identity question."""
+
+    return _SMALL_TALK_KINDS.get(_normalize_chat_text(question))
+
+
+def _small_talk_answer(kind):
+    if kind == "identity":
+        return (
+            "I'm ACOT, an AI assistant for Dubai real estate. I answer from "
+            "project records and documents, including prices, developers, "
+            "bedroom ranges, handover dates, and amenities."
+        )
+
+    if kind == "capabilities":
+        return (
+            "I can help you with Dubai project data:\n\n"
+            "- Find projects in a community\n"
+            "- List starting prices, bedroom ranges, and handover dates\n"
+            "- Compare projects already on screen\n"
+            "- Pull amenities from their documents"
+        )
+
+    if kind == "thanks":
+        return (
+            "You're welcome. Ask me about a Dubai community or project "
+            "whenever you're ready."
+        )
+
+    if kind == "bye":
+        return (
+            "Goodbye. I'm here when you want to look at Dubai projects again."
+        )
+
+    return (
+        "Hi, I'm ACOT, a Dubai real estate assistant. I can look up projects, "
+        "starting prices, bedroom ranges, handover dates, and comparisons "
+        "from the data I have. What would you like to know?"
+    )
+
+
+def _empty_structured_summary():
+    return {
+        "community": [],
+        "projects": [],
+        "sub_communities": [],
+        "filter_no_match": False,
+        "filter_evidence_projects": [],
+    }
 
 
 # =========================================================
@@ -1325,9 +1536,39 @@ def _prepare_acot_turn(
     timing_ms = {}
     ask_started = time.perf_counter()
 
+    small_talk = _classify_small_talk(question)
+    if small_talk:
+        timing_ms["rewrite"] = 0
+        return {
+            "question": question,
+            "standalone_question": question,
+            "question_type": "general",
+            "structured_summary": _empty_structured_summary(),
+            "documents": [],
+            "investment_analysis": None,
+            "retrieval_result": {
+                "question_type": "general",
+                "structured_data": {
+                    "community": [],
+                    "projects": [],
+                    "sub_communities": [],
+                },
+                "documents": [],
+            },
+            "rag_chain": rag_chain,
+            "conversation_memory": conversation_memory,
+            "use_fast": True,
+            "fast_answer": _small_talk_answer(small_talk),
+            "context": None,
+            "timing_ms": timing_ms,
+            "ask_started": ask_started,
+            "small_talk": small_talk,
+        }
+
     rewrite_started = time.perf_counter()
+    question_for_search = prepare_user_question(question) or question
     standalone_question = conversation_memory.rewrite_question(
-        question
+        question_for_search
     )
     timing_ms["rewrite"] = _elapsed_ms(rewrite_started)
 
@@ -1379,6 +1620,10 @@ def _prepare_acot_turn(
                 []
             )
         ) or [],
+        "understood_subject": structured_data.get("understood_subject"),
+        "understood_kind": structured_data.get("understood_kind"),
+        "closest_match": structured_data.get("closest_match"),
+        "ambiguous_label": structured_data.get("ambiguous_label"),
     }
 
     investment_analysis = None
@@ -1402,6 +1647,13 @@ def _prepare_acot_turn(
         structured_summary=structured_summary,
         documents=documents,
     )
+    if (
+        not documents
+        and not structured_summary.get("projects")
+        and structured_summary.get("understood_subject")
+        and not structured_summary.get("filter_no_match")
+    ):
+        use_fast = True
 
     if use_fast:
         fast_answer = _build_fast_structured_answer(
@@ -1533,26 +1785,100 @@ def _stream_sources(prepared):
     return sources
 
 
+_PROJECT_FOLLOWUPS = (
+    ("price", "What are their starting prices?"),
+    ("bedroom", "Which of these have 2-bedroom options?"),
+    ("handover", "What are their handover dates?"),
+    ("developer", "Who is the developer of each of these projects?"),
+    (
+        "compare",
+        "Compare the first and second ones based on price, bedroom range, and handover date.",
+    ),
+    (
+        "amenities",
+        "What amenities do those projects offer according to their documents?",
+    ),
+    ("size", "What is the size range of each project?"),
+)
+
+
+def _question_topics(text):
+    question = (text or "").lower()
+    topics = set()
+    if any(term in question for term in ("price", "prices", "cost")):
+        topics.add("price")
+    if "bedroom" in question:
+        topics.add("bedroom")
+    if "handover" in question:
+        topics.add("handover")
+    if "developer" in question:
+        topics.add("developer")
+    if any(term in question for term in ("compare", "comparison", "versus", " vs ")):
+        topics.add("compare")
+    if "amenit" in question or "facilities" in question:
+        topics.add("amenities")
+    if any(term in question for term in ("size", "sqft", "square foot")):
+        topics.add("size")
+    return topics
+
+
+def _questions_already_asked(prepared):
+    asked = [prepared.get("question") or ""]
+    memory = prepared.get("conversation_memory")
+    turns = getattr(memory, "turns", None) or []
+    for turn in turns:
+        if isinstance(turn, dict):
+            asked.append(turn.get("user_question") or "")
+            asked.append(turn.get("standalone_question") or "")
+    return asked
+
+
+def _unused_followups(prepared, chips):
+    asked = _questions_already_asked(prepared)
+    asked_text = {_normalize_chat_text(item) for item in asked if item}
+    covered = set()
+    for item in asked:
+        covered.update(_question_topics(item))
+
+    unused = []
+    for chip in chips:
+        if _normalize_chat_text(chip) in asked_text:
+            continue
+        if _question_topics(chip) & covered:
+            continue
+        unused.append(chip)
+    return unused[:3]
+
+
 def _followup_questions(prepared):
+    question = prepared.get("question") or ""
+
+    if prepared.get("small_talk"):
+        return _unused_followups(prepared, _STARTER_CHIPS)
+
     projects = [
         project
         for project in (prepared["structured_summary"].get("projects") or [])
         if isinstance(project, dict)
     ]
     if len(projects) >= 2:
-        return [
-            "What are their starting prices?",
-            "What amenities do those projects offer according to their documents?",
-            "Compare the first and second ones based on price, bedroom range, and handover date.",
-        ]
+        return _unused_followups(
+            prepared,
+            [chip for _, chip in _PROJECT_FOLLOWUPS],
+        )
     if len(projects) == 1:
         name = projects[0].get("name") or "this project"
-        return [
-            f"What is the starting price of {name}?",
-            f"What is the handover date of {name}?",
-            f"What amenities does {name} offer?",
-        ]
-    return []
+        return _unused_followups(
+            prepared,
+            [
+                f"What is the starting price of {name}?",
+                f"What is the handover date of {name}?",
+                f"Who is the developer of {name}?",
+                f"What amenities does {name} offer?",
+                f"What is the bedroom range of {name}?",
+            ],
+        )
+    return _unused_followups(prepared, _STARTER_CHIPS)
 
 
 def _slim_stream_response(response):
