@@ -1,4 +1,4 @@
-﻿from app.llm.client import GeminiClient
+﻿from app.llm.client import AICreditsClient
 
 
 class HybridRAGChain:
@@ -10,7 +10,7 @@ class HybridRAGChain:
     """
 
     def __init__(self):
-        self.llm = GeminiClient()
+        self.llm = AICreditsClient()
 
     def generate_answer(
         self,

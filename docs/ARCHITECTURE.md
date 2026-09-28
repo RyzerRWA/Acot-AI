@@ -23,7 +23,7 @@ sequenceDiagram
     participant Vector as Supabase pgvector
     participant Analyzer as InvestmentAnalyzer
     participant Context as HybridContextBuilder
-    participant Gemini as GeminiClient (LLM)
+    participant LLM as AICreditsClient (openai/gpt-4o-mini)
 
     User->>CLI: User Question (e.g., "Which of these have 2 bedrooms?")
     CLI->>Memory: resolve_and_rewrite(question)
@@ -52,8 +52,8 @@ sequenceDiagram
 
     CLI->>Context: build_context(structured, documents, investment)
     Context-->>CLI: Grounded Markdown Context Block
-    CLI->>Gemini: generate_answer(question, context)
-    Gemini-->>CLI: Grounded Natural-Language Answer
+    CLI->>LLM: generate_answer(question, context)
+    LLM-->>CLI: Grounded Natural-Language Answer
     CLI->>Memory: update(question, standalone, answer, candidates)
     CLI->>User: Typewriter Streaming Output & JSON Payload
 ```
@@ -71,7 +71,7 @@ sequenceDiagram
   - Positional terms (*"the first one"*, *"the second"*, *"the last project"*).
   - Plural demonstratives (*"which of these"*, *"those projects"*, *"their prices"*).
   - Spatial demonstratives (*"there"*, *"in that community"*).
-- **Fallback Resolution**: If deterministic parsing cannot resolve the reference with certainty, it delegates to `GeminiClient` to extract the target reference while protecting system invariants.
+- **Reference resolution**: If deterministic parsing cannot resolve the reference with certainty, it delegates to `AICreditsClient` to extract the target reference while protecting system invariants.
 
 ### 3.2 Query Planner (`app/retrieval/hybrid/query_planner.py`)
 - Emits a structured `QueryPlan` dataclass:
@@ -98,7 +98,7 @@ sequenceDiagram
   - **Data Confidence vs Investment Risk**: Explicitly separates sample size confidence from market risk.
 
 ### 3.6 Hybrid RAG Chain (`app/rag/chains/hybrid_rag_chain.py`)
-- **Model**: `gemini-3.6-flash` via `google-genai` SDK.
+- **Model**: `openai/gpt-4o-mini` via AICredits.
 - Enforces **10 Grounding Commandments**:
   1. No hallucinated figures, projects, or statistics.
   2. No external Dubai real-estate knowledge outside the prompt.

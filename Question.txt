@@ -8,7 +8,7 @@
 8.show me the best properties in Jumeirah Village Circle?
 
 #Testing Question
-Show me the projects in Jumeirah Village Circle.meydan, Azizi Milan
+1.Show me the projects in Jumeirah Village Circle.meydan, Azizi Milan
 2.Which of these have 2-bedroom options?
 
 3.What are their starting prices?
@@ -16,3 +16,4 @@ Show me the projects in Jumeirah Village Circle.meydan, Azizi Milan
 4.What amenities do those projects offer according to their documents?
 
 5.Compare the first and second ones based on price, bedroom range, handover date, and documented amenities.
+

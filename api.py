@@ -1,4 +1,5 @@
 import io
+import time
 from contextlib import redirect_stdout, redirect_stderr
 
 from fastapi import FastAPI, HTTPException
@@ -66,7 +67,7 @@ def get_api_components():
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             _api_components = initialize_acot()
 
-        # Reuse the same OpenRouter-backed LLM client used by QueryPlanner.
+        # Reuse the same AICredits client used by QueryPlanner.
         _api_components["ai_analysis_engine"] = AIAnalysisEngine(
             llm=_api_components["query_planner"]._llm_client
         )
@@ -314,6 +315,8 @@ def ask_endpoint(request: AskRequest):
 
     try:
 
+        endpoint_started = time.perf_counter()
+
         # ----------------------------------------------------
         # Get session-specific ACOT components
         # ----------------------------------------------------
@@ -337,11 +340,21 @@ def ask_endpoint(request: AskRequest):
         # Add short ACOT score + recommendation
         # ----------------------------------------------------
 
+        summary_started = time.perf_counter()
         response["ai_summary"] = build_ai_summary(
             question=question,
             response=response,
             ai_analysis_engine=components["ai_analysis_engine"],
         )
+
+        timing = response.setdefault("meta", {}).setdefault("timing_ms", {})
+        timing["ai_summary"] = int(
+            round((time.perf_counter() - summary_started) * 1000)
+        )
+        timing["total"] = int(
+            round((time.perf_counter() - endpoint_started) * 1000)
+        )
+        print(f"ACOT timing_ms: {timing}")
 
         # ----------------------------------------------------
         # Return complete ACOT response
