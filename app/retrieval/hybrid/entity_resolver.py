@@ -35,9 +35,12 @@ Important:
 - Data is loaded from live Supabase.
 """
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 import re
+import time
+from threading import Lock
 from typing import Any, Dict, List, Optional
 
 
@@ -94,6 +97,8 @@ class ResolvedEntity:
 # ============================================================
 
 class EntityResolver:
+
+    CATALOG_TTL_SECONDS = 600
 
     # ========================================================
     # SUPABASE FIELDS
@@ -202,6 +207,10 @@ class EntityResolver:
         self.structured_retriever = (
             structured_retriever
         )
+        self._catalog_lock = Lock()
+        self._communities_cache = None
+        self._projects_cache = None
+        self._catalog_loaded_at = 0.0
 
     # ========================================================
     # NORMALIZE TEXT
@@ -300,6 +309,29 @@ class EntityResolver:
         )
 
         return response.data or []
+
+    def _catalog(self):
+        """Return communities and projects, refreshing at most every 10 minutes."""
+        now = time.monotonic()
+
+        with self._catalog_lock:
+            if (
+                self._communities_cache is not None
+                and self._projects_cache is not None
+                and now - self._catalog_loaded_at < self.CATALOG_TTL_SECONDS
+            ):
+                return self._communities_cache, self._projects_cache
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                communities_future = pool.submit(self._load_communities)
+                projects_future = pool.submit(self._load_projects)
+                communities = communities_future.result()
+                projects = projects_future.result()
+
+            self._communities_cache = communities
+            self._projects_cache = projects
+            self._catalog_loaded_at = time.monotonic()
+            return communities, projects
 
     # ========================================================
     # SCORE
@@ -740,13 +772,7 @@ class EntityResolver:
         # LOAD LIVE SUPABASE DATA
         # ====================================================
 
-        communities = (
-            self._load_communities()
-        )
-
-        projects = (
-            self._load_projects()
-        )
+        communities, projects = self._catalog()
 
         # ====================================================
         # 1. PROJECT

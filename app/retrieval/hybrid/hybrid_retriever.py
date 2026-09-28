@@ -25,7 +25,13 @@ Document data:
 """
 
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
+
+
+def _elapsed_ms(started: float) -> int:
+    return int(round((time.perf_counter() - started) * 1000))
 
 
 class HybridRetriever:
@@ -1040,68 +1046,36 @@ class HybridRetriever:
                 .supabase
             )
 
-            # ----------------------------------------------------
-            # Communities in city
-            # ----------------------------------------------------
-
-            community_response = (
-                supabase
-                .table("communities")
-                .select("*")
-                .ilike(
-                    "city",
-                    city_name
+            def _city_rows(table_name: str):
+                response = (
+                    supabase
+                    .table(table_name)
+                    .select("*")
+                    .ilike(
+                        "city",
+                        city_name
+                    )
+                    .limit(1000)
+                    .execute()
                 )
-                .limit(1000)
-                .execute()
-            )
+                return response.data or []
 
-            communities = (
-                community_response.data
-                or []
-            )
-
-            # ----------------------------------------------------
-            # Projects in city
-            # ----------------------------------------------------
-
-            project_response = (
-                supabase
-                .table("projects")
-                .select("*")
-                .ilike(
-                    "city",
-                    city_name
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                community_future = pool.submit(
+                    _city_rows,
+                    "communities",
                 )
-                .limit(1000)
-                .execute()
-            )
-
-            projects = (
-                project_response.data
-                or []
-            )
-
-            # ----------------------------------------------------
-            # Sub-communities in city
-            # ----------------------------------------------------
-
-            subcommunity_response = (
-                supabase
-                .table("sub_communities")
-                .select("*")
-                .ilike(
-                    "city",
-                    city_name
+                project_future = pool.submit(
+                    _city_rows,
+                    "projects",
                 )
-                .limit(1000)
-                .execute()
-            )
-
-            sub_communities = (
-                subcommunity_response.data
-                or []
-            )
+                subcommunity_future = pool.submit(
+                    _city_rows,
+                    "sub_communities",
+                )
+                communities = community_future.result()
+                projects = project_future.result()
+                sub_communities = subcommunity_future.result()
 
             return {
                 "communities":
@@ -1728,9 +1702,13 @@ class HybridRetriever:
         print("HYBRID RETRIEVER")
         print("================================")
 
+        timing_ms = {}
+
         # ========================================================
         # 1. QUERY PLANNING
         # ========================================================
+
+        plan_started = time.perf_counter()
 
         try:
 
@@ -1759,10 +1737,13 @@ class HybridRetriever:
 
             query_plan = None
 
+        timing_ms["plan"] = _elapsed_ms(plan_started)
+
         # ========================================================
         # 2. ENTITY RESOLUTION
         # ========================================================
 
+        entity_started = time.perf_counter()
         resolved_entity = None
 
         if self.entity_resolver:
@@ -1789,6 +1770,8 @@ class HybridRetriever:
                     "Entity resolver error:",
                     exc
                 )
+
+        timing_ms["entity_resolve"] = _elapsed_ms(entity_started)
 
         # ========================================================
         # 3. FALLBACK COMMUNITY
@@ -2021,78 +2004,82 @@ class HybridRetriever:
         )
 
         # ========================================================
-        # 7. RETRIEVE STRUCTURED DATA
+        # 7-8. RETRIEVE STRUCTURED DATA AND DOCUMENTS
         # ========================================================
+        # These sources do not depend on each other, so both run
+        # at the same time when a question needs them.
 
-        communities = []
+        structured_result = self._empty_structured_result()
+        documents = []
+        timing_ms["structured_retrieval"] = 0
+        timing_ms["document_retrieval"] = 0
 
-        projects = []
-
-        sub_communities = []
-
-        if needs_structured:
-
+        def _run_structured():
+            started = time.perf_counter()
             print()
             print(
                 "Retrieving structured "
                 "PostgreSQL data..."
             )
-
-            structured_result = (
-                self.retrieve_structured_data(
-                    question=question,
-                    resolved_entity=
-                        resolved_entity,
-                    filters=filters,
-                    conversation_context=
-                        conversation_context,
-                    query_plan=query_plan,
-                )
+            result = self.retrieve_structured_data(
+                question=question,
+                resolved_entity=resolved_entity,
+                filters=filters,
+                conversation_context=conversation_context,
+                query_plan=query_plan,
             )
+            return result, _elapsed_ms(started)
 
-            communities = (
-                structured_result.get(
-                    "communities",
-                    []
-                )
-                or []
-            )
-
-            projects = (
-                structured_result.get(
-                    "projects",
-                    []
-                )
-                or []
-            )
-
-            sub_communities = (
-                structured_result.get(
-                    "sub_communities",
-                    []
-                )
-                or []
-            )
-
-        # ========================================================
-        # 8. RETRIEVE DOCUMENTS
-        # ========================================================
-
-        documents = []
-
-        if needs_documents:
-
+        def _run_documents():
+            started = time.perf_counter()
             print()
             print(
                 "Retrieving Supabase "
                 "PGVector documents..."
             )
+            result = self.retrieve_documents(question)
+            return result, _elapsed_ms(started)
 
-            documents = (
-                self.retrieve_documents(
-                    question
-                )
+        if needs_structured and needs_documents:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                structured_future = pool.submit(_run_structured)
+                documents_future = pool.submit(_run_documents)
+                structured_result, structured_ms = structured_future.result()
+                documents, document_ms = documents_future.result()
+            timing_ms["structured_retrieval"] = structured_ms
+            timing_ms["document_retrieval"] = document_ms
+        elif needs_structured:
+            structured_result, timing_ms["structured_retrieval"] = (
+                _run_structured()
             )
+        elif needs_documents:
+            documents, timing_ms["document_retrieval"] = (
+                _run_documents()
+            )
+
+        communities = (
+            structured_result.get(
+                "communities",
+                []
+            )
+            or []
+        )
+
+        projects = (
+            structured_result.get(
+                "projects",
+                []
+            )
+            or []
+        )
+
+        sub_communities = (
+            structured_result.get(
+                "sub_communities",
+                []
+            )
+            or []
+        )
 
         # ========================================================
         # 9. ENTITY INFORMATION
@@ -2309,6 +2296,9 @@ class HybridRetriever:
             # Compatibility
             "structured_data":
                 structured_data,
+
+            "timing_ms":
+                timing_ms,
         }
 
     # ============================================================

@@ -1,7 +1,7 @@
-from app.llm.client import GeminiClient
+from app.llm.client import AICreditsClient
 
 
-llm = GeminiClient()
+llm = AICreditsClient()
 
 
 response = llm.generate(
@@ -9,6 +9,6 @@ response = llm.generate(
 )
 
 
-print("\nGEMINI RESPONSE:\n")
+print(f"\n{llm.model} RESPONSE:\n")
 
 print(response)

@@ -9,12 +9,9 @@ from openai import OpenAI
 from app.core.config import AICREDITS_API_KEY, AICREDITS_BASE_URL
 
 
-class GeminiClient:
+class AICreditsClient:
     """
-    ACOT LLM client using AICredits.
-
-    The class name remains GeminiClient so the rest of ACOT
-    keeps calling the same generate() method.
+    ACOT LLM client using AICredits and openai/gpt-4o-mini.
 
     AICredits is an OpenAI-compatible gateway:
         https://api.aicredits.in/v1
@@ -33,39 +30,16 @@ class GeminiClient:
 
         self.model = os.getenv(
             "AICREDITS_MODEL",
-            os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
+            "openai/gpt-4o-mini",
         )
 
-        configured_fallbacks = os.getenv(
-            "AICREDITS_FALLBACK_MODELS",
-            os.getenv(
-                "OPENROUTER_FALLBACK_MODELS",
-                "google/gemini-2.5-flash",
-            ),
-        )
-
-        fallback_models = [
-            item.strip()
-            for item in configured_fallbacks.split(",")
-            if item.strip()
-        ]
-
-        self.models = []
-
-        for model in [self.model] + fallback_models:
-            if model and model not in self.models:
-                self.models.append(model)
-
-        # Retry configuration
+        # One retry of the same model. A failure does not switch models.
         self.max_retries = 2
         self.retry_delays = (1.0,)
 
         # Output token limit
         self.max_output_tokens = int(
-            os.getenv(
-                "AICREDITS_MAX_OUTPUT_TOKENS",
-                os.getenv("OPENROUTER_MAX_OUTPUT_TOKENS", os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "900")),
-            )
+            os.getenv("AICREDITS_MAX_OUTPUT_TOKENS", "900")
         )
 
         # Response cache
@@ -321,108 +295,90 @@ class GeminiClient:
                 "Prompt cannot be empty."
             )
 
+        model = self.model
+        cache_key = self._cache_key(
+            prompt,
+            model,
+        )
+
+        cached = self._get_cached(
+            cache_key
+        )
+
+        if cached is not None:
+            print(
+                f"AICredits cache hit: {model}"
+            )
+            return cached
+
         last_error = None
 
-        for model_index, model in enumerate(
-            self.models
+        for attempt in range(
+            self.max_retries
         ):
-            cache_key = self._cache_key(
-                prompt,
-                model,
-            )
+            try:
 
-            cached = self._get_cached(
-                cache_key
-            )
-
-            if cached is not None:
-                print(
-                    f"AICredits cache hit: {model}"
-                )
-                return cached
-
-            for attempt in range(
-                self.max_retries
-            ):
-                try:
-
-                    if attempt > 0:
-                        delay = self.retry_delays[
-                            min(
-                                attempt - 1,
-                                len(self.retry_delays) - 1,
-                            )
-                        ]
-
-                        print(
-                            f"AICredits temporary "
-                            f"failure on {model}. "
-                            f"Retrying in "
-                            f"{delay:.1f}s "
-                            f"(attempt "
-                            f"{attempt + 1}/"
-                            f"{self.max_retries})..."
+                if attempt > 0:
+                    delay = self.retry_delays[
+                        min(
+                            attempt - 1,
+                            len(self.retry_delays) - 1,
                         )
+                    ]
 
-                        time.sleep(delay)
-
-                    response = (
-                        self._generate_with_model(
-                            model=model,
-                            prompt=prompt,
-                            max_output_tokens=(
-                                max_output_tokens
-                            ),
-                        )
+                    print(
+                        f"AICredits temporary "
+                        f"failure on {model}. "
+                        f"Retrying in "
+                        f"{delay:.1f}s "
+                        f"(attempt "
+                        f"{attempt + 1}/"
+                        f"{self.max_retries})..."
                     )
 
-                    self._set_cached(
-                        cache_key,
-                        response,
+                    time.sleep(delay)
+
+                response = (
+                    self._generate_with_model(
+                        model=model,
+                        prompt=prompt,
+                        max_output_tokens=(
+                            max_output_tokens
+                        ),
                     )
-
-                    return response
-
-                except Exception as error:
-                    last_error = error
-
-                    # Permanent errors:
-                    # do not retry.
-                    if not self._is_retryable_error(
-                        error
-                    ):
-                        raise RuntimeError(
-                            self._format_error(
-                                model,
-                                error,
-                            )
-                        ) from error
-
-                    # Retry temporary errors once.
-                    if attempt == 0:
-                        continue
-
-                    break
-
-            # Move to next fallback model.
-            if (
-                model_index
-                < len(self.models) - 1
-            ):
-                next_model = self.models[
-                    model_index + 1
-                ]
-
-                print(
-                    f"AICredits model "
-                    f"'{model}' is temporarily "
-                    f"unavailable. Falling back "
-                    f"to '{next_model}'."
                 )
+
+                self._set_cached(
+                    cache_key,
+                    response,
+                )
+
+                return response
+
+            except Exception as error:
+                last_error = error
+
+                # Permanent errors:
+                # do not retry.
+                if not self._is_retryable_error(
+                    error
+                ):
+                    raise RuntimeError(
+                        self._format_error(
+                            model,
+                            error,
+                        )
+                    ) from error
+
+                # Retry the same model once.
+                if attempt == 0:
+                    continue
+
+                break
 
         raise RuntimeError(
             "AICredits generation failed on "
-            "all configured models. "
+            f"model '{model}'. "
             f"Last error: {last_error}"
         ) from last_error
 
