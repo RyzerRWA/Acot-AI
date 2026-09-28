@@ -17,3 +17,114 @@
 
 5.Compare the first and second ones based on price, bedroom range, handover date, and documented amenities.
 
+# 1. Basic project search
+
+Show me 310 Riverside Crescent.
+Tell me about Azizi Riviera 49.
+Show details for Binghatti Aquarise.
+What information do you have about Damac Bay?
+Find Aykon City 3.
+Show me Canal Crown.
+Tell me about Binghatti Skyhall.
+Find Al Haseen Residence Phase 3 By Dugasta.
+Show me Damac City 2.
+Tell me about Azizi Venice.
+
+# 2. Developer-based questions
+
+Show me all projects by Azizi.
+What projects does Damac have?
+Show me all Binghatti projects.
+List all projects developed by Sobha.
+Show me Danube projects.
+What projects are developed by Dugasta?
+Show me all Azizi projects in Meydan.
+Show all Damac projects in Business Bay.
+Show all Binghatti projects in Business Bay.
+Which projects belong to Sobha in Umm Al Quwain Marina?
+
+# 3. Community → Project questions
+
+Show me all projects in Meydan.
+What projects are available in Business Bay?
+Show me projects in DAMAC Islands.
+What projects are in Dubai Industrial City?
+Show me projects in Al Jaddaf.
+List projects in Dubai Sports City.
+What projects are available in Al Furjan?
+Show projects in Dubai South (Dubai World Central).
+What projects are in Dubai Harbour?
+Show me projects in Umm Al Quwain Marina.
+List all projects in Al Safa.
+What projects are in Dubai Science Park?
+Show me projects in Majan.
+What projects are in Nad Al Sheba?
+Show me projects in Jumeirah Village Circle.
+
+# 4. Developer + community combination
+
+Show me Azizi projects in Meydan.
+Show me Damac projects in DAMAC Islands.
+Show me Damac projects in Business Bay.
+Show me Binghatti projects in Business Bay.
+Show me Sobha projects in Umm Al Quwain Marina.
+Show me Dugasta projects in Dubai Industrial City.
+Show me Azizi projects in Dubai South.
+Show me Damac projects in Dubai Harbour.
+Show me Danube projects in Business Bay.
+Show me Binghatti projects in Al Jaddaf.
+
+# 5. Specific project-name pattern questions
+
+Show me all projects starting with Azizi Milan.
+Show me all Azizi Riviera projects.
+Show me all Azizi Venice projects.
+Show me all Bora Bora projects.
+Show me all Damac Bay projects.
+Show me all Damac City projects.
+Show me all Canal Heights projects.
+Show me all Canal Crown projects.
+Show me all Al Haseen Residence projects.
+Show me all Binghatti Hills projects.
+Show me all projects containing Riverside Crescent.
+Show me all projects containing Milan.
+Show me all projects containing Riviera.
+Show me all projects containing Venice.
+Show me all projects containing Phase 2.
+
+# 6. Developer + name-pattern questions
+
+Show me all Azizi Milan projects.
+Show me all Azizi Riviera projects.
+Show me all Azizi Venice projects.
+Show me all Binghatti Hills projects.
+Show me all Damac Bay projects.
+Show me all Damac City projects.
+Show me all Bora Bora projects by Damac.
+Show me all Riverside Crescent projects by Sobha.
+
+# 7. Comparison questions
+
+Compare 310 Riverside Crescent and 320 Riverside Crescent.
+Compare Azizi Riviera 49 and Azizi Riviera 54.
+Compare Damac Bay and Damac Bay 2.
+Compare Canal Crown and Canal Crown 2.
+Compare Canal Heights and Canal Heights 2.
+Compare Damac City and Damac City 2.
+Compare Binghatti Skyflame and Binghatti Skyflame 2.
+Compare Bora Bora By Damac and Bora Bora Phase 2 by Damac.
+Compare Al Haseen Residence Phase 3 By Dugasta and Al Haseen Residences Phase 4 By Dugasta.
+Compare Azizi Milan and Azizi Milan 18.
+
+# 8. Multi-project retrieval
+
+Show me Damac Bay, Damac Bay 2, and Damac Bay Cavalli Phase 2.
+Show me all Azizi Riviera projects.
+Show me all Bora Bora projects.
+Show me all Riverside Crescent projects.
+Show me all Damac City projects.
+Show me all Canal Crown projects.
+Show me all Canal Heights projects.
+Show me all Al Haseen Residence projects.
+Show me all Binghatti Hills projects.
+
