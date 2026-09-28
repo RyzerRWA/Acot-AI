@@ -25,7 +25,22 @@ Document data:
 """
 
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
+
+from app.retrieval.hybrid.entity_resolver import EntityResolver
+from app.retrieval.hybrid.question_text import (
+    display_phrase,
+    interpret_search,
+    is_group_attribute_question,
+    prepare_user_question,
+    subject_for,
+)
+
+
+def _elapsed_ms(started: float) -> int:
+    return int(round((time.perf_counter() - started) * 1000))
 
 
 class HybridRetriever:
@@ -1040,68 +1055,36 @@ class HybridRetriever:
                 .supabase
             )
 
-            # ----------------------------------------------------
-            # Communities in city
-            # ----------------------------------------------------
-
-            community_response = (
-                supabase
-                .table("communities")
-                .select("*")
-                .ilike(
-                    "city",
-                    city_name
+            def _city_rows(table_name: str):
+                response = (
+                    supabase
+                    .table(table_name)
+                    .select("*")
+                    .ilike(
+                        "city",
+                        city_name
+                    )
+                    .limit(1000)
+                    .execute()
                 )
-                .limit(1000)
-                .execute()
-            )
+                return response.data or []
 
-            communities = (
-                community_response.data
-                or []
-            )
-
-            # ----------------------------------------------------
-            # Projects in city
-            # ----------------------------------------------------
-
-            project_response = (
-                supabase
-                .table("projects")
-                .select("*")
-                .ilike(
-                    "city",
-                    city_name
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                community_future = pool.submit(
+                    _city_rows,
+                    "communities",
                 )
-                .limit(1000)
-                .execute()
-            )
-
-            projects = (
-                project_response.data
-                or []
-            )
-
-            # ----------------------------------------------------
-            # Sub-communities in city
-            # ----------------------------------------------------
-
-            subcommunity_response = (
-                supabase
-                .table("sub_communities")
-                .select("*")
-                .ilike(
-                    "city",
-                    city_name
+                project_future = pool.submit(
+                    _city_rows,
+                    "projects",
                 )
-                .limit(1000)
-                .execute()
-            )
-
-            sub_communities = (
-                subcommunity_response.data
-                or []
-            )
+                subcommunity_future = pool.submit(
+                    _city_rows,
+                    "sub_communities",
+                )
+                communities = community_future.result()
+                projects = project_future.result()
+                sub_communities = subcommunity_future.result()
 
             return {
                 "communities":
@@ -1183,6 +1166,10 @@ class HybridRetriever:
             "filter_evidence_projects": (
                 result.get("filter_evidence_projects", []) or []
             ),
+            "understood_subject": result.get("understood_subject") or None,
+            "understood_kind": result.get("understood_kind") or None,
+            "closest_match": result.get("closest_match") or None,
+            "ambiguous_label": result.get("ambiguous_label") or None,
         }
 
     @staticmethod
@@ -1228,6 +1215,14 @@ class HybridRetriever:
             re.search(r"\bproperties?\b", q)
         )
 
+        asks_project_facts = bool(
+            re.search(
+                r"\b(?:handover|price|prices|cost|bedroom|bedrooms|"
+                r"amenit(?:y|ies)|status|size|developer)\b",
+                q,
+            )
+        )
+
         scopes: List[str] = []
 
         if asks_communities:
@@ -1243,6 +1238,9 @@ class HybridRetriever:
         # Keep project data for property-style questions because projects
         # are the closest available structured source.
         if asks_properties and not scopes:
+            scopes.append("projects")
+
+        if asks_project_facts and "projects" not in scopes:
             scopes.append("projects")
 
         if scopes:
@@ -1330,7 +1328,235 @@ class HybridRetriever:
                 )
                 or []
             ),
+            "understood_subject": (
+                structured_result.get("understood_subject") or None
+            ),
+            "understood_kind": (
+                structured_result.get("understood_kind") or None
+            ),
+            "closest_match": (
+                structured_result.get("closest_match") or None
+            ),
+            "ambiguous_label": (
+                structured_result.get("ambiguous_label") or None
+            ),
         }
+
+    # ============================================================
+    # SEARCH SHAPE
+    # ============================================================
+
+    @staticmethod
+    def _shape_takes_priority(shape: Dict[str, Any]) -> bool:
+        kind = (shape or {}).get("kind")
+        if kind in {
+            "name_pattern",
+            "developer_community",
+            "multi_name",
+            "developer",
+            "community",
+        }:
+            return True
+        return kind == "project" and bool(shape.get("browse"))
+
+    def _closest_named_community(self, phrase: str):
+        resolver = self.entity_resolver
+        if not resolver or not phrase:
+            return None
+
+        try:
+            communities, _projects = resolver._catalog()
+        except Exception:
+            return None
+
+        best_name = None
+        best_score = 0.0
+        for record in communities or []:
+            name = str(record.get("name") or "").strip()
+            if not name:
+                continue
+            score = EntityResolver._score(phrase, name)
+            if score > best_score:
+                best_score = score
+                best_name = name
+
+        if best_name and best_score >= 0.72:
+            return best_name
+        return None
+
+    def _canonical_community(self, phrase: str, resolved_entity=None) -> str:
+        phrase = (phrase or "").strip()
+        if (
+            resolved_entity
+            and getattr(resolved_entity, "entity_type", None) == "community"
+            and getattr(resolved_entity, "name", None)
+        ):
+            if EntityResolver._score(phrase, resolved_entity.name) >= 0.70:
+                return resolved_entity.name
+
+        closest = self._closest_named_community(phrase)
+        if closest and EntityResolver._score(phrase, closest) >= 0.70:
+            return closest
+        return phrase
+
+    def _projects_named(self, phrase: str, limit: int = 50):
+        if not self.structured_retriever or not phrase:
+            return []
+        try:
+            return (
+                self.structured_retriever.search_projects_by_name(
+                    phrase,
+                    limit=limit,
+                )
+                or []
+            )
+        except Exception as exc:
+            print("Name lookup error:", exc)
+            return []
+
+    def _filtered_projects(
+        self,
+        name_pattern: str = None,
+        starts_with: bool = False,
+        developer_name: str = None,
+        community_name: str = None,
+    ):
+        if not self.structured_retriever:
+            return []
+        try:
+            return (
+                self.structured_retriever.search_projects_filtered(
+                    name_pattern=name_pattern,
+                    starts_with=starts_with,
+                    developer_name=developer_name,
+                    community_name=community_name,
+                )
+                or []
+            )
+        except Exception as exc:
+            print("Filtered project lookup error:", exc)
+            return []
+
+    def _project_result(self, projects, ambiguous_label=None):
+        result = {
+            "communities": [],
+            "projects": projects or [],
+            "sub_communities": [],
+        }
+        if ambiguous_label and len(result["projects"]) > 1:
+            result["ambiguous_label"] = ambiguous_label
+        return result
+
+    def _retrieve_shaped(self, shape: Dict[str, Any], resolved_entity=None):
+        """Run compare-adjacent shapes before a single entity can win.
+
+        Returns None when this shape should fall through to the existing
+        project, community, developer, or city lookup.
+        """
+
+        kind = (shape or {}).get("kind")
+
+        if kind == "multi_name":
+            ordered = []
+            seen = set()
+            for name in shape.get("names") or []:
+                matches = self._projects_named(name)
+                exact = [
+                    row for row in matches
+                    if str(row.get("name") or "").strip().lower() == name.lower()
+                ]
+                chosen = exact[0] if exact else (matches[0] if matches else None)
+                if not chosen:
+                    continue
+                key = str(chosen.get("name") or "").strip().lower()
+                if key and key not in seen:
+                    seen.add(key)
+                    ordered.append(chosen)
+            return self._project_result(ordered)
+
+        if kind == "name_pattern":
+            projects = self._filtered_projects(
+                name_pattern=shape.get("stem"),
+                starts_with=bool(shape.get("starts_with")),
+                developer_name=shape.get("developer"),
+            )
+            return self._project_result(projects)
+
+        if kind == "developer_community":
+            community_name = self._canonical_community(
+                shape.get("community") or "",
+                resolved_entity=resolved_entity,
+            )
+            projects = self._filtered_projects(
+                developer_name=shape.get("developer"),
+                community_name=community_name,
+            )
+            return self._project_result(projects)
+
+        if kind == "developer":
+            return self._retrieve_by_developer(shape.get("developer") or "")
+
+        if kind == "community":
+            community_name = self._canonical_community(
+                shape.get("community") or "",
+                resolved_entity=resolved_entity,
+            )
+            projects = self._filtered_projects(community_name=community_name)
+            if not projects:
+                return None
+            return self._project_result(projects)
+
+        if kind == "project" and shape.get("browse"):
+            phrase = shape.get("name") or ""
+            matches = self._projects_named(phrase)
+            if not matches:
+                return None
+            label = display_phrase(phrase) if len(matches) > 1 else None
+            if len(matches) == 1:
+                return self._retrieve_by_project(
+                    matches[0].get("name") or phrase
+                )
+            return self._project_result(matches, ambiguous_label=label)
+
+        return None
+
+    def _retrieve_project_family(self, shape: Dict[str, Any], resolved_name: str):
+        """Return every project a short name matches, instead of one tower."""
+
+        phrase = (
+            (shape or {}).get("name")
+            or (shape or {}).get("mentioned_name")
+            or ""
+        )
+        matches = self._projects_named(phrase) if phrase else []
+        if len(matches) > 1:
+            return self._project_result(
+                matches,
+                ambiguous_label=display_phrase(phrase),
+            )
+        if len(matches) == 1:
+            return self._retrieve_by_project(
+                matches[0].get("name") or resolved_name
+            )
+        return self._retrieve_by_project(resolved_name)
+
+    def _annotate_miss(self, result: Dict[str, Any], shape: Dict[str, Any]):
+        if result.get("projects"):
+            return result
+
+        subject, kind = subject_for(shape or {})
+        if not subject:
+            return result
+
+        result["understood_subject"] = subject
+        result["understood_kind"] = kind
+        if kind == "place":
+            closest = self._closest_named_community(
+                (shape or {}).get("community") or ""
+            )
+            if closest and closest.lower() != subject.lower():
+                result["closest_match"] = closest
+        return result
 
     # ============================================================
     # STRUCTURED RETRIEVAL
@@ -1428,6 +1654,8 @@ class HybridRetriever:
         "them",
     )
 )
+            if candidate_names and is_group_attribute_question(question):
+                candidate_list_reference = True
 
             # Explicit project names in the current question.
             explicit_multi_project_reference = (
@@ -1486,6 +1714,8 @@ class HybridRetriever:
             explicit_multi_entity_comparison = (
                 len(comparison_entities) >= 2
             )
+
+            shape = interpret_search(question)
 
             if explicit_multi_entity_comparison:
 
@@ -1553,6 +1783,50 @@ class HybridRetriever:
                 )
 
             # ----------------------------------------------------
+            # SHAPE BEFORE A SINGLE ENTITY WINS
+            # ----------------------------------------------------
+
+            elif self._shape_takes_priority(shape):
+
+                shaped = self._retrieve_shaped(
+                    shape,
+                    resolved_entity=resolved_entity,
+                )
+                if shaped is not None:
+                    result = shaped
+                elif (
+                    resolved_entity
+                    and resolved_entity.entity_type == "project"
+                ):
+                    result = self._retrieve_project_family(
+                        shape,
+                        resolved_entity.name,
+                    )
+                elif (
+                    resolved_entity
+                    and resolved_entity.entity_type == "community"
+                ):
+                    result = self._retrieve_by_community(
+                        resolved_entity.name
+                    )
+                elif (
+                    resolved_entity
+                    and resolved_entity.entity_type == "developer"
+                ):
+                    result = self._retrieve_by_developer(
+                        resolved_entity.name
+                    )
+                elif (
+                    resolved_entity
+                    and resolved_entity.entity_type == "city"
+                ):
+                    result = self._retrieve_by_city(
+                        resolved_entity.name
+                    )
+                else:
+                    result = self._empty_structured_result()
+
+            # ----------------------------------------------------
             # PROJECT
             # ----------------------------------------------------
 
@@ -1563,10 +1837,9 @@ class HybridRetriever:
                 == "project"
             ):
 
-                result = (
-                    self._retrieve_by_project(
-                        resolved_entity.name
-                    )
+                result = self._retrieve_project_family(
+                    shape,
+                    resolved_entity.name,
                 )
 
             # ----------------------------------------------------
@@ -1582,6 +1855,23 @@ class HybridRetriever:
 
                 result = (
                     self._retrieve_by_community(
+                        resolved_entity.name
+                    )
+                )
+
+            # ----------------------------------------------------
+            # DEVELOPER
+            # ----------------------------------------------------
+
+            elif (
+                resolved_entity
+                and
+                resolved_entity.entity_type
+                == "developer"
+            ):
+
+                result = (
+                    self._retrieve_by_developer(
                         resolved_entity.name
                     )
                 )
@@ -1608,6 +1898,8 @@ class HybridRetriever:
                 result = (
                     self._empty_structured_result()
                 )
+
+            self._annotate_miss(result, shape)
 
             # ----------------------------------------------------
             # NORMALIZE RESULT KEYS
@@ -1728,9 +2020,14 @@ class HybridRetriever:
         print("HYBRID RETRIEVER")
         print("================================")
 
+        question = prepare_user_question(question) or question
+        timing_ms = {}
+
         # ========================================================
         # 1. QUERY PLANNING
         # ========================================================
+
+        plan_started = time.perf_counter()
 
         try:
 
@@ -1759,10 +2056,13 @@ class HybridRetriever:
 
             query_plan = None
 
+        timing_ms["plan"] = _elapsed_ms(plan_started)
+
         # ========================================================
         # 2. ENTITY RESOLUTION
         # ========================================================
 
+        entity_started = time.perf_counter()
         resolved_entity = None
 
         if self.entity_resolver:
@@ -1789,6 +2089,8 @@ class HybridRetriever:
                     "Entity resolver error:",
                     exc
                 )
+
+        timing_ms["entity_resolve"] = _elapsed_ms(entity_started)
 
         # ========================================================
         # 3. FALLBACK COMMUNITY
@@ -2021,78 +2323,82 @@ class HybridRetriever:
         )
 
         # ========================================================
-        # 7. RETRIEVE STRUCTURED DATA
+        # 7-8. RETRIEVE STRUCTURED DATA AND DOCUMENTS
         # ========================================================
+        # These sources do not depend on each other, so both run
+        # at the same time when a question needs them.
 
-        communities = []
+        structured_result = self._empty_structured_result()
+        documents = []
+        timing_ms["structured_retrieval"] = 0
+        timing_ms["document_retrieval"] = 0
 
-        projects = []
-
-        sub_communities = []
-
-        if needs_structured:
-
+        def _run_structured():
+            started = time.perf_counter()
             print()
             print(
                 "Retrieving structured "
                 "PostgreSQL data..."
             )
-
-            structured_result = (
-                self.retrieve_structured_data(
-                    question=question,
-                    resolved_entity=
-                        resolved_entity,
-                    filters=filters,
-                    conversation_context=
-                        conversation_context,
-                    query_plan=query_plan,
-                )
+            result = self.retrieve_structured_data(
+                question=question,
+                resolved_entity=resolved_entity,
+                filters=filters,
+                conversation_context=conversation_context,
+                query_plan=query_plan,
             )
+            return result, _elapsed_ms(started)
 
-            communities = (
-                structured_result.get(
-                    "communities",
-                    []
-                )
-                or []
-            )
-
-            projects = (
-                structured_result.get(
-                    "projects",
-                    []
-                )
-                or []
-            )
-
-            sub_communities = (
-                structured_result.get(
-                    "sub_communities",
-                    []
-                )
-                or []
-            )
-
-        # ========================================================
-        # 8. RETRIEVE DOCUMENTS
-        # ========================================================
-
-        documents = []
-
-        if needs_documents:
-
+        def _run_documents():
+            started = time.perf_counter()
             print()
             print(
                 "Retrieving Supabase "
                 "PGVector documents..."
             )
+            result = self.retrieve_documents(question)
+            return result, _elapsed_ms(started)
 
-            documents = (
-                self.retrieve_documents(
-                    question
-                )
+        if needs_structured and needs_documents:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                structured_future = pool.submit(_run_structured)
+                documents_future = pool.submit(_run_documents)
+                structured_result, structured_ms = structured_future.result()
+                documents, document_ms = documents_future.result()
+            timing_ms["structured_retrieval"] = structured_ms
+            timing_ms["document_retrieval"] = document_ms
+        elif needs_structured:
+            structured_result, timing_ms["structured_retrieval"] = (
+                _run_structured()
             )
+        elif needs_documents:
+            documents, timing_ms["document_retrieval"] = (
+                _run_documents()
+            )
+
+        communities = (
+            structured_result.get(
+                "communities",
+                []
+            )
+            or []
+        )
+
+        projects = (
+            structured_result.get(
+                "projects",
+                []
+            )
+            or []
+        )
+
+        sub_communities = (
+            structured_result.get(
+                "sub_communities",
+                []
+            )
+            or []
+        )
 
         # ========================================================
         # 9. ENTITY INFORMATION
@@ -2186,6 +2492,18 @@ class HybridRetriever:
                     )
                     or []
                 ) if needs_structured else [],
+
+            "understood_subject":
+                structured_result.get("understood_subject"),
+
+            "understood_kind":
+                structured_result.get("understood_kind"),
+
+            "closest_match":
+                structured_result.get("closest_match"),
+
+            "ambiguous_label":
+                structured_result.get("ambiguous_label"),
         }
 
         # ========================================================
@@ -2309,6 +2627,9 @@ class HybridRetriever:
             # Compatibility
             "structured_data":
                 structured_data,
+
+            "timing_ms":
+                timing_ms,
         }
 
     # ============================================================

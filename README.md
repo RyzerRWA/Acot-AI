@@ -39,7 +39,7 @@
 1. **Relational PostgreSQL Data**: Live, structured property listings, developers, pricing, bedroom counts, completion statuses, and community metrics stored in Supabase.
 2. **Dense Vector Embeddings (`pgvector`)**: 384-dimensional dense vectors (`all-MiniLM-L6-v2`) of official Dubai Land Department (DLD) annual reports, Dubai Municipality Building Codes, and official developer project brochures.
 3. **Deterministic Financial Modeling**: Automated calculation of rental yield percentiles, project status distributions, risk scores, and data confidence metrics.
-4. **Strictly Grounded LLM Generation**: Backed by Google Gemini (`gemini-3.6-flash`), enforced by rigid system-level grounding constraints that forbid extrapolation, external market conjecture, or unit alterations.
+4. **Strictly Grounded LLM Generation**: Backed by AICredits (`openai/gpt-4o-mini`), enforced by rigid system-level grounding constraints that forbid extrapolation, external market conjecture, or unit alterations.
 
 ---
 
@@ -79,7 +79,7 @@ flowchart TD
     Aggregator --> CtxBuilder[Hybrid Context Builder\nFormat Markdown Evidence]
     InvestAnalyzer --> CtxBuilder
     
-    CtxBuilder --> RAGChain[Hybrid RAG Chain\nGoogle Gemini 3.6 Flash]
+    CtxBuilder --> RAGChain[Hybrid RAG Chain\nAICredits openai/gpt-4o-mini]
     RAGChain --> Response([Grounded Response\nTerminal Stream + Frontend JSON])
     Response -.->|Update History| Mem
 ```
@@ -106,7 +106,7 @@ Acot-AI/
 │   │       └── chat.py               # HTTP chat endpoints
 │   ├── core/
 │   │   ├── __init__.py
-│   │   └── config.py                 # App settings & Gemini API keys
+│   │   └── config.py                 # App settings and AICredits API key
 │   ├── database/
 │   │   ├── __init__.py
 │   │   └── supabase_client.py        # Supabase client singleton
@@ -122,7 +122,7 @@ Acot-AI/
 │   │   └── investment_analyzer.py    # Deterministic rental yield & risk analyzer
 │   ├── llm/
 │   │   ├── __init__.py
-│   │   └── client.py                 # Resilient Gemini API client with backoff
+│   │   └── client.py                 # AICredits client for openai/gpt-4o-mini
 │   ├── memory/
 │   │   ├── __init__.py
 │   │   └── conversation_memory.py    # Multi-turn memory & coreference resolver
@@ -131,7 +131,7 @@ Acot-AI/
 │   │   ├── chains/
 │   │   │   ├── __init__.py
 │   │   │   ├── rag_chain.py
-│   │   │   └── hybrid_rag_chain.py   # Grounded prompt construction & Gemini answer generation
+│   │   │   └── hybrid_rag_chain.py   # Grounded prompt construction and AICredits answer generation
 │   │   ├── embeddings/
 │   │   │   ├── __init__.py
 │   │   │   └── embedding_model.py    # SentenceTransformers (all-MiniLM-L6-v2, 384-dim)
@@ -263,7 +263,7 @@ Acot-AI/
 
 ### 7. Grounded Hybrid RAG Chain
 - **Module**: `app/rag/chains/hybrid_rag_chain.py`
-- Communicates with Google Gemini via `GeminiClient` (`gemini-3.6-flash`).
+- Communicates with AICredits via `AICreditsClient` (`openai/gpt-4o-mini`).
 - Injects the Grounding Commandments ensuring that:
   - Missing fields are reported as *"not specified in available records"*, not inferred as zero.
   - Handover dates are never conflated with development status without explicit evidence.
@@ -337,7 +337,7 @@ The system uses Supabase (PostgreSQL with `pgvector` extension enabled):
 - **Python**: **3.10+** (Python 3.11 recommended; macOS built-in Python 3.9 is **not** supported due to dependency requirements).
 - **Package Manager**: `pip` (upgraded to latest)
 - **Supabase Account**: With PostgreSQL and `pgvector` extension enabled.
-- **Google Cloud / Gemini API Key**: With access to `gemini-3.6-flash`.
+- **AICredits API Key**: With access to `openai/gpt-4o-mini`.
 
 ---
 
@@ -382,8 +382,10 @@ pip install -r requirements.txt
 Create or update the `.env` file in the root directory:
 
 ```env
-# Google Gemini API
-GEMINI_API_KEY=your_gemini_api_key_here
+# AICredits
+AICREDITS_API_KEY=your_aicredits_api_key_here
+AICREDITS_BASE_URL=https://api.aicredits.in/v1
+AICREDITS_MODEL=openai/gpt-4o-mini
 
 # Supabase Credentials
 SUPABASE_URL=https://your-project-id.supabase.co

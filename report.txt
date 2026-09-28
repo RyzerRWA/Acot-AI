@@ -1,0 +1,19 @@
+The test passed for speed and for using only one model. Do not sync in a way that throws away your local files. A normal pull is fine if you keep those changes.
+
+**Test report**
+
+The API was healthy. All 9 questions came back with an answer. The log never switched to a second model. Every answer used AICredits and `openai/gpt-4o-mini`.
+
+Simple price and project questions were the quick ones, about 2 to 5 seconds after the first request. The first Sky Edition price question took 14 seconds because the server was still starting. Asking it again took 5 seconds, and looking up the project list dropped from 2.3 seconds to 64 milliseconds.
+
+Questions that need a written answer were slower. Amenities took 8 seconds. “Best properties” took 8 seconds. Amenities from documents took 22 seconds. Comparing two projects took 47 seconds, and most of that was the model writing the answer.
+
+Follow-up questions remembered the Azizi Milan projects. The comparison scored 96. “Best properties in Jumeirah Village Circle” did not get a score. It was treated as a normal search and said there were no listings there.
+
+**Syncing with `pradeepk/devAI`**
+
+Your branch `fet/ai` is already on the same commit as `origin/pradeepk/devAI`. GitHub does not have newer commits than that, based on the last check. The latency and model cleanup are only on your computer. They are not committed. That is 12 changed files.
+
+`.env` is ignored, so a commit would not upload your API keys.
+
+A normal pull is safe and should change nothing, as long as you do not discard or reset your local edits. Do not sync by resetting the folder to match GitHub. That would delete this work. If you want GitHub to have it, commit the 12 files first, then push.

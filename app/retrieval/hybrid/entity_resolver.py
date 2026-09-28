@@ -35,9 +35,12 @@ Important:
 - Data is loaded from live Supabase.
 """
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 import re
+import time
+from threading import Lock
 from typing import Any, Dict, List, Optional
 
 
@@ -94,6 +97,8 @@ class ResolvedEntity:
 # ============================================================
 
 class EntityResolver:
+
+    CATALOG_TTL_SECONDS = 600
 
     # ========================================================
     # SUPABASE FIELDS
@@ -168,6 +173,8 @@ class EntityResolver:
         "prices",
         "available",
         "options",
+        "all",
+        "every",
         "good",
         "better",
         "recommend",
@@ -202,6 +209,10 @@ class EntityResolver:
         self.structured_retriever = (
             structured_retriever
         )
+        self._catalog_lock = Lock()
+        self._communities_cache = None
+        self._projects_cache = None
+        self._catalog_loaded_at = 0.0
 
     # ========================================================
     # NORMALIZE TEXT
@@ -215,29 +226,11 @@ class EntityResolver:
         if not text:
             return ""
 
-        text = text.lower().strip()
-
-        text = re.sub(
-            r"[^a-z0-9\s]",
-            " ",
-            text
+        from app.retrieval.hybrid.question_text import (
+            normalize_for_match,
         )
 
-        text = re.sub(
-            r"\s+",
-            " ",
-            text
-        )
-
-        aliases = {
-            "jvc": "jumeirah village circle",
-            "jumeirah village": "jumeirah village circle",
-        }
-
-        return aliases.get(
-            text,
-            text
-        )
+        return normalize_for_match(text)
 
     # ========================================================
     # TOKEN SET
@@ -301,6 +294,29 @@ class EntityResolver:
 
         return response.data or []
 
+    def _catalog(self):
+        """Return communities and projects, refreshing at most every 10 minutes."""
+        now = time.monotonic()
+
+        with self._catalog_lock:
+            if (
+                self._communities_cache is not None
+                and self._projects_cache is not None
+                and now - self._catalog_loaded_at < self.CATALOG_TTL_SECONDS
+            ):
+                return self._communities_cache, self._projects_cache
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                communities_future = pool.submit(self._load_communities)
+                projects_future = pool.submit(self._load_projects)
+                communities = communities_future.result()
+                projects = projects_future.result()
+
+            self._communities_cache = communities
+            self._projects_cache = projects
+            self._catalog_loaded_at = time.monotonic()
+            return communities, projects
+
     # ========================================================
     # SCORE
     # ========================================================
@@ -357,6 +373,12 @@ class EntityResolver:
             +
             0.30 * sequence
         )
+
+        # Close spellings such as "Ai Jaddaf" and "Al Jaddaf" share most
+        # of the name but miss the 0.70 token threshold.
+        length_ratio = min(len(q), len(n)) / max(len(q), len(n))
+        if length_ratio >= 0.75 and sequence >= 0.84 and overlap >= 0.5:
+            score = max(score, 0.88)
 
         return min(
             score,
@@ -610,6 +632,70 @@ class EntityResolver:
         )
 
     # ========================================================
+    # RESOLVE DEVELOPER
+    # ========================================================
+
+    def _resolve_developer(
+        self,
+        phrases: List[str],
+        projects: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """Match a developer when the question asks for that developer's projects."""
+
+        developers: Dict[str, Dict[str, Any]] = {}
+
+        for record in projects:
+            raw = str(record.get("developer_name") or "").strip()
+            key = self.normalize(raw)
+            if not key:
+                continue
+            bucket = developers.setdefault(
+                key,
+                {"name": raw, "count": 0},
+            )
+            bucket["count"] += 1
+
+        best = None
+
+        for phrase in phrases:
+            normalized_phrase = self.normalize(phrase)
+            query_tokens = self.token_set(phrase)
+            if not query_tokens and not normalized_phrase:
+                continue
+
+            for key, info in developers.items():
+                developer_tokens = self.token_set(info["name"])
+                if not developer_tokens:
+                    continue
+
+                tokens_covered = developer_tokens <= query_tokens
+                name_covered = key in normalized_phrase
+                if not tokens_covered and not name_covered:
+                    continue
+
+                score = 0.92 if tokens_covered else 0.84
+                if (
+                    best is None
+                    or score > best["score"]
+                    or (
+                        score == best["score"]
+                        and info["count"] > best["count"]
+                    )
+                ):
+                    best = {
+                        "entity_type": "developer",
+                        "name": info["name"],
+                        "score": score,
+                        "count": info["count"],
+                        "matched_phrase": phrase,
+                    }
+
+        if not best or best["count"] < 1:
+            return None
+
+        return best
+
+    # ========================================================
     # RESOLVE COMMUNITY
     # ========================================================
 
@@ -740,13 +826,7 @@ class EntityResolver:
         # LOAD LIVE SUPABASE DATA
         # ====================================================
 
-        communities = (
-            self._load_communities()
-        )
-
-        projects = (
-            self._load_projects()
-        )
+        communities, projects = self._catalog()
 
         # ====================================================
         # 1. PROJECT
@@ -987,7 +1067,57 @@ class EntityResolver:
                 )
 
         # ====================================================
-        # 4. NOTHING FOUND
+        # 4. DEVELOPER
+        # ====================================================
+        #
+        # "Show me all Binghatti projects" is not one project name.
+        # It is every project whose developer is Binghatti.
+
+        developer_match = (
+            self._resolve_developer(
+                unique_phrases,
+                projects
+            )
+        )
+
+        if developer_match:
+
+            return ResolvedEntity(
+
+                entity_type="developer",
+
+                name=developer_match["name"],
+
+                entity_id=None,
+
+                confidence=developer_match["score"],
+
+                record=None,
+
+                candidates=[
+                    developer_match
+                ],
+
+                location=None,
+
+                community=None,
+
+                reasoning=[
+
+                    f"Resolved developer "
+                    f"'{developer_match['name']}' "
+                    f"from live Supabase data.",
+
+                    f"Matched query phrase: "
+                    f"'{developer_match['matched_phrase']}'.",
+
+                    f"Projects: "
+                    f"{developer_match['count']}.",
+                ],
+            )
+
+        # ====================================================
+        # 5. NOTHING FOUND
         # ====================================================
 
         return ResolvedEntity(

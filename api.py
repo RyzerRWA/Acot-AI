@@ -1,11 +1,14 @@
 import io
+import json
+import time
 from contextlib import redirect_stdout, redirect_stderr
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from run import initialize_acot, ask_acot
+from run import initialize_acot, ask_acot, stream_acot, _slim_stream_response
 from app.memory.conversation_memory import ConversationMemory
 from app.intelligence.ai_analysis_engine import AIAnalysisEngine
 
@@ -66,7 +69,7 @@ def get_api_components():
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             _api_components = initialize_acot()
 
-        # Reuse the same OpenRouter-backed LLM client used by QueryPlanner.
+        # Reuse the same AICredits client used by QueryPlanner.
         _api_components["ai_analysis_engine"] = AIAnalysisEngine(
             llm=_api_components["query_planner"]._llm_client
         )
@@ -314,6 +317,8 @@ def ask_endpoint(request: AskRequest):
 
     try:
 
+        endpoint_started = time.perf_counter()
+
         # ----------------------------------------------------
         # Get session-specific ACOT components
         # ----------------------------------------------------
@@ -337,11 +342,21 @@ def ask_endpoint(request: AskRequest):
         # Add short ACOT score + recommendation
         # ----------------------------------------------------
 
+        summary_started = time.perf_counter()
         response["ai_summary"] = build_ai_summary(
             question=question,
             response=response,
             ai_analysis_engine=components["ai_analysis_engine"],
         )
+
+        timing = response.setdefault("meta", {}).setdefault("timing_ms", {})
+        timing["ai_summary"] = int(
+            round((time.perf_counter() - summary_started) * 1000)
+        )
+        timing["total"] = int(
+            round((time.perf_counter() - endpoint_started) * 1000)
+        )
+        print(f"ACOT timing_ms: {timing}")
 
         # ----------------------------------------------------
         # Return complete ACOT response
@@ -355,6 +370,84 @@ def ask_endpoint(request: AskRequest):
             status_code=500,
             detail=f"ACOT processing error: {str(exc)}"
         )
+
+
+def _sse_data(payload):
+    body = json.dumps(
+        payload,
+        ensure_ascii=False,
+        default=str,
+    )
+    return f"data: {body}\n\n"
+
+
+@app.post("/api/ask/stream")
+def ask_stream_endpoint(request: AskRequest):
+
+    question = request.question.strip()
+
+    if not question:
+        raise HTTPException(
+            status_code=400,
+            detail="Question cannot be empty."
+        )
+
+    def events():
+        try:
+            components = get_session_components(
+                request.session_id
+            )
+
+            for event_name, data in stream_acot(
+                question,
+                components
+            ):
+                if event_name == "meta" and isinstance(data, dict):
+                    data = dict(data)
+                    data["session_id"] = request.session_id
+
+                if event_name == "done" and isinstance(data, dict):
+                    data = dict(data)
+                    data["ai_summary"] = build_ai_summary(
+                        question=question,
+                        response=data,
+                        ai_analysis_engine=components["ai_analysis_engine"],
+                    )
+                    data = _slim_stream_response(data)
+                    yield _sse_data({
+                        "type": "done",
+                        "response": data,
+                    })
+                    continue
+
+                if isinstance(data, dict) and data.get("type"):
+                    yield _sse_data(data)
+                    continue
+
+                yield _sse_data({
+                    "type": event_name,
+                    **(data if isinstance(data, dict) else {"text": data}),
+                })
+
+        except Exception as exc:
+            yield _sse_data(
+                {
+                    "type": "error",
+                    "message": (
+                        f"ACOT processing error: {str(exc)}"
+                    )
+                },
+            )
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ============================================================

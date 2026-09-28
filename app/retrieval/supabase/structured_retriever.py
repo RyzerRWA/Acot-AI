@@ -136,6 +136,72 @@ class SupabaseStructuredRetriever:
         return response.data or []
 
     # =========================================================
+    # PROJECTS BY NAME, DEVELOPER, AND COMMUNITY
+    # =========================================================
+
+    def search_projects_filtered(
+        self,
+        name_pattern: str = None,
+        starts_with: bool = False,
+        developer_name: str = None,
+        community_name: str = None,
+        limit: int = 200,
+    ):
+        """Return projects matching a name stem and optional developer or community.
+
+        Developer names are stored with a leading space on some rows.
+        The comparison uses the stripped name, and the lookup itself
+        uses a contains match so that space does not hide the row.
+        """
+
+        name_pattern = (name_pattern or "").strip()
+        developer_name = (developer_name or "").strip()
+        community_name = (community_name or "").strip()
+
+        if not name_pattern and not developer_name and not community_name:
+            return []
+
+        query = (
+            self.supabase
+            .table("projects")
+            .select(self.PROJECT_FIELDS)
+        )
+
+        if name_pattern:
+            safe = name_pattern.replace("%", "").replace("_", " ").strip()
+            pattern = f"{safe}%" if starts_with else f"%{safe}%"
+            query = query.ilike("name", pattern)
+
+        if developer_name:
+            safe_developer = developer_name.replace("%", "").replace("_", " ").strip()
+            query = query.ilike("developer_name", f"%{safe_developer}%")
+
+        if community_name:
+            safe_community = community_name.replace("%", "").replace("_", " ").strip()
+            query = query.ilike("community", f"%{safe_community}%")
+
+        response = query.limit(limit).execute()
+        rows = response.data or []
+
+        if community_name and rows:
+            wanted_community = community_name.strip().lower()
+            exact = [
+                row for row in rows
+                if str(row.get("community") or "").strip().lower() == wanted_community
+            ]
+            if exact:
+                rows = exact
+
+        if not developer_name:
+            return rows
+
+        wanted = developer_name.lower()
+        return [
+            row for row in rows
+            if wanted in str(row.get("developer_name") or "").strip().lower()
+        ]
+
+    # =========================================================
     # PROJECT SEARCH
     # =========================================================
 

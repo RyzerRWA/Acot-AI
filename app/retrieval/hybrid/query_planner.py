@@ -107,8 +107,8 @@ class QueryPlanner:
 
         if self.use_llm and self._llm_client is None:
             try:
-                from app.llm.client import GeminiClient
-                self._llm_client = GeminiClient()
+                from app.llm.client import AICreditsClient
+                self._llm_client = AICreditsClient()
             except Exception as exc:
                 self._llm_client = None
                 self._llm_error = str(exc)
@@ -420,6 +420,15 @@ class QueryPlanner:
                 "The question asks for document/brochure/feature knowledge; source documents are required."
             )
 
+        elif self._is_attribute_question(q_lower):
+            plan.intent = "information"
+            plan.operations.append("retrieve_information")
+            plan.needs_structured_data = True
+            plan.needs_documents = False
+            plan.reasoning.append(
+                "The question asks for a stored project field rather than a new project search."
+            )
+
         elif self._contains_any(q_lower, self.SEARCH_TERMS):
             plan.intent = "search"
             plan.operations.append("search")
@@ -515,7 +524,19 @@ class QueryPlanner:
             "document",
             "general",
         }:
-            plan.needs_documents = True
+            # A price or bedroom follow-up only needs the structured rows.
+            # Document intent, and information questions that are not field
+            # lookups, still search brochures.
+            if (
+                plan.intent == "information"
+                and self._is_attribute_question(q_lower)
+            ):
+                plan.needs_documents = self._contains_any(
+                    q_lower,
+                    self.DOCUMENT_TERMS,
+                )
+            else:
+                plan.needs_documents = True
 
         # Investment/prediction should NOT be treated as pure brochure RAG.
         if plan.needs_analytics or plan.needs_prediction:
@@ -810,6 +831,31 @@ Rules:
             list(llm_plan.reasoning) + list(rule_plan.reasoning)
         )
         return llm_plan
+
+    ATTRIBUTE_TERMS = (
+        "price",
+        "prices",
+        "bedroom",
+        "bedrooms",
+        "handover",
+        "developer",
+        "status",
+    )
+
+    BROWSE_TERMS = (
+        "show me",
+        "list",
+        "find",
+        "search",
+    )
+
+    def _is_attribute_question(self, text: str) -> bool:
+        """Stored-field questions are information, unless the user is browsing."""
+
+        if self._contains_any(text, self.BROWSE_TERMS):
+            return False
+
+        return self._contains_any(text, self.ATTRIBUTE_TERMS)
 
     @staticmethod
     def _contains_any(text: str, terms) -> bool:
