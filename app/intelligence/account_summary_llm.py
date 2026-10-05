@@ -240,6 +240,11 @@ def _parse_labelled_text(raw: str) -> dict:
 
     summary, score_text, insights_text = _split_sections(raw)
 
+    # No recognisable section headers. Keep the raw text as the summary so
+    # the caller still renders something instead of an empty card.
+    if not summary:
+        summary = _strip_markdown(raw.replace("\n", " "))
+
     return {
         "summary": summary,
         "acot_score": _clean_score(score_text),
@@ -294,9 +299,15 @@ def _split_sections(raw: str) -> tuple[str, str, str]:
 
 _BULLET = re.compile(r"^\s*(?:[-*\u2022\u2013]|\d+[.)])\s*")
 _SCORE = re.compile(r"-?\d+(?:\.\d+)?")
+_INLINE_MARKDOWN = re.compile(r"(\*\*|__|\*|`)")
 
 
-def _clean_score(value: unknown) -> float | None:
+def _strip_markdown(value: str) -> str:
+
+    return re.sub(r"\s{2,}", " ", _INLINE_MARKDOWN.sub("", value)).strip()
+
+
+def _clean_score(value) -> float | None:
 
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         number = float(value)
@@ -312,7 +323,7 @@ def _clean_score(value: unknown) -> float | None:
     return round(max(0.0, min(10.0, number)), 1)
 
 
-def _clean_insights(value: unknown) -> list[str]:
+def _clean_insights(value) -> list[str]:
 
     if isinstance(value, str):
         lines: list[str] = value.splitlines()
@@ -325,7 +336,7 @@ def _clean_insights(value: unknown) -> list[str]:
 
     for line in lines:
 
-        cleaned = _BULLET.sub("", line).strip()
+        cleaned = _strip_markdown(_BULLET.sub("", line))
 
         if cleaned:
             insights.append(cleaned)

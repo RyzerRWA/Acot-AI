@@ -11,6 +11,10 @@ from pydantic import BaseModel, Field
 from run import initialize_acot, ask_acot, stream_acot, _slim_stream_response
 from app.memory.conversation_memory import ConversationMemory
 from app.intelligence.ai_analysis_engine import AIAnalysisEngine
+from app.intelligence.account_summary_service import (
+    clear_summary_cache,
+    get_account_summary,
+)
 
 
 # ============================================================
@@ -448,6 +452,45 @@ def ask_stream_endpoint(request: AskRequest):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ============================================================
+# ACCOUNT AI SUMMARY
+# ============================================================
+
+@app.get("/api/account/summary/{user_id}")
+def account_summary(
+    user_id: str,
+    refresh: bool = False
+):
+
+    user = user_id.strip()
+
+    if not user:
+
+        raise HTTPException(
+            status_code=400,
+            detail="user_id is required."
+        )
+
+    try:
+
+        return get_account_summary(user, refresh=refresh)
+
+    except Exception as exc:
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Account summary error: {str(exc)}"
+        )
+
+
+@app.post("/api/account/summary/refresh/{user_id}")
+def account_summary_refresh(user_id: str):
+
+    clear_summary_cache()
+
+    return account_summary(user_id, refresh=True)
 
 
 # ============================================================
