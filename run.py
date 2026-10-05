@@ -1304,6 +1304,7 @@ def _build_fast_structured_answer(
 
 _SMALL_TALK_KINDS = {
     "hi": "greeting",
+    "hii": "greeting",
     "hello": "greeting",
     "hey": "greeting",
     "good morning": "greeting",
