@@ -6,7 +6,7 @@ from supabase import create_client, Client
 
 
 ROOT = Path(__file__).resolve().parents[2]
-load_dotenv(ROOT / ".env.chat")
+load_dotenv(ROOT / ".env")
 
 url = os.getenv("CHAT_SUPABASE_URL")
 key = os.getenv("CHAT_SUPABASE_SECRET_KEY")
