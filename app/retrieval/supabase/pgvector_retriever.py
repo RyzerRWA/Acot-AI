@@ -1,11 +1,11 @@
 from app.rag.embeddings.embedding_model import EmbeddingModel
 
-from app.retrieval.supabase.supabase_client import supabase
+from app.database.postgres import match
 
 
 class SupabasePGVectorRetriever:
     """
-    Semantic retriever using Supabase PostgreSQL + pgvector.
+    Semantic retriever over PostgreSQL (cosine similarity in SQL).
 
     Supports:
         1. Community semantic search
@@ -14,7 +14,7 @@ class SupabasePGVectorRetriever:
     Embedding dimension:
         384
 
-    PostgreSQL RPCs:
+    PostgreSQL functions:
         match_communities
         match_document_chunks
     """
@@ -105,24 +105,9 @@ class SupabasePGVectorRetriever:
             question
         )
 
-        # -----------------------------------------------------
-        # Call Supabase PostgreSQL RPC
-        # -----------------------------------------------------
-
-        response = supabase.rpc(
-            "match_communities",
-            {
-                "query_embedding": query_embedding,
-                "match_threshold": threshold,
-                "match_count": count
-            }
-        ).execute()
-
-        # -----------------------------------------------------
-        # Return community results
-        # -----------------------------------------------------
-
-        return response.data or []
+        return match(
+            "match_communities", query_embedding, threshold, count
+        )
 
     # =========================================================
     # SEARCH DOCUMENT CHUNKS
@@ -168,21 +153,6 @@ class SupabasePGVectorRetriever:
             question
         )
 
-        # -----------------------------------------------------
-        # Call document pgvector RPC
-        # -----------------------------------------------------
-
-        response = supabase.rpc(
-            "match_document_chunks",
-            {
-                "query_embedding": query_embedding,
-                "match_threshold": threshold,
-                "match_count": count
-            }
-        ).execute()
-
-        # -----------------------------------------------------
-        # Return document results
-        # -----------------------------------------------------
-
-        return response.data or []
+        return match(
+            "match_document_chunks", query_embedding, threshold, count
+        )

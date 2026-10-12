@@ -6,7 +6,6 @@ import json
 from contextlib import redirect_stdout, redirect_stderr
 from datetime import datetime
 from dotenv import load_dotenv
-from supabase import create_client, Client
 
 # =========================================================
 # ENVIRONMENT

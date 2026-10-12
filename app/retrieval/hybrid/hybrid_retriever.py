@@ -24,6 +24,7 @@ Document data:
     document_chunks
 """
 
+from app.database.postgres import fetch
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -546,19 +547,14 @@ class HybridRetriever:
             return self._empty_structured_result()
 
         try:
-            supabase = self.structured_retriever.supabase
-            response = (
-                supabase
-                .table("projects")
-                .select("*")
-                .ilike("developer_name", f"%{developer_name}%")
-                .limit(1000)
-                .execute()
+            projects = fetch(
+                "select * from projects where developer_name ilike %s limit 1000",
+                (f"%{developer_name}%",),
             )
 
             return {
                 "communities": [],
-                "projects": response.data or [],
+                "projects": projects,
                 "sub_communities": [],
             }
         except Exception as exc:
@@ -578,20 +574,15 @@ class HybridRetriever:
             return self._empty_structured_result()
 
         try:
-            supabase = self.structured_retriever.supabase
-            response = (
-                supabase
-                .table("sub_communities")
-                .select("*")
-                .ilike("name", f"%{sub_community_name}%")
-                .limit(1000)
-                .execute()
+            sub_communities = fetch(
+                "select * from sub_communities where name ilike %s limit 1000",
+                (f"%{sub_community_name}%",),
             )
 
             return {
                 "communities": [],
                 "projects": [],
-                "sub_communities": response.data or [],
+                "sub_communities": sub_communities,
             }
         except Exception as exc:
             print("Sub-community retrieval error:", exc)
@@ -1050,24 +1041,12 @@ class HybridRetriever:
 
         try:
 
-            supabase = (
-                self.structured_retriever
-                .supabase
-            )
-
             def _city_rows(table_name: str):
-                response = (
-                    supabase
-                    .table(table_name)
-                    .select("*")
-                    .ilike(
-                        "city",
-                        city_name
-                    )
-                    .limit(1000)
-                    .execute()
+                # table_name is one of three internal constants, never user input
+                return fetch(
+                    f"select * from {table_name} where city ilike %s limit 1000",
+                    (city_name,),
                 )
-                return response.data or []
 
             with ThreadPoolExecutor(max_workers=3) as pool:
                 community_future = pool.submit(

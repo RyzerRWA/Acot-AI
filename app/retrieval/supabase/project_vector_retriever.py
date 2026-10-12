@@ -1,13 +1,5 @@
-import os
-from pathlib import Path
-
-from dotenv import load_dotenv
-from supabase import create_client
-
+from app.database.postgres import match
 from app.rag.embeddings.embedding_model import EmbeddingModel
-
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-load_dotenv(PROJECT_ROOT / ".env")
 
 
 class SupabaseProjectVectorRetriever:
@@ -17,24 +9,6 @@ class SupabaseProjectVectorRetriever:
         match_threshold: float = 0.5,
         match_count: int = 5
     ):
-
-        supabase_url = os.getenv("SUPABASE_URL")
-        supabase_key = os.getenv("SUPABASE_SECRET_KEY")
-
-        if not supabase_url:
-            raise ValueError(
-                "SUPABASE_URL is not configured."
-            )
-
-        if not supabase_key:
-            raise ValueError(
-                "SUPABASE_SECRET_KEY is not configured."
-            )
-
-        self.supabase = create_client(
-            supabase_url,
-            supabase_key
-        )
 
         self.embedding_model = EmbeddingModel()
 
@@ -100,16 +74,9 @@ class SupabaseProjectVectorRetriever:
         # Call Supabase RPC
         # -----------------------------------------------------
 
-        response = self.supabase.rpc(
-            "match_projects",
-            {
-                "query_embedding": query_embedding.tolist(),
-                "match_threshold": threshold,
-                "match_count": count
-            }
-        ).execute()
-
-        results = response.data or []
+        results = match(
+            "match_projects", query_embedding.tolist(), threshold, count
+        )
 
         print(
             f"Projects retrieved: {len(results)}"
