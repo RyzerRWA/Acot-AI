@@ -1,9 +1,8 @@
-import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from supabase import create_client
 
+from app.database.postgres_client import PostgresClient
 from app.rag.embeddings.embedding_model import EmbeddingModel
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -18,23 +17,7 @@ class SupabaseProjectVectorRetriever:
         match_count: int = 5
     ):
 
-        supabase_url = os.getenv("SUPABASE_URL")
-        supabase_key = os.getenv("SUPABASE_SECRET_KEY")
-
-        if not supabase_url:
-            raise ValueError(
-                "SUPABASE_URL is not configured."
-            )
-
-        if not supabase_key:
-            raise ValueError(
-                "SUPABASE_SECRET_KEY is not configured."
-            )
-
-        self.supabase = create_client(
-            supabase_url,
-            supabase_key
-        )
+        self.supabase = PostgresClient()
 
         self.embedding_model = EmbeddingModel()
 

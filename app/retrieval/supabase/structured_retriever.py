@@ -1,8 +1,8 @@
-import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from supabase import create_client, Client
+
+from app.database.postgres_client import PostgresClient
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -11,7 +11,7 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 class SupabaseStructuredRetriever:
     """
-    Structured retrieval directly from Supabase PostgreSQL.
+    Structured retrieval directly from PostgreSQL (DATABASE_URL).
 
     Tables used:
         - communities
@@ -21,19 +21,9 @@ class SupabaseStructuredRetriever:
 
     def __init__(self):
 
-        supabase_url = os.getenv("SUPABASE_URL")
-        supabase_key = os.getenv("SUPABASE_SECRET_KEY")
-
-        if not supabase_url:
-            raise ValueError("SUPABASE_URL is not set")
-
-        if not supabase_key:
-            raise ValueError("SUPABASE_SECRET_KEY is not set")
-
-        self.supabase: Client = create_client(
-            supabase_url,
-            supabase_key
-        )
+        # Attribute name kept as `supabase` because the hybrid
+        # retriever and entity resolver read `structured_retriever.supabase`.
+        self.supabase = PostgresClient()
 
     # =========================================================
     # COMMON PROJECT FIELDS

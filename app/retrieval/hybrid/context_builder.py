@@ -109,6 +109,9 @@ class HybridContextBuilder:
                 "sub_communities": structured_summary.get(
                     "sub_communities", []
                 ) or [],
+                "listings": structured_summary.get(
+                    "listings", []
+                ) or [],
                 "documents": document_results or [],
             }
 
@@ -197,10 +200,16 @@ class HybridContextBuilder:
             or []
         )
 
+        listings = (
+            retrieval_result.get("listings", [])
+            or []
+        )
+
         if not (
             communities
             or projects
             or sub_communities
+            or listings
         ):
             return ""
 
@@ -212,6 +221,53 @@ class HybridContextBuilder:
             "",
         ]
 
+        if listings:
+            context_parts.extend([
+                "RENTAL LISTINGS",
+                "",
+                "These rows are individual rental listings.",
+                "Use each listing's rent, bedrooms, size, and community.",
+                "Do not add listings that are not listed here.",
+                "",
+            ])
+            for index, listing in enumerate(listings, start=1):
+                beds = listing.get("beds")
+                if beds == 0:
+                    bedroom_text = "studio"
+                elif beds is None:
+                    bedroom_text = "N/A"
+                else:
+                    bedroom_text = str(beds)
+
+                price = listing.get("price_aed")
+                frequency = listing.get("rent_frequency") or ""
+                if isinstance(price, (int, float)):
+                    price_text = f"AED {int(price):,} {frequency}".strip()
+                elif price:
+                    price_text = f"AED {price} {frequency}".strip()
+                else:
+                    price_text = "N/A"
+
+                size = listing.get("size_sqft")
+                size_text = f"{size} sqft" if size else "N/A"
+                context_parts.extend([
+                    f"LISTING {index}",
+                    f"Title: {self._value(listing.get('title'))}",
+                    f"Community: {self._value(listing.get('community'))}",
+                    f"Sub-community: {self._value(listing.get('sub_community'))}",
+                    f"Type: {self._value(listing.get('property_type'))}",
+                    f"Bedrooms: {bedroom_text}",
+                    f"Bathrooms: {self._value(listing.get('baths'))}",
+                    f"Size: {size_text}",
+                    f"Rent: {price_text}",
+                    f"Furnishing: {self._value(listing.get('furnishing'))}",
+                    f"Status: {self._value(listing.get('completion_status'))}",
+                    f"Agency: {self._value(listing.get('agency_name'))}",
+                    "",
+                    "------------------------",
+                    "",
+                ])
+
         # ========================================================
         # PROJECTS
         # ========================================================
@@ -219,18 +275,6 @@ class HybridContextBuilder:
         if projects:
             context_parts.extend([
                 "PROJECTS",
-                "",
-                "COMPLETE PROJECT FACTS",
-                "Every retrieved project is listed here. Use every row, in this order.",
-                "",
-            ])
-
-            for index, project in enumerate(projects, start=1):
-                context_parts.append(
-                    f"{index}. {self._project_fact_line(project)}"
-                )
-
-            context_parts.extend([
                 "",
                 "PROJECT DETAIL",
                 "",

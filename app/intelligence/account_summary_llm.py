@@ -20,6 +20,13 @@ if not API_KEY or not BASE_URL:
 client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 
 
+SCORE_LIMITS = {
+    "freeplan": 5.0,
+    "professional": 7.0,
+    "enterprise": 10.0,
+}
+
+
 PROMPT_BEHAVIOUR = """
 You are ACOT's account-level real-estate behavior analyst.
 
@@ -28,8 +35,7 @@ Analyze ONLY the supplied account intelligence derived from USER QUESTIONS.
 Write the summary directly about the user.
 
 IMPORTANT:
-- Start the summary with "The user..." or naturally describe the user's
-  interests.
+- Start the summary with "The user..." or naturally describe the user's interests.
 - Do NOT start with "This account..."
 - Do NOT start with "This user shows..."
 - Do NOT mention question counts.
@@ -53,19 +59,39 @@ prices, handover dates, amenities, comparisons, and recent interests.
 """
 
 
+def _score_limit(intelligence: dict) -> tuple[str, float]:
+    plan = str(
+        intelligence.get("subscription_plan") or "free"
+    ).strip().lower()
+
+    return plan, SCORE_LIMITS.get(plan, 5.0)
+
+
 def generate_account_summary(intelligence: dict) -> str:
     """Return the raw human-readable account summary (CLI/debug use)."""
 
+    plan, max_score = _score_limit(intelligence)
+
     prompt = f"""
 {PROMPT_BEHAVIOUR}
+
+SUBSCRIPTION SCORE RULE:
+- Freeplan: 0 to 5 / 10
+- Professional: 0 to 7 / 10
+- Enterprise: 0 to 10 / 10
+- Current subscription: {plan}
+- The ACOT score MUST be between 0 and {max_score:g}.
+- NEVER generate a score above {max_score:g}.
+
 FORMAT:
 
 Summary:
 Write one natural paragraph describing the user's main
 real-estate interests and research behavior.
+
 AcotScore:
-give a single number between 0 and 10 that represents the user's overall
-engagement and interest level in real estate topics.
+give a single number between 0 and {max_score:g} that represents
+the user's overall engagement and interest level in real estate topics.
 
 Key Insights:
 Write 4-6 concise points describing the strongest observed interests.
@@ -94,23 +120,32 @@ def generate_account_profile(intelligence: dict) -> dict:
         }
     """
 
+    plan, max_score = _score_limit(intelligence)
+
     prompt = f"""
 {PROMPT_BEHAVIOUR}
+
+SUBSCRIPTION SCORE RULE:
+- Freeplan: 0 to 5 / 10
+- Professional: 0 to 7 / 10
+- Enterprise: 0 to 10 / 10
+- Current subscription: {plan}
+- The ACOT score MUST be between 0 and {max_score:g}.
+- NEVER generate a score above {max_score:g}.
+
 OUTPUT FORMAT:
 
 Return ONLY a JSON object, no markdown fences and no commentary.
 
 {{
-  "summary": "one natural paragraph describing the user's main real-estate
-              interests and research behavior",
-  "acot_score": <number between 0 and 10>,
-  "key_insights": ["4 to 6 concise points describing the strongest observed
-                    interests"]
+  "summary": "one natural paragraph describing the user's main real-estate interests and research behavior",
+  "acot_score": <number between 0 and {max_score:g}>,
+  "key_insights": ["4 to 6 concise points describing the strongest observed interests"]
 }}
 
 RULES:
-- "acot_score" is a single number between 0 and 10 reflecting overall
-  engagement and interest level in real estate topics.
+- "acot_score" MUST be between 0 and {max_score:g}.
+- Do not exceed the subscription maximum under any circumstance.
 - "key_insights" holds 4 to 6 short strings, each one observation.
 - Never mention counts, statistics or raw numbers in the summary.
 
@@ -131,7 +166,6 @@ ACCOUNT INTELLIGENCE:
 # ============================================================
 
 def _complete(prompt: str) -> str | None:
-
     response = client.chat.completions.create(
         model=MODEL,
         messages=[{"role": "user", "content": prompt}],
@@ -140,7 +174,6 @@ def _complete(prompt: str) -> str | None:
     )
 
     content = response.choices[0].message.content
-
     return content.strip() if content else None
 
 
@@ -151,15 +184,14 @@ def _complete(prompt: str) -> str | None:
 def _compact_intelligence(intelligence: dict) -> str:
     """
     Keep the prompt payload focused on behavioural signals.
-
-    Statistics and full question text are dropped so the model reasons
-    about behaviour instead of copying raw numbers.
+    Statistics and full question text are dropped.
     """
 
     if not isinstance(intelligence, dict):
         return ""
 
     payload = {
+        "subscription_plan": intelligence.get("subscription_plan", "free"),
         "interests": [
             {
                 "topic": item.get("topic"),
@@ -184,31 +216,31 @@ def _compact_intelligence(intelligence: dict) -> str:
 # RESPONSE PARSING
 # ============================================================
 
-_FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
+_FENCE = re.compile(
+    r"^\s*```(?:json)?\s*|\s*```\s*$",
+    re.IGNORECASE,
+)
 
 
 def _parse_profile(content: str, intelligence: dict) -> dict:
     """
     Parse the LLM output into the structured profile shape.
 
-    JSON is preferred. The labelled-text format produced by
-    generate_account_summary is used as a fallback so the endpoint keeps
-    working if the model ignores the JSON instruction.
+    JSON is preferred. Labelled text is used as a fallback.
     """
 
     raw = _FENCE.sub("", content.strip())
     candidate = _first_json_object(raw)
 
     if candidate is not None:
-        parsed = _normalise_json(candidate)
+        parsed = _normalise_json(candidate, intelligence)
         if parsed.get("summary"):
             return parsed
 
-    return _parse_labelled_text(raw)
+    return _parse_labelled_text(raw, intelligence)
 
 
 def _first_json_object(raw: str) -> dict | None:
-
     start = raw.find("{")
     end = raw.rfind("}")
 
@@ -223,31 +255,31 @@ def _first_json_object(raw: str) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
-def _normalise_json(payload: dict) -> dict:
-
+def _normalise_json(payload: dict, intelligence: dict) -> dict:
     summary = payload.get("summary")
     score = payload.get("acot_score", payload.get("acotScore"))
     insights = payload.get("key_insights", payload.get("keyInsights"))
 
+    _, max_score = _score_limit(intelligence)
+
     return {
         "summary": summary.strip() if isinstance(summary, str) else "",
-        "acot_score": _clean_score(score),
+        "acot_score": _clean_score(score, max_score),
         "key_insights": _clean_insights(insights),
     }
 
 
-def _parse_labelled_text(raw: str) -> dict:
-
+def _parse_labelled_text(raw: str, intelligence: dict) -> dict:
     summary, score_text, insights_text = _split_sections(raw)
 
-    # No recognisable section headers. Keep the raw text as the summary so
-    # the caller still renders something instead of an empty card.
     if not summary:
         summary = _strip_markdown(raw.replace("\n", " "))
 
+    _, max_score = _score_limit(intelligence)
+
     return {
         "summary": summary,
-        "acot_score": _clean_score(score_text),
+        "acot_score": _clean_score(score_text, max_score),
         "key_insights": _clean_insights(insights_text.splitlines()),
     }
 
@@ -260,7 +292,6 @@ _SECTION = re.compile(
 
 
 def _split_sections(raw: str) -> tuple[str, str, str]:
-
     sections: dict[str, list[str]] = {
         "summary": [],
         "score": [],
@@ -270,7 +301,6 @@ def _split_sections(raw: str) -> tuple[str, str, str]:
     current = None
 
     for line in raw.splitlines():
-
         match = _SECTION.match(line)
         remainder = ""
 
@@ -303,12 +333,17 @@ _INLINE_MARKDOWN = re.compile(r"(\*\*|__|\*|`)")
 
 
 def _strip_markdown(value: str) -> str:
+    return re.sub(
+        r"\s{2,}",
+        " ",
+        _INLINE_MARKDOWN.sub("", value),
+    ).strip()
 
-    return re.sub(r"\s{2,}", " ", _INLINE_MARKDOWN.sub("", value)).strip()
 
-
-def _clean_score(value) -> float | None:
-
+def _clean_score(
+    value,
+    max_score: float = 10.0,
+) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         number = float(value)
     elif isinstance(value, str):
@@ -320,11 +355,13 @@ def _clean_score(value) -> float | None:
     if number is None:
         return None
 
-    return round(max(0.0, min(10.0, number)), 1)
+    return round(
+        max(0.0, min(max_score, number)),
+        1,
+    )
 
 
 def _clean_insights(value) -> list[str]:
-
     if isinstance(value, str):
         lines: list[str] = value.splitlines()
     elif isinstance(value, list):
@@ -335,8 +372,9 @@ def _clean_insights(value) -> list[str]:
     insights: list[str] = []
 
     for line in lines:
-
-        cleaned = _strip_markdown(_BULLET.sub("", line))
+        cleaned = _strip_markdown(
+            _BULLET.sub("", line)
+        )
 
         if cleaned:
             insights.append(cleaned)

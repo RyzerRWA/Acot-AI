@@ -2,10 +2,13 @@ import re
 import json
 from collections import Counter, defaultdict
 from app.intelligence.account_summary_llm import generate_account_summary
-from app.database.chat_supabase_client import supabase
+from app.database.postgres_client import get_postgres_client
 from app.intelligence.account_intelligence_store import (
     save_account_intelligence
 )
+
+
+db = get_postgres_client()
 
 
 NOISE = {
@@ -101,7 +104,7 @@ def strength(count: int, conversations: int) -> str:
 def analyze_questions(user_id: str) -> dict:
 
     rows = (
-        supabase.rpc(
+        db.rpc(
             "get_user_questions",
             {"p_user_id": user_id}
         )

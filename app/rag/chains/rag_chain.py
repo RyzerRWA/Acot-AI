@@ -12,7 +12,7 @@ class HybridRAGChain:
     def __init__(self):
         self.llm = AICreditsClient()
 
-    def generate_answer(
+    async def generate_answer(
         self,
         question: str,
         context: str,
@@ -134,7 +134,7 @@ AVAILABLE ACOT EVIDENCE:
 Now answer the user.
 """
 
-        response = self.llm.generate(prompt)
+        response = await self.llm.generate(prompt)
 
         if not response or not response.strip():
             raise RuntimeError("LLM returned an empty answer.")

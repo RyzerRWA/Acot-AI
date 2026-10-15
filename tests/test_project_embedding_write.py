@@ -1,9 +1,8 @@
-import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from supabase import create_client
 
+from app.database.postgres_client import PostgresClient
 from app.rag.embeddings.embedding_model import EmbeddingModel
 from app.rag.ingestion.supabase_embedding_writer import (
     SupabaseEmbeddingWriter
@@ -23,13 +22,7 @@ def main():
     # SUPABASE CONNECTION
     # =========================================================
 
-    supabase_url = os.getenv("SUPABASE_URL")
-    supabase_key = os.getenv("SUPABASE_SECRET_KEY")
-
-    supabase = create_client(
-        supabase_url,
-        supabase_key
-    )
+    supabase = PostgresClient()
 
     # =========================================================
     # GET ONE PROJECT

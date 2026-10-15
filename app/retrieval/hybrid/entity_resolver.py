@@ -105,23 +105,11 @@ class EntityResolver:
     # ========================================================
 
     COMMUNITY_FIELDS = """
-        id,
-        slug,
-        name,
-        city
+        id,slug,name,city
     """
 
     PROJECT_FIELDS = """
-        id,
-        slug,
-        name,
-        developer_name,
-        city,
-        community,
-        sub_community,
-        price,
-        bedroom_min,
-        bedroom_max,
+        id,slug,name,developer_name,city,community,sub_community,price,bedroom_min,bedroom_max,
         property_types
     """
 
@@ -130,66 +118,13 @@ class EntityResolver:
     # ========================================================
 
     STOP_WORDS = {
-        "show",
-        "give",
-        "tell",
-        "me",
-        "about",
-        "the",
-        "best",
-        "top",
-        "properties",
-        "property",
-        "projects",
-        "project",
-        "apartments",
-        "apartment",
-        "villas",
-        "villa",
-        "homes",
-        "home",
-        "in",
-        "at",
-        "near",
-        "around",
-        "within",
-        "for",
-        "under",
-        "below",
-        "above",
-        "over",
-        "with",
-        "and",
-        "or",
-        "rental",
-        "rent",
-        "investment",
-        "invest",
-        "buy",
-        "sale",
-        "selling",
-        "aed",
-        "price",
-        "prices",
-        "available",
-        "options",
-        "all",
-        "every",
-        "good",
-        "better",
-        "recommend",
-        "recommendation",
-        "looking",
-        "find",
-        "search",
-        "which",
-        "what",
-        "are",
-        "is",
-        "can",
-        "you",
-        "city",
-        "location",
+        "show","give","tell","me","about","the","best","top","properties",
+        "property","projects","project","apartments","apartment","villas",
+        "villa","homes","home","in","at","near","around","within",
+        "for","under","below","above","over","with","and","or","rental","rent",
+        "investment","invest","buy","sale","selling","aed","price","prices","available",
+        "options","all","every","good","better","recommend","recommendation","looking","find",
+        "search","which","what","are","is","can","you","city","location",
     }
 
     # ========================================================
@@ -1122,21 +1057,9 @@ class EntityResolver:
 
         return ResolvedEntity(
 
-            entity_type=None,
+            entity_type=None,name=None,entity_id=None,confidence=0.0,
 
-            name=None,
-
-            entity_id=None,
-
-            confidence=0.0,
-
-            record=None,
-
-            candidates=[],
-
-            location=None,
-
-            community=None,
+            record=None,candidates=[],location=None,community=None,
 
             reasoning=[
 

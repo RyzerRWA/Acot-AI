@@ -13,7 +13,7 @@ print("COMMUNITY EMBEDDING INGESTION")
 print("================================")
 
 
-from app.database.supabase_client import supabase
+from app.retrieval.supabase.supabase_client import supabase
 from app.rag.embeddings.embedding_model import EmbeddingModel
 
 
