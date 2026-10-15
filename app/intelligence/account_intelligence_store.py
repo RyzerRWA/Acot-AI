@@ -1,34 +1,23 @@
-from app.database.postgres_client import get_postgres_client
+import json
 
-
-db = get_postgres_client()
+from app.database.postgres import execute, scalar
 
 
 def save_account_intelligence(analysis: dict) -> None:
     stats = analysis["statistics"]
 
-    db.rpc(
-        "save_account_intelligence",
-        {
-            "p_user_id": analysis["user_id"],
-            "p_intelligence": analysis,
-            "p_question_count": stats["meaningful_questions"],
-            "p_conversation_count": stats["meaningful_conversations"],
-        },
-    ).execute()
+    execute(
+        "select public.save_account_intelligence(%s, %s::jsonb, %s, %s)",
+        (
+            analysis["user_id"],
+            json.dumps(analysis),
+            stats["meaningful_questions"],
+            stats["meaningful_conversations"],
+        ),
+    )
 
 
 def get_account_intelligence(user_id: str) -> dict | None:
-    result = (
-        db.rpc(
-            "get_account_intelligence",
-            {"p_user_id": user_id}
-        )
-        .execute()
-        .data
-    )
-
-    if isinstance(result, list):
-        result = result[0] if result else None
+    result = scalar("select public.get_account_intelligence(%s)", (user_id,))
 
     return result or None

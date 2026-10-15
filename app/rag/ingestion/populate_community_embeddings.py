@@ -13,7 +13,7 @@ print("COMMUNITY EMBEDDING INGESTION")
 print("================================")
 
 
-from app.retrieval.supabase.supabase_client import supabase
+from app.database.postgres import execute, fetch
 from app.rag.embeddings.embedding_model import EmbeddingModel
 
 
@@ -25,19 +25,11 @@ class CommunityEmbeddingIngestor:
         print("Embedding model loaded.")
 
     def get_records_without_embeddings(self):
-        print("\nFetching communities from Supabase...")
+        print("\nFetching communities from PostgreSQL...")
 
-        response = (
-            supabase
-            .table("communities")
-            .select("id, name, knowledge_text")
-            .is_("embedding", "null")
-            .execute()
+        return fetch(
+            "select id, name, knowledge_text from communities where embedding is null"
         )
-
-        records = response.data or []
-
-        return records
 
     def run(self, batch_size=50):
 
@@ -99,7 +91,7 @@ class CommunityEmbeddingIngestor:
             )
 
             # Store embeddings
-            print("Storing embeddings in Supabase...")
+            print("Storing embeddings in PostgreSQL...")
 
             for record, embedding in zip(
                 valid_records,
@@ -108,17 +100,9 @@ class CommunityEmbeddingIngestor:
 
                 vector = embedding.tolist()
 
-                (
-                    supabase
-                    .table("communities")
-                    .update({
-                        "embedding": vector
-                    })
-                    .eq(
-                        "id",
-                        record["id"]
-                    )
-                    .execute()
+                execute(
+                    "update communities set embedding = %s::real[] where id = %s",
+                    (vector, record["id"]),
                 )
 
                 print(

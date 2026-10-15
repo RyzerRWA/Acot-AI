@@ -1,17 +1,10 @@
-from pathlib import Path
-
-from dotenv import load_dotenv
-
+from app.database.postgres import fetch
 from app.database.postgres_client import PostgresClient
-
-
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-load_dotenv(PROJECT_ROOT / ".env")
 
 
 class SupabaseStructuredRetriever:
     """
-    Structured retrieval directly from PostgreSQL (DATABASE_URL).
+    Structured retrieval directly from PostgreSQL.
 
     Tables used:
         - communities
@@ -21,8 +14,7 @@ class SupabaseStructuredRetriever:
 
     def __init__(self):
 
-        # Attribute name kept as `supabase` because the hybrid
-        # retriever and entity resolver read `structured_retriever.supabase`.
+        # Listings and catalog search still read this client.
         self.supabase = PostgresClient()
 
     # =========================================================
@@ -79,16 +71,10 @@ class SupabaseStructuredRetriever:
 
         query = community_name.strip()
 
-        response = (
-            self.supabase
-            .table("projects")
-            .select(self.PROJECT_FIELDS)
-            .ilike("community", query)
-            .limit(limit)
-            .execute()
+        return fetch(
+            f"select {self.PROJECT_FIELDS} from projects where community ilike %s limit %s",
+            (query, limit),
         )
-
-        return response.data or []
 
     # =========================================================
     # PROJECTS BY NAME
@@ -114,16 +100,10 @@ class SupabaseStructuredRetriever:
         if not query:
             return []
 
-        response = (
-            self.supabase
-            .table("projects")
-            .select(self.PROJECT_FIELDS)
-            .ilike("name", f"%{query}%")
-            .limit(limit)
-            .execute()
+        return fetch(
+            f"select {self.PROJECT_FIELDS} from projects where name ilike %s limit %s",
+            (f"%{query}%", limit),
         )
-
-        return response.data or []
 
     # =========================================================
     # PROJECTS BY NAME, DEVELOPER, AND COMMUNITY
@@ -151,27 +131,27 @@ class SupabaseStructuredRetriever:
         if not name_pattern and not developer_name and not community_name:
             return []
 
-        query = (
-            self.supabase
-            .table("projects")
-            .select(self.PROJECT_FIELDS)
-        )
+        where, params = [], []
 
         if name_pattern:
             safe = name_pattern.replace("%", "").replace("_", " ").strip()
-            pattern = f"{safe}%" if starts_with else f"%{safe}%"
-            query = query.ilike("name", pattern)
+            where.append("name ilike %s")
+            params.append(f"{safe}%" if starts_with else f"%{safe}%")
 
         if developer_name:
             safe_developer = developer_name.replace("%", "").replace("_", " ").strip()
-            query = query.ilike("developer_name", f"%{safe_developer}%")
+            where.append("developer_name ilike %s")
+            params.append(f"%{safe_developer}%")
 
         if community_name:
             safe_community = community_name.replace("%", "").replace("_", " ").strip()
-            query = query.ilike("community", f"%{safe_community}%")
+            where.append("community ilike %s")
+            params.append(f"%{safe_community}%")
 
-        response = query.limit(limit).execute()
-        rows = response.data or []
+        rows = fetch(
+            f"select {self.PROJECT_FIELDS} from projects where {' and '.join(where)} limit %s",
+            (*params, limit),
+        )
 
         if community_name and rows:
             wanted_community = community_name.strip().lower()
@@ -243,36 +223,16 @@ class SupabaseStructuredRetriever:
 
         query = community_name.strip()
 
-        response = (
-            self.supabase
-            .table("communities")
-            .select(
-                """
-                id,
-                slug,
-                name,
-                city,
-                latitude,
-                longitude,
-                photos,
-                sell_properties_count,
-                rent_properties_count,
-                projects_count,
-                pool_projects_count,
-                total_count,
-                assigned_agents,
-                knowledge_text,
-                source,
-                fetched_at,
-                updated_at
-                """
-            )
-            .ilike("name", query)
-            .limit(5)
-            .execute()
+        return fetch(
+            """
+            select id, slug, name, city, latitude, longitude, photos,
+                   sell_properties_count, rent_properties_count, projects_count,
+                   pool_projects_count, total_count, assigned_agents, knowledge_text,
+                   source, fetched_at, updated_at
+            from communities where name ilike %s limit 5
+            """,
+            (query,),
         )
-
-        return response.data or []
 
     # =========================================================
     # SUB-COMMUNITIES
@@ -292,32 +252,14 @@ class SupabaseStructuredRetriever:
 
         query = community_name.strip()
 
-        response = (
-            self.supabase
-            .table("sub_communities")
-            .select(
-                """
-                id,
-                slug,
-                name,
-                city,
-                community,
-                community_slug,
-                latitude,
-                longitude,
-                photos,
-                knowledge_text,
-                source,
-                fetched_at,
-                updated_at
-                """
-            )
-            .ilike("community", query)
-            .limit(limit)
-            .execute()
+        return fetch(
+            """
+            select id, slug, name, city, community, community_slug, latitude, longitude,
+                   photos, knowledge_text, source, fetched_at, updated_at
+            from sub_communities where community ilike %s limit %s
+            """,
+            (query, limit),
         )
-
-        return response.data or []
 
     # =========================================================
     # GENERAL STRUCTURED RETRIEVAL
@@ -332,7 +274,7 @@ class SupabaseStructuredRetriever:
         include_sub_communities: bool = True
     ):
         """
-        Retrieve structured information from Supabase.
+        Retrieve structured information from PostgreSQL.
 
         Supports:
             - community-based retrieval
