@@ -35,6 +35,7 @@ Important:
 - Data is loaded from live Supabase.
 """
 
+from app.database.postgres import fetch
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
@@ -105,23 +106,11 @@ class EntityResolver:
     # ========================================================
 
     COMMUNITY_FIELDS = """
-        id,
-        slug,
-        name,
-        city
+        id,slug,name,city
     """
 
     PROJECT_FIELDS = """
-        id,
-        slug,
-        name,
-        developer_name,
-        city,
-        community,
-        sub_community,
-        price,
-        bedroom_min,
-        bedroom_max,
+        id,slug,name,developer_name,city,community,sub_community,price,bedroom_min,bedroom_max,
         property_types
     """
 
@@ -130,66 +119,13 @@ class EntityResolver:
     # ========================================================
 
     STOP_WORDS = {
-        "show",
-        "give",
-        "tell",
-        "me",
-        "about",
-        "the",
-        "best",
-        "top",
-        "properties",
-        "property",
-        "projects",
-        "project",
-        "apartments",
-        "apartment",
-        "villas",
-        "villa",
-        "homes",
-        "home",
-        "in",
-        "at",
-        "near",
-        "around",
-        "within",
-        "for",
-        "under",
-        "below",
-        "above",
-        "over",
-        "with",
-        "and",
-        "or",
-        "rental",
-        "rent",
-        "investment",
-        "invest",
-        "buy",
-        "sale",
-        "selling",
-        "aed",
-        "price",
-        "prices",
-        "available",
-        "options",
-        "all",
-        "every",
-        "good",
-        "better",
-        "recommend",
-        "recommendation",
-        "looking",
-        "find",
-        "search",
-        "which",
-        "what",
-        "are",
-        "is",
-        "can",
-        "you",
-        "city",
-        "location",
+        "show","give","tell","me","about","the","best","top","properties",
+        "property","projects","project","apartments","apartment","villas",
+        "villa","homes","home","in","at","near","around","within",
+        "for","under","below","above","over","with","and","or","rental","rent",
+        "investment","invest","buy","sale","selling","aed","price","prices","available",
+        "options","all","every","good","better","recommend","recommendation","looking","find",
+        "search","which","what","are","is","can","you","city","location",
     }
 
     # ========================================================
@@ -258,19 +194,9 @@ class EntityResolver:
         self
     ) -> List[Dict[str, Any]]:
 
-        response = (
-            self
-            .structured_retriever
-            .supabase
-            .table("communities")
-            .select(
-                self.COMMUNITY_FIELDS
-            )
-            .limit(1000)
-            .execute()
+        return fetch(
+            f"select {self.COMMUNITY_FIELDS} from communities limit 1000"
         )
-
-        return response.data or []
 
     # ========================================================
     # LOAD PROJECTS
@@ -280,19 +206,9 @@ class EntityResolver:
         self
     ) -> List[Dict[str, Any]]:
 
-        response = (
-            self
-            .structured_retriever
-            .supabase
-            .table("projects")
-            .select(
-                self.PROJECT_FIELDS
-            )
-            .limit(2000)
-            .execute()
+        return fetch(
+            f"select {self.PROJECT_FIELDS} from projects limit 2000"
         )
-
-        return response.data or []
 
     def _catalog(self):
         """Return communities and projects, refreshing at most every 10 minutes."""
@@ -1122,21 +1038,9 @@ class EntityResolver:
 
         return ResolvedEntity(
 
-            entity_type=None,
+            entity_type=None,name=None,entity_id=None,confidence=0.0,
 
-            name=None,
-
-            entity_id=None,
-
-            confidence=0.0,
-
-            record=None,
-
-            candidates=[],
-
-            location=None,
-
-            community=None,
+            record=None,candidates=[],location=None,community=None,
 
             reasoning=[
 

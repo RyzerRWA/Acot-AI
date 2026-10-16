@@ -27,6 +27,7 @@ the planner independent from the current database contents.
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
@@ -79,24 +80,13 @@ class QueryPlanner:
     """
 
     VALID_INTENTS = {
-        "investment",
-        "prediction",
-        "comparison",
-        "ranking",
-        "calculation",
-        "document",
-        "search",
-        "information",
-        "general",
+        "investment","prediction","comparison","ranking","calculation",
+        "document","search","information","general",
     }
 
     VALID_ENTITY_TYPES = {
-        "city",
-        "community",
-        "sub_community",
-        "project",
-        "property",
-        "developer",
+        "city","community","sub_community","project",
+        "property","developer",
         None,
     }
 
@@ -104,6 +94,14 @@ class QueryPlanner:
         self.use_llm = use_llm
         self._llm_client = llm_client
         self._llm_error = None
+        # Planning returns a small fixed JSON object, so the client's
+        # default 900-token budget is far more than it needs. A tighter cap
+        # directly reduces generation time on the request critical path.
+        # Raise via env if plans ever come back truncated (a truncated
+        # response fails JSON parsing and silently falls back to rule_plan).
+        self.max_output_tokens = int(
+            os.getenv("ACOT_PLANNER_MAX_TOKENS", "400")
+        )
 
         if self.use_llm and self._llm_client is None:
             try:
@@ -114,72 +112,28 @@ class QueryPlanner:
                 self._llm_error = str(exc)
 
     INVESTMENT_TERMS = (
-        "invest",
-        "investment",
-        "investing",
-        "roi",
-        "return",
-        "rental yield",
-        "yield",
-        "capital appreciation",
-        "appreciation",
-        "profit",
-        "profitable",
-        "worth buying",
-        "good buy",
-        "best investment",
+        "invest","investment","investing","roi","return","rental yield",
+        "yield","capital appreciation","appreciation","profit","profitable",
+        "worth buying","good buy","best investment",
     )
 
     PREDICTION_TERMS = (
-        "predict",
-        "prediction",
-        "forecast",
-        "future",
-        "next year",
-        "next month",
-        "will prices",
-        "will price",
-        "expected price",
-        "expected rent",
-        "outlook",
+        "predict","prediction","forecast","future","next year",
+        "next month","will prices","will price","expected price","expected rent","outlook",
     )
 
     COMPARISON_TERMS = (
-        "compare",
-        "comparison",
-        "versus",
-        "vs",
-        "difference between",
-        "different",
-        "what makes",
-        "stand out",
-        "which is better",
-        "better between",
-        "choose between",
+        "compare","comparison","versus","vs","difference between","different","what makes","stand out",
+        "which is better","better between","choose between",
     )
 
     RANKING_TERMS = (
-        "best",
-        "top",
-        "highest",
-        "lowest",
-        "cheapest",
-        "most expensive",
-        "recommend",
-        "recommended",
-        "best options",
-        "top options",
+        "best","top","highest","lowest","cheapest","most expensive","recommend",
+        "recommended","best options","top options",
     )
 
     SEARCH_TERMS = (
-        "show me",
-        "find",
-        "list",
-        "search",
-        "available",
-        "options",
-        "properties",
-        "projects",
+        "show me","find","list","search","available","options","properties","projects",
     )
 
     # ============================================================
@@ -200,89 +154,36 @@ class QueryPlanner:
     }
 
     DOCUMENT_TERMS = (
-        "brochure",
-        "document",
-        "documents",
-        "building code",
-        "regulation",
-        "regulations",
-        "law",
-        "laws",
-        "requirements",
-        "guideline",
-        "guidelines",
-        "security",
-        "security features",
-        "amenity",
-        "amenities",
-        "facilities",
-        "interior",
-        "interiors",
-        "finishes",
-        "kitchen",
-        "appliances",
-        "views",
-        "floor plan",
-        "floor plans",
-        "layout",
-        "dimensions",
-        "clubhouse",
-        "pool",
-        "gym",
-        "cinema",
-        "lobby",
-        "surveillance",
-        "balcony",
-        "bathroom",
-        "smart home",
-        "smart wc",
-        "concierge",
-        "valet",
-        "sauna",
-        "steam",
+        "brochure","document","documents","building code","regulation","regulations",
+        "law","laws","requirements","guideline","guidelines","security","security features","amenity",
+        "amenities","facilities","interior","interiors","finishes","kitchen","appliances","steam",
+        "views","floor plan","floor plans","layout","dimensions","clubhouse","pool","gym","cinema",
+        "lobby","surveillance","balcony","bathroom","smart home","smart wc","concierge","valet","sauna",
     )
 
     STRUCTURED_TERMS = (
-        "price",
-        "prices",
-        "cost",
-        "rent",
+        "price","prices",
+        "cost","rent",
         "rental",
-        "bedroom",
-        "bedrooms",
-        "size",
-        "area",
-        "property",
-        "properties",
-        "project",
-        "projects",
-        "community",
-        "communities",
-        "developer",
-        "developers",
-        "handover",
-        "status",
-        "location",
-        "district",
-        "sub-community",
-        "subcommunity",
+        "bedroom","bedrooms",
+        "size","area",
+        "property","properties",
+        "project","projects",
+        "community","communities",
+        "developer","developers",
+        "handover","status",
+        "location","district",
+        "sub-community","subcommunity",
     )
 
     CALCULATION_TERMS = (
-        "calculate",
-        "calculation",
-        "how much",
-        "how many",
-        "percentage",
-        "percent",
-        "per sqft",
-        "per square foot",
-        "monthly payment",
-        "mortgage",
-        "afford",
-        "budget",
-        "yield",
-        "roi",
+        "calculate","calculation",
+        "how much","how many",
+        "percentage","percent",
+        "per sqft","per square foot",
+        "monthly payment","mortgage",
+        "afford","budget",
+        "yield","roi",
     )
 
     INFORMATION_PATTERNS = (
@@ -510,19 +411,13 @@ class QueryPlanner:
         # Required sources based on entity/operation
         # ------------------------------------------------------------
         if plan.intent in {
-            "search",
-            "ranking",
-            "comparison",
-            "investment",
-            "calculation",
-            "prediction",
+            "search","ranking","comparison",
+            "investment","calculation","prediction",
         }:
             plan.needs_structured_data = True
 
         if plan.intent in {
-            "information",
-            "document",
-            "general",
+            "information","document","general",
         }:
             # A price or bedroom follow-up only needs the structured rows.
             # Document intent, and information questions that are not field
@@ -547,7 +442,7 @@ class QueryPlanner:
 
         return plan
 
-    def plan(
+    async def plan(
         self,
         question: str,
         conversation_context: Optional[Dict[str, Any]] = None,
@@ -581,7 +476,7 @@ class QueryPlanner:
             return rule_plan
 
         try:
-            llm_plan = self._llm_plan(
+            llm_plan = await self._llm_plan(
                 question=question,
                 conversation_context=conversation_context,
             )
@@ -631,7 +526,7 @@ class QueryPlanner:
 
         return True
 
-    def _llm_plan(
+    async def _llm_plan(
         self,
         question: str,
         conversation_context: Optional[Dict[str, Any]] = None,
@@ -690,7 +585,10 @@ Rules:
 
 """
 
-        response = self._llm_client.generate(prompt)
+        response = await self._llm_client.generate(
+            prompt,
+            max_output_tokens=self.max_output_tokens,
+        )
         data = self._extract_json(response)
         if not isinstance(data, dict):
             return None
@@ -833,20 +731,13 @@ Rules:
         return llm_plan
 
     ATTRIBUTE_TERMS = (
-        "price",
-        "prices",
-        "bedroom",
-        "bedrooms",
-        "handover",
-        "developer",
-        "status",
+        "price","prices","bedroom","bedrooms","handover",
+        "developer","status",
     )
 
     BROWSE_TERMS = (
-        "show me",
-        "list",
-        "find",
-        "search",
+        "show me","list",
+        "find","search",
     )
 
     def _is_attribute_question(self, text: str) -> bool:
@@ -1009,6 +900,8 @@ Rules:
 
 
 if __name__ == "__main__":
+    import asyncio
+
     planner = QueryPlanner()
 
     examples = [
@@ -1024,4 +917,4 @@ if __name__ == "__main__":
 
     for question in examples:
         print("\nQUESTION:", question)
-        print(planner.plan(question).to_dict())
+        print(asyncio.run(planner.plan(question)).to_dict())

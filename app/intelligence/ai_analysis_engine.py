@@ -28,7 +28,7 @@ class AIAnalysisEngine:
     # PUBLIC METHOD
     # =========================================================
 
-    def analyze(
+    async def analyze(
         self,
         question: str,
         structured_summary: Optional[Dict[str, Any]] = None,
@@ -64,7 +64,7 @@ class AIAnalysisEngine:
         # LLM explanation
         # -----------------------------------------------------
 
-        llm_analysis = self._generate_llm_analysis(
+        llm_analysis = await self._generate_llm_analysis(
             question=question,
             data=data,
             documents=documents,
@@ -811,7 +811,7 @@ class AIAnalysisEngine:
     # LLM ANALYSIS
     # =========================================================
 
-    def _generate_llm_analysis(
+    async def _generate_llm_analysis(
         self,
         question: str,
         data: Dict[str, Any],
@@ -822,6 +822,26 @@ class AIAnalysisEngine:
         if self.llm is None:
             return None
 
+        structured_json = json.dumps(
+            data,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=str,
+        )
+        documents_json = json.dumps(
+            documents,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=str,
+        )
+
+        print(
+            "ACOT LLM INPUT SIZE: "
+            f"question_chars={len(question):,}, "
+            f"structured_chars={len(structured_json):,}, "
+            f"documents_chars={len(documents_json):,}"
+        )
+
         prompt = f"""
 You are the ACOT Real Estate AI Analysis Engine.
 
@@ -831,10 +851,10 @@ USER QUESTION:
 {question}
 
 STRUCTURED ACOT DATA:
-{json.dumps(data, indent=2, default=str)}
+{structured_json}
 
 DOCUMENT EVIDENCE:
-{json.dumps(documents, indent=2, default=str)}
+{documents_json}
 
 ACOT SCORE:
 {score}
@@ -879,7 +899,7 @@ Return ONLY valid JSON:
 
         try:
 
-            response = self.llm.generate(
+            response = await self.llm.generate(
                 prompt
             )
 

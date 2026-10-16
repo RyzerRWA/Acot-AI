@@ -2,7 +2,7 @@ import re
 import json
 from collections import Counter, defaultdict
 from app.intelligence.account_summary_llm import generate_account_summary
-from app.database.chat_supabase_client import supabase
+from app.database.postgres import fetch
 from app.intelligence.account_intelligence_store import (
     save_account_intelligence
 )
@@ -100,14 +100,10 @@ def strength(count: int, conversations: int) -> str:
 
 def analyze_questions(user_id: str) -> dict:
 
-    rows = (
-        supabase.rpc(
-            "get_user_questions",
-            {"p_user_id": user_id}
-        )
-        .execute()
-        .data or []
-    )
+    rows = fetch(
+        "select * from public.get_user_questions(%s)",
+        (user_id,),
+    ) or []
 
     all_conversations = {
         row["conversation_id"] for row in rows

@@ -1,9 +1,8 @@
-import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from supabase import create_client
 
+from app.database.postgres_client import PostgresClient
 from app.rag.ingestion.project_text_builder import (
     ProjectTextBuilder
 )
@@ -18,13 +17,7 @@ def main():
     print("PROJECT TEXT BUILDER TEST")
     print("================================")
 
-    supabase_url = os.getenv("SUPABASE_URL")
-    supabase_key = os.getenv("SUPABASE_SECRET_KEY")
-
-    supabase = create_client(
-        supabase_url,
-        supabase_key
-    )
+    supabase = PostgresClient()
 
     project_id = 233000800
 

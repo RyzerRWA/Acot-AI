@@ -1,34 +1,74 @@
+# Cloud Build: build, push to Artifact Registry, then promote on Cloud Run.
+#
+# Traffic stays on the previous revision until the new one returns a healthy
+# response. A failed deploy does not leave the service unavailable.
+#
+# Trigger substitutions (override per environment):
+#   _REGION       Cloud Run region. Must match the existing service.
+#   _AR_LOCATION  Region of the Artifact Registry repository.
+#   _SERVICE      Cloud Run service name.
+#   _AR_REPO      Artifact Registry repository (already used by this service).
+#
+# The Cloud Build service account needs roles/run.admin,
+# roles/artifactregistry.writer, and roles/iam.serviceAccountUser.
+
+substitutions:
+  _REGION: me-central1
+  _AR_LOCATION: me-central1
+  _SERVICE: acot-ai
+  _AR_REPO: cloud-run-source-deploy
+  _HEALTH_PATH: /
+  _MEMORY: 2Gi
+  _CPU: "1"
+  _PROBE_FAILURE_THRESHOLD: "24"
+  _PROBE_PERIOD_SECONDS: "15"
+  _ATTEMPTS: "20"
+
 steps:
-  # Build Docker image
-  - name: "gcr.io/cloud-builders/docker"
+  - name: gcr.io/cloud-builders/docker
+    env:
+      - DOCKER_BUILDKIT=1
     args:
-      - "build"
-      - "-t"
-      - "me-central1-docker.pkg.dev/kinetic-axle-442714-m6/cloud-run-source-deploy/acot-ai/acot-ai:$COMMIT_SHA"
-      - "."
+      - build
+      - -t
+      - ${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}/${_SERVICE}:$COMMIT_SHA
+      - .
 
-  # Push Docker image
-  - name: "gcr.io/cloud-builders/docker"
+  - name: gcr.io/cloud-builders/docker
     args:
-      - "push"
-      - "me-central1-docker.pkg.dev/kinetic-axle-442714-m6/cloud-run-source-deploy/acot-ai/acot-ai:$COMMIT_SHA"
+      - push
+      - ${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}/${_SERVICE}:$COMMIT_SHA
 
-  # Deploy to Cloud Run
-  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
-    entrypoint: gcloud
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
     args:
-      - "run"
-      - "deploy"
-      - "acot-ai"
-      - "--image"
-      - "me-central1-docker.pkg.dev/kinetic-axle-442714-m6/cloud-run-source-deploy/acot-ai/acot-ai:$COMMIT_SHA"
-      - "--region"
-      - "me-central1"
-      - "--platform"
-      - "managed"
+      - scripts/cloud-run-safe-deploy.sh
+    env:
+      - SERVICE=${_SERVICE}
+      - REGION=${_REGION}
+      - IMAGE=${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}/${_SERVICE}:$COMMIT_SHA
+      - HEALTH_PATH=${_HEALTH_PATH}
+      - MEMORY=${_MEMORY}
+      - CPU=${_CPU}
+      - PROBE_FAILURE_THRESHOLD=${_PROBE_FAILURE_THRESHOLD}
+      - PROBE_PERIOD_SECONDS=${_PROBE_PERIOD_SECONDS}
+      - ATTEMPTS=${_ATTEMPTS}
 
-images:
-  - "me-central1-docker.pkg.dev/kinetic-axle-442714-m6/cloud-run-source-deploy/acot-ai/acot-ai:$COMMIT_SHA"
+  # Only reached when the new revision is serving. A failed build leaves :stable
+  # pointing at the last good image.
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - tag
+      - ${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}/${_SERVICE}:$COMMIT_SHA
+      - ${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}/${_SERVICE}:stable
+
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - ${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}/${_SERVICE}:stable
 
 options:
   logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
+
+timeout: 3600s

@@ -84,7 +84,8 @@ knowledge. Preserve exact AED, sqft, bedroom, date, and percentage values.
 
 PROJECT DATA RULES
 - The structured database is project-level. Do not invent individual unit/listing data.
-- A project price is a starting price unless explicit unit-level prices are supplied.
+- When the evidence contains RENTAL LISTINGS, those rows are real rental listings. Quote their rent, bedrooms, size, and community, and do not add listings that are not listed.
+- A project price is a starting price unless the evidence is a rental listing with its own rent.
 - Never derive studio/1BR/2BR/3BR prices from a starting price or bedroom range.
 - Use ACTIVE/OFF_PLAN/UNDER_CONSTRUCTION only when the evidence explicitly says so.
 
@@ -246,7 +247,7 @@ Now answer the user directly using ONLY the supplied evidence.
 
         return prompt, max_output_tokens
 
-    def generate_answer(
+    async def generate_answer(
         self,
         question: str,
         context: str,
@@ -258,7 +259,7 @@ Now answer the user directly using ONLY the supplied evidence.
             question_type,
         )
 
-        response = self.llm.generate(
+        response = await self.llm.generate(
             prompt,
             max_output_tokens=max_output_tokens,
         )
@@ -268,7 +269,7 @@ Now answer the user directly using ONLY the supplied evidence.
 
         return response.strip()
 
-    def stream_answer(
+    async def stream_answer(
         self,
         question: str,
         context: str,
@@ -282,7 +283,7 @@ Now answer the user directly using ONLY the supplied evidence.
 
         parts = []
 
-        for delta in self.llm.stream(
+        async for delta in self.llm.stream(
             prompt,
             max_output_tokens=max_output_tokens,
         ):

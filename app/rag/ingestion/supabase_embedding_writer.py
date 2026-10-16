@@ -1,44 +1,16 @@
-import os
-from pathlib import Path
-
-from dotenv import load_dotenv
-from supabase import create_client
+from app.database.postgres import execute
+from app.database.postgres_client import PostgresClient
 
 
 # =========================================================
-# PROJECT ROOT / ENVIRONMENT
-# =========================================================
-
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-
-load_dotenv(PROJECT_ROOT / ".env")
-
-
-# =========================================================
-# SUPABASE EMBEDDING WRITER
+# POSTGRES EMBEDDING WRITER
 # =========================================================
 
 class SupabaseEmbeddingWriter:
 
     def __init__(self):
 
-        supabase_url = os.getenv("SUPABASE_URL")
-        supabase_key = os.getenv("SUPABASE_SECRET_KEY")
-
-        if not supabase_url:
-            raise ValueError(
-                "SUPABASE_URL is not configured."
-            )
-
-        if not supabase_key:
-            raise ValueError(
-                "SUPABASE_SECRET_KEY is not configured."
-            )
-
-        self.supabase = create_client(
-            supabase_url,
-            supabase_key
-        )
+        self.supabase = PostgresClient()
 
     # =========================================================
     # PROJECT
@@ -73,18 +45,10 @@ class SupabaseEmbeddingWriter:
                 f"got {len(embedding_list)}."
             )
 
-        response = (
-            self.supabase
-            .table("projects")
-            .update({
-                "knowledge_text": text,
-                "embedding": embedding_list
-            })
-            .eq("id", project_id)
-            .execute()
+        execute(
+            "update projects set knowledge_text = %s, embedding = %s::real[] where id = %s",
+            (text, embedding_list, project_id),
         )
-
-        return response
 
     # =========================================================
     # COMMUNITY
@@ -119,18 +83,10 @@ class SupabaseEmbeddingWriter:
                 f"got {len(embedding_list)}."
             )
 
-        response = (
-            self.supabase
-            .table("communities")
-            .update({
-                "knowledge_text": text,
-                "embedding": embedding_list
-            })
-            .eq("id", community_id)
-            .execute()
+        execute(
+            "update communities set knowledge_text = %s, embedding = %s::real[] where id = %s",
+            (text, embedding_list, community_id),
         )
-
-        return response
 
     # =========================================================
     # SUB-COMMUNITY
@@ -165,18 +121,10 @@ class SupabaseEmbeddingWriter:
                 f"got {len(embedding_list)}."
             )
 
-        response = (
-            self.supabase
-            .table("sub_communities")
-            .update({
-                "knowledge_text": text,
-                "embedding": embedding_list
-            })
-            .eq("id", sub_community_id)
-            .execute()
+        execute(
+            "update sub_communities set knowledge_text = %s, embedding = %s::real[] where id = %s",
+            (text, embedding_list, sub_community_id),
         )
-
-        return response
 
     # =========================================================
     # DOCUMENT CHUNK
@@ -242,20 +190,15 @@ class SupabaseEmbeddingWriter:
         # Insert into Supabase document_chunks
         # -----------------------------------------------------
 
-        response = (
-            self.supabase
-            .table("document_chunks")
-            .insert({
-                "document_id": document_id,
-                "document_title": document_title,
-                "document_url": document_url,
-                "document_type": document_type,
-                "publisher": publisher,
-                "chunk_id": chunk_id,
-                "content": content,
-                "embedding": embedding_list
-            })
-            .execute()
+        execute(
+            """
+            insert into document_chunks
+                (document_id, document_title, document_url, document_type,
+                 publisher, chunk_id, content, embedding)
+            values (%s, %s, %s, %s, %s, %s, %s, %s::real[])
+            """,
+            (
+                document_id, document_title, document_url, document_type,
+                publisher, chunk_id, content, embedding_list,
+            ),
         )
-
-        return response

@@ -145,6 +145,7 @@ class ConversationMemory:
         if isinstance(item, dict):
             name = (
                 item.get("name")
+                or item.get("title")
                 or item.get("project_name")
                 or item.get("community_name")
                 or item.get("sub_community_name")
@@ -866,31 +867,53 @@ class ConversationMemory:
         # =========================================================
         # 6. "their" / "them"
         #
-        # Only resolve automatically for exactly TWO candidates.
-        #
-        # If there are five projects, "their" can be ambiguous.
-        # We should not inject all five names into the query.
+        # Resolve against ALL active candidates.
+        # Example:
+        #   "What are their prices?"
+        # becomes a question about every project in the
+        # latest verified result set.
         # =========================================================
 
         candidate_names = self._candidate_names()
 
         if (
-            len(candidate_names) == 2
+            candidate_names
             and re.search(
                 r"\b(?:their|them)\b",
                 q_lower,
             )
         ):
-            first = candidate_names[0]
-            second = candidate_names[1]
-
-            replacement = (
-                f'"{first}" and "{second}"'
+            names = ", ".join(
+                f'"{name}"'
+                for name in candidate_names
             )
+
+            if re.search(
+                r"\b(?:starting\s+prices?|prices?|cost)\b",
+                q_lower,
+            ):
+                return (
+                    f"What are the starting prices for {names}?"
+                )
+
+            if re.search(r"\bhandover\b", q_lower):
+                return (
+                    f"What are the handover dates for {names}?"
+                )
+
+            if re.search(r"\bbedrooms?\b", q_lower):
+                return (
+                    f"What bedroom options are available for {names}?"
+                )
+
+            if re.search(r"\bdevelopers?\b", q_lower):
+                return (
+                    f"Who are the developers of {names}?"
+                )
 
             rewritten = re.sub(
                 r"\b(?:their|them)\b",
-                replacement,
+                names,
                 original,
                 count=1,
                 flags=re.IGNORECASE,
@@ -902,11 +925,11 @@ class ConversationMemory:
         # =========================================================
         # 7. "these projects" / "those projects"
         #
-        # Safe only when the candidate list is reasonably small.
+        # Resolve against the full verified candidate list.
         # =========================================================
 
         if (
-            1 <= len(candidate_names) <= 5
+            candidate_names
             and re.search(
                 r"\b(?:these|those)\s+projects\b",
                 q_lower,
@@ -934,7 +957,7 @@ class ConversationMemory:
     # QUESTION REWRITING
     # =============================================================
 
-    def rewrite_question(
+    async def rewrite_question(
         self,
         question: str,
     ) -> str:
@@ -1105,7 +1128,7 @@ Rules:
 """
 
         try:
-            rewritten = self.llm_client.generate(
+            rewritten = await self.llm_client.generate(
                 prompt
             )
 
@@ -1126,6 +1149,49 @@ Rules:
     # =============================================================
     # CANDIDATE EXTRACTION
     # =============================================================
+
+    @staticmethod
+    def _compact_listing(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Keep the fields needed to compare a shown listing later."""
+
+        title = ConversationMemory._clean(
+            item.get("title") or item.get("name")
+        )
+        if not title:
+            return None
+
+        bedrooms = item.get("bedrooms")
+        beds = item.get("beds")
+        if beds is None and isinstance(bedrooms, dict):
+            beds = bedrooms.get("min")
+
+        size = item.get("size_sqft")
+        if isinstance(size, dict):
+            size = size.get("min")
+
+        cover = item.get("cover_photo")
+        photos = item.get("photos")
+        if not cover and isinstance(photos, list) and photos:
+            cover = photos[0]
+
+        return {
+            "name": title,
+            "title": title,
+            "entity_type": "listing",
+            "listing_id": item.get("listing_id") or item.get("id"),
+            "price_aed": (
+                item.get("price_aed")
+                if item.get("price_aed") is not None
+                else item.get("price")
+            ),
+            "rent_frequency": item.get("rent_frequency"),
+            "beds": beds,
+            "property_type": item.get("property_type"),
+            "size_sqft": size,
+            "cover_photo": cover,
+            "url": item.get("url") or item.get("property_finder_url"),
+            "community": item.get("community"),
+        }
 
     def _extract_candidates(
         self,
@@ -1261,6 +1327,24 @@ Rules:
                 return candidates[
                     : self.MAX_CANDIDATES
                 ]
+
+        listings = (
+            retrieval_result.get("listings")
+            or structured_data.get("listings")
+        )
+        if listings:
+            add_candidates(
+                [
+                    item
+                    for item in (
+                        self._compact_listing(row)
+                        for row in listings
+                        if isinstance(row, dict)
+                    )
+                    if item
+                ],
+                "listing",
+            )
 
         return candidates[
             : self.MAX_CANDIDATES
