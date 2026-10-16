@@ -59,13 +59,19 @@ def _get_user_plan(user_id: str) -> str:
             (row or {}).get("plan") or "freeplan"
         ).strip().lower()
 
+        if "free" in plan:
+            return "freeplan"
+        if plan in {"professional", "pro"} or "professional" in plan:
+            return "professional"
+        if plan == "enterprise" or "enterprise" in plan:
+            return "enterprise"
         return plan if plan in SCORE_LIMITS else "freeplan"
 
     except Exception as exc:
         print(
             f"Account plan lookup failed for {user_id}: {exc}"
         )
-        return "free"
+        return "freeplan"
 
 
 # ============================================================

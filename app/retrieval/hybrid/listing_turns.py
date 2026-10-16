@@ -37,6 +37,62 @@ def retrieve_listings(supabase, question: str, filters: Dict[str, Any]) -> Dict[
     return result
 
 
+def retrieve_bedroom_comparison(supabase, counts, place: str) -> Dict[str, Any]:
+    """Load a rental sample for each bedroom count in one place."""
+
+    retriever = ListingRetriever(supabase)
+    community = retriever._match_community(place or "") or (place or "").strip()
+    sides = []
+    rows = []
+
+    for count in counts:
+        label = f"{count} bedroom rentals"
+        if community:
+            label = f"{label} in {community.title()}"
+        constraints = ListingRetriever._constraints({"bedrooms": int(count)})
+        try:
+            matched, total = retriever._sql_search(community, constraints, 50)
+        except Exception as exc:
+            print("Bedroom listing comparison error:", exc)
+            matched, total = [], 0
+        if matched and matched[0].get("community"):
+            label = f"{count} bedroom rentals in {matched[0]['community']}"
+        sides.append({
+            "entity_type": "listing",
+            "requested_name": label,
+            "resolved_name": label,
+            "data": {
+                "listings": matched,
+                "listing_total": total,
+                "projects": [],
+                "communities": [],
+                "sub_communities": [],
+            },
+        })
+        rows.extend(matched)
+
+    populated = [side for side in sides if side["data"]["listings"]]
+    print(
+        "Bedroom listing comparison:",
+        community or place or "anywhere",
+        [(side["resolved_name"], len(side["data"]["listings"])) for side in sides],
+    )
+    result = {
+        "communities": [],
+        "projects": [],
+        "sub_communities": [],
+        "listings": rows,
+        "listing_query": True,
+        "listing_total": len(rows),
+        "comparison": len(populated) >= 2,
+        "comparison_entities": populated if len(populated) >= 2 else [],
+    }
+    if not rows:
+        result["understood_subject"] = community.title() if community else (place or "that request")
+        result["understood_kind"] = "listing"
+    return result
+
+
 def retrieve_listing_comparison(
     supabase,
     filters: Dict[str, Any],

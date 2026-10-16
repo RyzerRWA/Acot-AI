@@ -182,6 +182,46 @@ def _clean_compare_name(value: str) -> str:
     return re.sub(r"\s+", " ", text).strip(" ,")
 
 
+def bedroom_rental_pair(question: str):
+    """Two bedroom counts to compare as rentals, and the place when one is named.
+
+    ``Compare the 2 and 3 rentals in Business Bay`` is a 2-bedroom versus
+    3-bedroom rental comparison. ``Compare 1 and 2 rentals`` with no place
+    stays a follow-up about rows already on screen.
+    """
+
+    text = prepare_user_question(question)
+    if not text:
+        return None
+
+    bed = r"bed(?:room)?s?"
+    offered = r"(?:rentals?|listings?|apartments?|flats?|properties)"
+    match = None
+    for pattern in (
+        rf"\b(\d+)\s*{bed}\s+(?:and|vs\.?|versus)\s+(\d+)\s*{bed}\b",
+        rf"\b(\d+)\s*(?:{bed}\s+)?(?:and)\s+(\d+)\s*(?:{bed}\s+)?{offered}\b",
+    ):
+        match = re.search(pattern, text)
+        if match:
+            break
+    if not match:
+        return None
+
+    left = int(match.group(1))
+    right = int(match.group(2))
+    if left == right or left > 12 or right > 12:
+        return None
+
+    place = ""
+    located = re.search(r"\b(?:in|at)\s+(.+)$", text)
+    if located:
+        place = _place_only(located.group(1))
+    names_bedrooms = bool(re.search(rf"\b{bed}\b", text))
+    if not place and not names_bedrooms:
+        return None
+    return left, right, place
+
+
 def comparison_pair(question: str):
     """Return the two names in a comparison, without the trailing request."""
 
@@ -237,6 +277,12 @@ def asks_for_listings(question: str) -> bool:
         return False
 
     if re.search(r"\blistings?\b|\bfor rent\b|\bto rent\b|\brenting\b", text):
+        return True
+    # "rentals" is a listing request. "rental price" stays a project fact.
+    if re.search(r"\brentals?\b", text) and not re.search(
+        r"\brental\s+(?:price|yield|income)\b",
+        text,
+    ):
         return True
 
     return bool(

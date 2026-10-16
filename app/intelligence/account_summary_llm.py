@@ -61,7 +61,7 @@ prices, handover dates, amenities, comparisons, and recent interests.
 
 def _score_limit(intelligence: dict) -> tuple[str, float]:
     plan = str(
-        intelligence.get("subscription_plan") or "free"
+        intelligence.get("subscription_plan") or "freeplan"
     ).strip().lower()
 
     return plan, SCORE_LIMITS.get(plan, 5.0)

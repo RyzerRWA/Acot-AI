@@ -406,6 +406,7 @@ def root():
 # HEALTH CHECK
 # ============================================================
 
+@app.get("/health")
 @app.get("/api/healths")
 def health_check():
 

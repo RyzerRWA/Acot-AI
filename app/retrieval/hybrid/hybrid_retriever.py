@@ -34,12 +34,14 @@ from app.retrieval.hybrid.entity_resolver import EntityResolver
 from app.retrieval.hybrid.catalog_turns import retrieve_catalog
 from app.retrieval.hybrid.listing_turns import (
     previous_listing_comparison,
+    retrieve_bedroom_comparison,
     retrieve_listing_comparison,
     retrieve_listings,
     shown_listing_followup,
 )
 from app.retrieval.hybrid.question_text import (
     asks_for_listings,
+    bedroom_rental_pair,
     catalog_request,
     comparison_pair,
     display_phrase,
@@ -1722,6 +1724,17 @@ class HybridRetriever:
             explicit_multi_entity_comparison = (
                 len(comparison_entities) >= 2
             )
+
+            bedroom_pair = bedroom_rental_pair(question)
+            if compared_listings is None and bedroom_pair:
+                print("\n================================")
+                print("BEDROOM LISTING COMPARISON")
+                print("================================")
+                compared_listings = retrieve_bedroom_comparison(
+                    self.structured_retriever.supabase,
+                    bedroom_pair[:2],
+                    bedroom_pair[2],
+                )
 
             if compared_listings is None and pair and asks_for_listings(question):
                 print("\n================================")
