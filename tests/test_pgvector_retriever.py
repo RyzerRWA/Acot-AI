@@ -1,5 +1,5 @@
-from app.retrieval.supabase.pgvector_retriever import (
-    SupabasePGVectorRetriever
+from app.retrieval.postgres.pgvector_retriever import (
+    PGVectorRetriever
 )
 
 
@@ -12,9 +12,9 @@ print("================================")
 # CREATE RETRIEVER
 # ============================================================
 
-print("\nInitializing Supabase PGVector Retriever...")
+print("\nInitializing PostgreSQL pgvector Retriever...")
 
-retriever = SupabasePGVectorRetriever(
+retriever = PGVectorRetriever(
     match_threshold=0.5,
     match_count=5
 )
@@ -36,7 +36,7 @@ print(question)
 # SEARCH
 # ============================================================
 
-print("\nSearching Supabase pgvector...")
+print("\nSearching PostgreSQL pgvector...")
 
 results = retriever.search(question)
 

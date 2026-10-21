@@ -2,7 +2,7 @@ from app.database.postgres import fetch
 from app.database.postgres_client import PostgresClient
 
 
-class SupabaseStructuredRetriever:
+class StructuredRetriever:
     """
     Structured retrieval directly from PostgreSQL.
 
@@ -15,7 +15,7 @@ class SupabaseStructuredRetriever:
     def __init__(self):
 
         # Listings and catalog search still read this client.
-        self.supabase = PostgresClient()
+        self.db = PostgresClient()
 
     # =========================================================
     # COMMON PROJECT FIELDS

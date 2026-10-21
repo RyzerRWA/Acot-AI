@@ -4,14 +4,14 @@ import re
 from typing import Any, Dict, Optional
 
 from app.retrieval.hybrid.question_text import comparison_pair
-from app.retrieval.supabase.listing_retriever import ListingRetriever
+from app.retrieval.postgres.listing_retriever import ListingRetriever
 
 
-def retrieve_listings(supabase, question: str, filters: Dict[str, Any]) -> Dict[str, Any]:
+def retrieve_listings(db, question: str, filters: Dict[str, Any]) -> Dict[str, Any]:
     """Search rental listings and keep project records out of the answer."""
 
     try:
-        found = ListingRetriever(supabase).search(question, filters)
+        found = ListingRetriever(db).search(question, filters)
     except Exception as exc:
         print("Listing retrieval error:", exc)
         found = {
@@ -37,10 +37,10 @@ def retrieve_listings(supabase, question: str, filters: Dict[str, Any]) -> Dict[
     return result
 
 
-def retrieve_bedroom_comparison(supabase, counts, place: str) -> Dict[str, Any]:
+def retrieve_bedroom_comparison(db, counts, place: str) -> Dict[str, Any]:
     """Load a rental sample for each bedroom count in one place."""
 
-    retriever = ListingRetriever(supabase)
+    retriever = ListingRetriever(db)
     community = retriever._match_community(place or "") or (place or "").strip()
     sides = []
     rows = []
@@ -94,13 +94,13 @@ def retrieve_bedroom_comparison(supabase, counts, place: str) -> Dict[str, Any]:
 
 
 def retrieve_listing_comparison(
-    supabase,
+    db,
     filters: Dict[str, Any],
     pair: tuple,
 ) -> Optional[Dict[str, Any]]:
     """Load a rental sample for each of the two named places."""
 
-    retriever = ListingRetriever(supabase)
+    retriever = ListingRetriever(db)
     constraints = retriever._constraints(filters or {})
     sides = []
     rows = []

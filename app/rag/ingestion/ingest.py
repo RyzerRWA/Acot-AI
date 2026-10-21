@@ -1,4 +1,4 @@
-﻿from app.rag.ingestion.source_detector import SourceDetector
+from app.rag.ingestion.source_detector import SourceDetector
 from app.rag.ingestion.url_fetcher import URLFetcher
 from app.rag.ingestion.content_extractor import ContentExtractor
 from app.rag.ingestion.text_cleaner import TextCleaner
@@ -217,7 +217,7 @@ class DocumentIngestionPipeline:
         )
 
         print(
-            "Status: Ready for Supabase pgvector"
+            "Status: Ready for PostgreSQL pgvector"
         )
 
         return results

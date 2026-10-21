@@ -22,11 +22,13 @@ _PROJECT_WORDS = (
 _LEAD = re.compile(
     r"^(?:please\s+)?"
     r"(?:show me|show|list|find|tell me about|tell me|give me|"
-    r"i need|i want|can you|could you|what are|what is|what|which)\s+"
+    r"suggest me|suggest|recommend me|recommend|"
+    r"i need|i want|can you|can u|could you|what are|what is|what|which)\s+"
 )
 
 _BROWSE_LEAD = re.compile(
-    r"^(?:please\s+)?(?:show me|show|list|find|tell me about|tell me|give me)\b"
+    r"^(?:please\s+)?(?:show me|show|list|find|tell me about|tell me|give me|"
+    r"suggest me|suggest|recommend me|recommend)\b"
 )
 
 _ATTRIBUTE_TOKENS = {
@@ -74,6 +76,9 @@ _GENERIC_WORDS = {
     "of", "in", "at", "on", "and", "or", "for", "with", "to", "from",
     "their", "these", "those", "them", "please", "available", "options",
     "list", "find", "give", "tell", "about", "what", "which", "are", "is",
+    "suggest", "recommend", "recommendation", "recommendations",
+    "suggestion", "suggestions", "best", "top", "good",
+    "invest", "investment", "investments", "investing", "u", "you",
     "property", "properties", "project", "projects",
     "community", "communities", "sub",
     "bedroom", "bedrooms", "bed", "beds", "room", "rooms",
@@ -81,6 +86,7 @@ _GENERIC_WORDS = {
     "apartment", "apartments", "villa", "villas", "townhouse", "townhouses",
     "listing", "listings", "unit", "units", "home", "homes",
     "starting", "under", "below", "above", "near",
+    "handover", "completion", "ready",
 }
 
 _CITIES = {
@@ -146,11 +152,20 @@ def _swap_project_words(text: str) -> str:
 def _place_only(value: str) -> str:
     text = re.split(r"\b(?:and|with|plus)\b", value or "", maxsplit=1)[0]
     text = re.sub(
+        r"\s+(?:to|for)\s+(?:invest(?:ment|ing)?|buy(?:ing)?)\b.*$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
         r"\b(?:communities|community|projects?|prices?|bedrooms?|"
         r"aed|apartments?|villas?|listings?|rentals?)\b",
         " ",
         text,
     )
+    # Year-only "places" are handover filters, not communities.
+    if re.fullmatch(r"20\d{2}", (text or "").strip()):
+        return ""
     return re.sub(r"\s+", " ", text).strip(" ,")
 
 
@@ -285,6 +300,17 @@ def asks_for_listings(question: str) -> bool:
     ):
         return True
 
+    # Spots-style budget browse: "studio under 200k", "apartments below 200000"
+    if re.search(
+        r"\b(?:under|below|less than|up to)\b",
+        text,
+    ) and re.search(
+        r"\b(?:apartments?|villas?|townhouses?|penthouses?|studios?|"
+        r"units?|flats?)\b",
+        text,
+    ):
+        return True
+
     return bool(
         re.search(r"\brent\b", text)
         and re.search(
@@ -326,6 +352,8 @@ def prepare_user_question(text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     text = _normalize_bedrooms(text)
     text = _correct_domain_typos(text)
+    # "hand over projects in 2028" → "handover projects in 2028"
+    text = re.sub(r"\bhand[\s-]+over\b", "handover", text)
     text = re.sub(r"\b(?:yo|pls|lemme|wanna)\b", " ", text)
     text = re.sub(r"\bplease\b", " ", text)
     text = re.sub(r"\bgimme\b", "give me", text)
@@ -483,12 +511,30 @@ def interpret_search(question: str) -> dict:
     if developer_place:
         developer = developer_place.group(1).strip()
         community = developer_place.group(2).strip()
+        # Drop trailing intent words: "jvc to invest" → "jvc"
+        community = re.sub(
+            r"\s+(?:to|for)\s+(?:invest(?:ment|ing)?|buy(?:ing)?)\b.*$",
+            "",
+            community,
+            flags=re.IGNORECASE,
+        ).strip()
+        developer_tokens = set(re.findall(r"[a-z0-9]+", developer.lower()))
+        developer_is_filler = (
+            not developer_tokens
+            or developer_tokens <= _GENERIC_WORDS
+            or is_attribute_phrase(developer)
+        )
+        # "handover projects in 2028" is a year filter, not a place named 2028.
+        if re.fullmatch(r"20\d{2}", community or ""):
+            return {"kind": "none"}
         if developer not in {"project", "projects"}:
-            if is_attribute_phrase(developer):
-                return {
-                    "kind": "community",
-                    "community": community,
-                }
+            if developer_is_filler:
+                if community:
+                    return {
+                        "kind": "community",
+                        "community": community,
+                    }
+                return {"kind": "none"}
             return {
                 "kind": "developer_community",
                 "developer": developer,
@@ -518,11 +564,27 @@ def interpret_search(question: str) -> dict:
             }
 
     mentioned = _mentioned_name(raw)
+    # "tell me about Morocco Cluster in International City" is a place,
+    # not a project named that whole phrase. Let entity resolution win.
+    place_phrase = re.match(
+        r"^(.+?)\s+(?:in|at)\s+(.+)$",
+        body,
+    )
+    if place_phrase and not re.search(r"\bprojects?\b", body):
+        left = place_phrase.group(1).strip()
+        right = _place_only(place_phrase.group(2))
+        if left and right and _specific_tokens(left):
+            return {"kind": "none"}
+
     if body and _BROWSE_LEAD.match(prepare_user_question(question) or raw):
         if (
             body not in {"project", "projects"}
             and "project" not in body.split()[:1]
             and _specific_tokens(body)
+            and not re.search(
+                r"\b(?:invest(?:ment|ments|ing)?|yield|roi)\b",
+                body,
+            )
         ):
             return {"kind": "project", "name": body, "browse": True}
 
@@ -623,7 +685,17 @@ def catalog_request(question: str):
     text = prepare_user_question(question)
     if not text or comparison_pair(text):
         return None
-    if re.search(r"\b(?:invest(?:ment|ing)?|compare|versus|vs|better|yield|roi)\b", text):
+    if re.search(
+        r"\b(?:invest(?:ment|ments|ing)?|compare|versus|vs|better|yield|roi)\b",
+        text,
+    ):
+        return None
+    # Year handover asks are filter retrieval, not catalog browse.
+    if re.search(
+        r"\b(?:hand[\s-]?over|completion)\b.*\b20\d{2}\b"
+        r"|\b20\d{2}\b.*\b(?:hand[\s-]?over|completion)\b",
+        text,
+    ):
         return None
     if re.search(r"\b(?:first|second|third|these|those|them|their)\b", text):
         return None

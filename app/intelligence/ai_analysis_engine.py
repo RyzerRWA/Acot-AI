@@ -64,12 +64,26 @@ class AIAnalysisEngine:
         # LLM explanation
         # -----------------------------------------------------
 
-        llm_analysis = await self._generate_llm_analysis(
-            question=question,
-            data=data,
-            documents=documents,
-            score=score,
+        # Investment/search already have deterministic recommendations.
+        # Only spend an extra LLM call for comparison/ranking narrative.
+        needs_llm = question_type in {
+            "comparison",
+            "ranking",
+            "analysis",
+        } and bool(
+            data.get("projects")
+            or data.get("communities")
+            or data.get("sub_communities")
         )
+
+        llm_analysis = None
+        if needs_llm:
+            llm_analysis = await self._generate_llm_analysis(
+                question=question,
+                data=data,
+                documents=documents,
+                score=score,
+            )
 
         if llm_analysis:
 
@@ -96,6 +110,51 @@ class AIAnalysisEngine:
     # =========================================================
     # PREPARE DATA
     # =========================================================
+
+    @staticmethod
+    def _slim_project(project: Dict[str, Any]) -> Dict[str, Any]:
+        """Keep only fields needed for analysis prompts (cuts token burn)."""
+
+        bedrooms = project.get("bedrooms")
+        if not isinstance(bedrooms, dict):
+            bedrooms = {
+                "min": project.get("bedroom_min"),
+                "max": project.get("bedroom_max"),
+            }
+        amenities = project.get("amenities") or []
+        if isinstance(amenities, list):
+            amenities = [
+                str(item).strip()
+                for item in amenities[:8]
+                if str(item).strip()
+            ]
+        else:
+            amenities = []
+
+        return {
+            "name": project.get("name"),
+            "developer": (
+                project.get("developer")
+                or project.get("developer_name")
+            ),
+            "community": project.get("community"),
+            "city": project.get("city"),
+            "price": project.get("price"),
+            "bedrooms": bedrooms,
+            "status": project.get("status"),
+            "project_status": project.get("project_status"),
+            "handover_time": project.get("handover_time"),
+            "property_types": (project.get("property_types") or [])[:6],
+            "amenities": amenities,
+        }
+
+    @staticmethod
+    def _slim_named(record: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "name": record.get("name"),
+            "city": record.get("city"),
+            "community": record.get("community"),
+        }
 
     def _prepare_data(
         self,
@@ -130,9 +189,21 @@ class AIAnalysisEngine:
         )
 
         return {
-            "communities": communities,
-            "projects": projects,
-            "sub_communities": sub_communities,
+            "communities": [
+                self._slim_named(item)
+                for item in communities[:8]
+                if isinstance(item, dict)
+            ],
+            "projects": [
+                self._slim_project(item)
+                for item in projects[:8]
+                if isinstance(item, dict)
+            ],
+            "sub_communities": [
+                self._slim_named(item)
+                for item in sub_communities[:8]
+                if isinstance(item, dict)
+            ],
         }
 
     # =========================================================
@@ -900,7 +971,8 @@ Return ONLY valid JSON:
         try:
 
             response = await self.llm.generate(
-                prompt
+                prompt,
+                max_output_tokens=500,
             )
 
             if not response:

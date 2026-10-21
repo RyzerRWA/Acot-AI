@@ -81,7 +81,7 @@ class HybridRetriever:
 
     Responsibilities:
         1. Plan the query
-        2. Resolve real entities from Supabase
+        2. Resolve real entities from PostgreSQL
         3. Retrieve structured PostgreSQL data
         4. Retrieve pgvector documents only when required
         5. Apply supported user filters
@@ -576,7 +576,7 @@ class HybridRetriever:
         self,
         sub_community_name: str,
     ) -> Dict[str, Any]:
-        """Retrieve sub-community records from the current schema."""
+        """Retrieve projects and rental listings for a sub-community / cluster."""
         if not self.structured_retriever:
             return self._empty_structured_result()
 
@@ -585,11 +585,31 @@ class HybridRetriever:
                 "select * from sub_communities where name ilike %s limit 1000",
                 (f"%{sub_community_name}%",),
             )
+            projects = fetch(
+                "select * from projects where sub_community ilike %s limit 1000",
+                (f"%{sub_community_name}%",),
+            )
+            listings = fetch(
+                "select listing_id, title, purpose, property_type, category, "
+                "beds, baths, size_sqft, price_aed, rent_frequency, furnishing, "
+                "completion_status, community, sub_community, location, "
+                "agency_name, cover_photo, image_urls, url "
+                "from listings "
+                "where sub_community ilike %s "
+                "order by price_aed asc nulls last "
+                "limit 50",
+                (f"%{sub_community_name}%",),
+            )
 
             return {
                 "communities": [],
-                "projects": [],
-                "sub_communities": sub_communities,
+                "projects": projects or [],
+                "sub_communities": sub_communities or [],
+                "listings": listings or [],
+                "listing_query": bool(listings),
+                "listing_total": len(listings or []),
+                "understood_subject": sub_community_name,
+                "understood_kind": "listing" if listings else "place",
             }
         except Exception as exc:
             print("Sub-community retrieval error:", exc)
@@ -784,6 +804,23 @@ class HybridRetriever:
                     TypeError,
                     ValueError,
                 ):
+                    continue
+
+            # ----------------------------------------------------
+            # HANDOVER YEAR
+            # ----------------------------------------------------
+
+            handover_year = (
+                filters.get("handover_year")
+                if filters
+                else None
+            )
+
+            if handover_year is not None:
+                handover_text = str(
+                    project.get("handover_time") or ""
+                )
+                if str(handover_year) not in handover_text:
                     continue
 
             filtered.append(
@@ -999,7 +1036,7 @@ class HybridRetriever:
                 or {}
             )
 
-            # `SupabaseStructuredRetriever.retrieve()` returns the
+            # `StructuredRetriever.retrieve()` returns the
             # community collection under `community`. Keep accepting
             # `communities` too so the retrieval layer stays compatible
             # with older callers.
@@ -1484,16 +1521,28 @@ class HybridRetriever:
                 developer_name=shape.get("developer"),
                 community_name=community_name,
             )
+            # Empty shaped results must fall through to entity resolution
+            # (e.g. "suggest me projects in jvc to invest").
+            if not projects:
+                return None
             return self._project_result(projects)
 
         if kind == "developer":
-            return self._retrieve_by_developer(shape.get("developer") or "")
+            developer = (shape.get("developer") or "").strip()
+            if not developer or re.fullmatch(r"20\d{2}", developer):
+                return None
+            result = self._retrieve_by_developer(developer)
+            if not (result.get("projects") or []):
+                return None
+            return result
 
         if kind == "community":
             community_name = self._canonical_community(
                 shape.get("community") or "",
                 resolved_entity=resolved_entity,
             )
+            if not community_name or re.fullmatch(r"20\d{2}", community_name):
+                return None
             projects = self._filtered_projects(community_name=community_name)
             if not projects:
                 return None
@@ -1589,11 +1638,19 @@ class HybridRetriever:
                 or []
             )
 
+            # Only prior PROJECT shortlists can drive multi-project /
+            # investment follow-ups. Listing titles from a Spots-style
+            # browse must not be looked up as project names when the user
+            # later asks "suggest projects in JVC to invest".
             candidate_names = [
                 str(item.get("name")).strip()
                 for item in active_candidates
                 if isinstance(item, dict)
                 and item.get("name")
+                and str(
+                    item.get("entity_type") or "project"
+                ).strip().lower()
+                == "project"
             ]
 
             question_lower = (question or "").lower()
@@ -1698,6 +1755,16 @@ class HybridRetriever:
             # LISTINGS ALREADY ON SCREEN
             # ----------------------------------------------------
             shape = interpret_search(question)
+
+            # A fresh shaped place search must not be hijacked by a prior
+            # shortlist just because the question mentions invest/compare.
+            if (
+                wants_multi_project
+                and self._shape_takes_priority(shape)
+                and not candidate_list_reference
+                and not explicit_multi_project_reference
+            ):
+                wants_multi_project = False
             pair = comparison_pair(question)
             compared_listings = previous_listing_comparison(
                 question,
@@ -1731,7 +1798,7 @@ class HybridRetriever:
                 print("BEDROOM LISTING COMPARISON")
                 print("================================")
                 compared_listings = retrieve_bedroom_comparison(
-                    self.structured_retriever.supabase,
+                    self.structured_retriever.db,
                     bedroom_pair[:2],
                     bedroom_pair[2],
                 )
@@ -1741,10 +1808,12 @@ class HybridRetriever:
                 print("LISTING COMPARISON")
                 print("================================")
                 compared_listings = retrieve_listing_comparison(
-                    self.structured_retriever.supabase,
+                    self.structured_retriever.db,
                     filters or {},
                     pair,
                 )
+
+            result = None
 
             if compared_listings is not None:
 
@@ -1760,7 +1829,7 @@ class HybridRetriever:
                 print("CATALOG BROWSE")
                 print("================================")
                 result = retrieve_catalog(
-                    self.structured_retriever.supabase,
+                    self.structured_retriever.db,
                     catalog_request(question),
                 )
 
@@ -1770,7 +1839,7 @@ class HybridRetriever:
                 print("LISTING SEARCH")
                 print("================================")
                 result = retrieve_listings(
-                    self.structured_retriever.supabase,
+                    self.structured_retriever.db,
                     question,
                     filters or {},
                 )
@@ -1862,6 +1931,13 @@ class HybridRetriever:
                     )
                 elif (
                     resolved_entity
+                    and resolved_entity.entity_type == "sub_community"
+                ):
+                    result = self._retrieve_by_sub_community(
+                        resolved_entity.name
+                    )
+                elif (
+                    resolved_entity
                     and resolved_entity.entity_type == "community"
                 ):
                     result = self._retrieve_by_community(
@@ -1882,11 +1958,15 @@ class HybridRetriever:
                         resolved_entity.name
                     )
                 else:
-                    result = self._empty_structured_result()
+                    # Empty shaped browse must not block year/investment defaults.
+                    result = None
 
             # ----------------------------------------------------
             # PROJECT
             # ----------------------------------------------------
+
+            if result is not None:
+                pass
 
             elif (
                 resolved_entity
@@ -1898,6 +1978,23 @@ class HybridRetriever:
                 result = self._retrieve_project_family(
                     shape,
                     resolved_entity.name,
+                )
+
+            # ----------------------------------------------------
+            # SUB-COMMUNITY
+            # ----------------------------------------------------
+
+            elif (
+                resolved_entity
+                and
+                resolved_entity.entity_type
+                == "sub_community"
+            ):
+
+                result = (
+                    self._retrieve_by_sub_community(
+                        resolved_entity.name
+                    )
                 )
 
             # ----------------------------------------------------
@@ -1952,10 +2049,37 @@ class HybridRetriever:
                 )
 
             else:
-
-                result = (
-                    self._empty_structured_result()
+                # No place name: still answer year / investment asks.
+                intent = (
+                    str(getattr(query_plan, "intent", "") or "").lower()
+                    if query_plan is not None
+                    else ""
                 )
+                handover_year = (
+                    (filters or {}).get("handover_year")
+                )
+                if handover_year is not None:
+                    try:
+                        year_projects = fetch(
+                            "select * from projects "
+                            "where handover_time::text ilike %s "
+                            "limit 1000",
+                            (f"%{handover_year}%",),
+                        )
+                        result = {
+                            "communities": [],
+                            "projects": year_projects or [],
+                            "sub_communities": [],
+                        }
+                    except Exception as exc:
+                        print("Handover-year retrieval error:", exc)
+                        result = self._empty_structured_result()
+                elif intent == "investment":
+                    result = self._retrieve_by_city("Dubai")
+                else:
+                    result = (
+                        self._empty_structured_result()
+                    )
 
             self._annotate_miss(result, shape)
 
@@ -2257,7 +2381,7 @@ class HybridRetriever:
             # If the user asks for database fields such as price, bedrooms,
             # projects, developers, handover, etc., do not call pgvector
             # unless the question explicitly asks for document/brochure data.
-            # This prevents unnecessary Supabase document RPC calls for
+            # This prevents unnecessary PostgreSQL document RPC calls for
             # questions such as: "Which of these have 2 bedroom options?"
             if (
                 self._needs_structured_data_from_question(question)
@@ -2422,7 +2546,7 @@ class HybridRetriever:
             started = time.perf_counter()
             print()
             print(
-                "Retrieving Supabase "
+                "Retrieving PostgreSQL "
                 "PGVector documents..."
             )
             result = self.retrieve_documents(question)

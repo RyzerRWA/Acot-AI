@@ -23,12 +23,12 @@ print("\nEnvironment loaded successfully.")
 
 
 # ============================================================
-# 2. CREATE SUPABASE CLIENT
+# 2. CREATE POSTGRES CLIENT
 # ============================================================
 
 print("\nConnecting to PostgreSQL...")
 
-supabase = PostgresClient()
+db = PostgresClient()
 
 print("PostgreSQL connection initialized.")
 
@@ -65,7 +65,7 @@ query_embedding = embedding_model.embed_query(question)
 
 # IMPORTANT:
 # The embedding model returns a NumPy ndarray.
-# Supabase RPC requires a normal Python list.
+# PostgreSQL RPC requires a normal Python list.
 if hasattr(query_embedding, "tolist"):
     query_embedding = query_embedding.tolist()
 
@@ -91,14 +91,14 @@ print("\nEmbedding dimension is correct: 384")
 
 
 # ============================================================
-# 7. SEARCH SUPABASE PGVECTOR
+# 7. SEARCH POSTGRES PGVECTOR
 # ============================================================
 
-print("\nSearching Supabase pgvector...")
+print("\nSearching PostgreSQL pgvector...")
 
 try:
 
-    response = supabase.rpc(
+    response = db.rpc(
         "match_communities",
         {
             "query_embedding": query_embedding,

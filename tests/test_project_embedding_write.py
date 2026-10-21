@@ -4,8 +4,8 @@ from dotenv import load_dotenv
 
 from app.database.postgres_client import PostgresClient
 from app.rag.embeddings.embedding_model import EmbeddingModel
-from app.rag.ingestion.supabase_embedding_writer import (
-    SupabaseEmbeddingWriter
+from app.rag.ingestion.embedding_writer import (
+    EmbeddingWriter
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -19,10 +19,10 @@ def main():
     print("================================")
 
     # =========================================================
-    # SUPABASE CONNECTION
+    # POSTGRES CONNECTION
     # =========================================================
 
-    supabase = PostgresClient()
+    db = PostgresClient()
 
     # =========================================================
     # GET ONE PROJECT
@@ -35,7 +35,7 @@ def main():
     )
 
     response = (
-        supabase
+        db
         .table("projects")
         .select("*")
         .eq("id", project_id)
@@ -154,9 +154,9 @@ Source:
     # WRITE
     # =========================================================
 
-    print("\nWriting embedding to Supabase...")
+    print("\nWriting embedding to PostgreSQL...")
 
-    writer = SupabaseEmbeddingWriter()
+    writer = EmbeddingWriter()
 
     writer.update_project_embedding(
         project_id=project_id,

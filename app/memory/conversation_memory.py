@@ -30,7 +30,7 @@ Responsibilities:
 - Fall back to the LLM only when deterministic resolution is not safe.
 
 Important:
-This module does NOT retrieve data from Supabase.
+This module does NOT retrieve data from PostgreSQL.
 It only maintains and resolves conversational context.
 """
 

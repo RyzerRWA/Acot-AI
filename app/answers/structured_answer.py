@@ -817,16 +817,11 @@ def _is_fast_structured_question(
     documents,
 ):
     """
-    Use the database template only for a browse/search that already has rows.
+    Use the database template when rows are already retrieved.
 
-    Price, bedroom, handover, comparison, and other follow-ups stay on the
-    model path so the reply is written instead of reprinted as a hit list.
+    Skips the answer LLM for browse/search, investment lists, and simple
+    field asks (price/handover/bedrooms) that the template already covers.
     """
-
-    del question
-
-    if question_type != "search":
-        return False
 
     if documents:
         return False
@@ -834,12 +829,28 @@ def _is_fast_structured_question(
     if structured_summary.get("filter_no_match"):
         return True
 
-    return bool(
+    has_rows = bool(
         structured_summary.get("projects")
         or structured_summary.get("community")
         or structured_summary.get("sub_communities")
         or structured_summary.get("listings")
     )
+    if not has_rows:
+        return False
+
+    if question_type in {"search", "investment"}:
+        return True
+
+    # Information field follow-ups: template already formats these.
+    if question_type == "information" and re.search(
+        r"\b(?:price|prices|cost|bedroom|bedrooms|hand[\s-]?over|"
+        r"developer|status)\b",
+        question or "",
+        flags=re.IGNORECASE,
+    ):
+        return True
+
+    return False
 
 
 def _listing_bedroom_phrase(listing):
@@ -1003,7 +1014,7 @@ def _build_fast_structured_answer(
     #
     # `projects` is intentionally empty because no candidate matched the
     # filter. `filter_evidence_projects` contains the previous candidates
-    # so we can explain the result using the real Supabase data.
+    # so we can explain the result using the PostgreSQL data.
     if structured_summary.get("filter_no_match"):
         evidence_projects = (
             structured_summary.get(
@@ -1064,7 +1075,9 @@ def _build_fast_structured_answer(
             term in q
             for term in ("bedroom", "bedrooms")
         )
-        wants_handover = "handover" in q
+        wants_handover = bool(
+            re.search(r"hand[\s-]?over", q)
+        )
         wants_developer = any(
             term in q
             for term in ("developer", "developers")
