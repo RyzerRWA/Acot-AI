@@ -597,9 +597,18 @@ def interpret_search(question: str) -> dict:
 def _mentioned_name(text: str) -> str:
     match = re.search(
         r"(?:price|prices|cost|bedrooms?|handover|developer|status|"
-        r"amenities|size|details|information)\s+(?:of|for|about)\s+(.+)$",
+        r"amenities|size|details|information|payment\s+plans?)\s+"
+        r"(?:of|for|about)\s+(.+)$",
         text,
     )
+    if not match:
+        match = re.search(
+            r"(?:create|show|give|tell(?:\s+me)?)\s+"
+            r"(?:a\s+|the\s+|me\s+(?:a\s+|the\s+)?)?"
+            r"payment\s+plans?\s+for\s+(.+)$",
+            text,
+            flags=re.IGNORECASE,
+        )
     if not match:
         return ""
     name = _clean_stem(match.group(1))

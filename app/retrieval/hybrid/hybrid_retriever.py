@@ -33,9 +33,13 @@ from typing import Any, Dict, List, Optional
 from app.retrieval.hybrid.entity_resolver import EntityResolver
 from app.retrieval.hybrid.catalog_turns import retrieve_catalog
 from app.retrieval.hybrid.listing_turns import (
+    asks_payment_plan,
+    payment_plan_subject,
     previous_listing_comparison,
     retrieve_bedroom_comparison,
+    retrieve_listing_by_title_result,
     retrieve_listing_comparison,
+    retrieve_listing_title_comparison,
     retrieve_listings,
     shown_listing_followup,
 )
@@ -1803,6 +1807,16 @@ class HybridRetriever:
                     bedroom_pair[2],
                 )
 
+            # Compare two pasted listing titles even when the question
+            # also says "invest" / does not say "rental".
+            if compared_listings is None and pair:
+                titled = retrieve_listing_title_comparison(pair)
+                if titled is not None:
+                    print("\n================================")
+                    print("LISTING TITLE COMPARISON")
+                    print("================================")
+                    compared_listings = titled
+
             if compared_listings is None and pair and asks_for_listings(question):
                 print("\n================================")
                 print("LISTING COMPARISON")
@@ -1813,6 +1827,21 @@ class HybridRetriever:
                     pair,
                 )
 
+            # Payment-plan ask about a pasted listing title.
+            named_listing = None
+            if compared_listings is None and asks_payment_plan(question):
+                subject = (
+                    payment_plan_subject(question)
+                    or (shape or {}).get("mentioned_name")
+                    or ""
+                ).strip()
+                if subject:
+                    named_listing = retrieve_listing_by_title_result(subject)
+                    if named_listing is not None:
+                        print("\n================================")
+                        print("LISTING TITLE LOOKUP")
+                        print("================================")
+
             result = None
 
             if compared_listings is not None:
@@ -1822,6 +1851,10 @@ class HybridRetriever:
             elif shown_listings is not None:
 
                 result = shown_listings
+
+            elif named_listing is not None:
+
+                result = named_listing
 
             elif catalog_request(question):
 

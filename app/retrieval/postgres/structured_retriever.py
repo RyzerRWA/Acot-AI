@@ -1,5 +1,13 @@
+import re
+
 from app.database.postgres import fetch
 from app.database.postgres_client import PostgresClient
+
+
+_PROJECT_NAME_STOP = {
+    "the", "and", "for", "of", "by", "at", "in", "on",
+    "project", "projects", "property", "properties",
+}
 
 
 class StructuredRetriever:
@@ -80,6 +88,52 @@ class StructuredRetriever:
     # PROJECTS BY NAME
     # =========================================================
 
+    @staticmethod
+    def _project_name_tokens(value: str) -> list:
+        tokens = re.findall(r"[a-z0-9]+", str(value or "").lower())
+        return [
+            token
+            for token in tokens
+            if len(token) > 2 and token not in _PROJECT_NAME_STOP
+        ]
+
+    @classmethod
+    def _rank_project_name_matches(cls, query: str, rows: list) -> list:
+        """Prefer projects whose names cover the query tokens (any order)."""
+
+        needle = cls._project_name_tokens(query)
+        if not needle or not rows:
+            return list(rows or [])
+
+        needle_set = set(needle)
+        ranked = []
+        for row in rows:
+            name = str(row.get("name") or "")
+            name_norm = re.sub(r"[^a-z0-9\s]+", " ", name.lower())
+            name_norm = re.sub(r"\s+", " ", name_norm).strip()
+            query_norm = re.sub(r"[^a-z0-9\s]+", " ", str(query or "").lower())
+            query_norm = re.sub(r"\s+", " ", query_norm).strip()
+            name_tokens = set(cls._project_name_tokens(name))
+            if not name_tokens:
+                continue
+            overlap = needle_set & name_tokens
+            if not overlap:
+                continue
+            score = len(overlap) / max(len(needle_set), 1)
+            if query_norm and (
+                query_norm in name_norm or name_norm in query_norm
+            ):
+                score += 0.35
+            # Prefer names that include every query token.
+            if overlap == needle_set:
+                score += 0.4
+            # Prefer tighter names when scores tie.
+            score += max(0.0, 0.15 - (len(name_tokens) * 0.01))
+            ranked.append((score, len(name), row))
+
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        return [item[2] for item in ranked if item[0] >= 0.5]
+
     def search_projects_by_name(
         self,
         project_name: str,
@@ -88,8 +142,8 @@ class StructuredRetriever:
         """
         Retrieve projects by project name.
 
-        Example:
-            "Sky Edition at Seahaven"
+        Exact substring first, then token AND for reordered names such as
+        "Binghatti Mercedes" → "Mercedes Benz Places by Binghatti".
         """
 
         if not project_name:
@@ -100,10 +154,32 @@ class StructuredRetriever:
         if not query:
             return []
 
-        return fetch(
+        rows = fetch(
             f"select {self.PROJECT_FIELDS} from projects where name ilike %s limit %s",
             (f"%{query}%", limit),
         )
+        if rows:
+            return rows
+
+        tokens = self._project_name_tokens(query)
+        if not tokens:
+            return []
+
+        if len(tokens) == 1:
+            rows = fetch(
+                f"select {self.PROJECT_FIELDS} from projects "
+                f"where name ilike %s limit %s",
+                (f"%{tokens[0]}%", max(limit * 5, 40)),
+            )
+            return self._rank_project_name_matches(query, rows)[:limit]
+
+        where = " and ".join(["name ilike %s"] * len(tokens))
+        params = tuple(f"%{token}%" for token in tokens)
+        rows = fetch(
+            f"select {self.PROJECT_FIELDS} from projects where {where} limit %s",
+            (*params, max(limit * 5, 40)),
+        )
+        return self._rank_project_name_matches(query, rows)[:limit]
 
     # =========================================================
     # PROJECTS BY NAME, DEVELOPER, AND COMMUNITY

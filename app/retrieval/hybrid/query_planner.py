@@ -799,9 +799,12 @@ Rules:
         # ------------------------------------------------------------
         # Budget / price
         # ------------------------------------------------------------
+        # Multiplier must not steal the leading "m" from "month"/"monthly"
+        # after punctuation is stripped ("2,500 / month" → "2,500 month").
+        _amount_unit = r"(million|thousand|k|m)?(?![a-z])"
         budget_patterns = [
-            r"(?:under|below|less than|up to|max(?:imum)?(?: budget)?(?: of)?)\s*(?:aed|dh|د\.إ)?\s*([\d,.]+)\s*(million|m|k|thousand)?",
-            r"(?:budget|price range)\s*(?:of|is|:)?\s*(?:aed|dh|د\.إ)?\s*([\d,.]+)\s*(million|m|k|thousand)?",
+            rf"(?:under|below|less than|up to|max(?:imum)?(?: budget)?(?: of)?)\s*(?:aed|dh|د\.إ)?\s*([\d,.]+)\s*{_amount_unit}",
+            rf"(?:budget|price range)\s*(?:of|is|:)?\s*(?:aed|dh|د\.إ)?\s*([\d,.]+)\s*{_amount_unit}",
         ]
 
         for pattern in budget_patterns:
@@ -819,7 +822,7 @@ Rules:
         # Minimum price
         # ------------------------------------------------------------
         minimum_patterns = [
-            r"(?:above|over|more than|at least)\s*(?:aed|dh|د\.إ)?\s*([\d,.]+)\s*(million|m|k|thousand)?",
+            rf"(?:above|over|more than|at least)\s*(?:aed|dh|د\.إ)?\s*([\d,.]+)\s*{_amount_unit}",
         ]
 
         for pattern in minimum_patterns:
@@ -832,6 +835,14 @@ Rules:
                 if amount is not None:
                     filters["min_price_aed"] = amount
                     break
+
+        # Listings store yearly AED. Spots-style "under 2,500 / month"
+        # must be compared as yearly (×12), not as a raw yearly cap.
+        if re.search(r"\b(?:monthly|months?)\b", q):
+            for key in ("max_price_aed", "min_price_aed"):
+                if filters.get(key) is not None:
+                    filters[key] = float(filters[key]) * 12
+            filters["rent_period"] = "monthly"
 
         # ------------------------------------------------------------
         # Bedrooms

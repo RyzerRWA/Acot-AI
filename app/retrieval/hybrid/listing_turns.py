@@ -93,6 +93,177 @@ def retrieve_bedroom_comparison(db, counts, place: str) -> Dict[str, Any]:
     return result
 
 
+def _normalize_listing_title(value: str) -> str:
+    text = re.sub(r"[^a-z0-9\s]+", " ", str(value or "").lower())
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def lookup_listing_by_title(title: str) -> Optional[Dict[str, Any]]:
+    """Resolve a pasted listing title to one listings row."""
+
+    from app.database.postgres import fetch
+
+    needle = _normalize_listing_title(title)
+    if len(needle) < 8:
+        return None
+
+    tokens = [token for token in needle.split() if len(token) > 2][:4]
+    if not tokens:
+        return None
+
+    where = " and ".join(["title ilike %s"] * len(tokens))
+    params = tuple(f"%{token}%" for token in tokens)
+    try:
+        rows = fetch(
+            "select listing_id, title, purpose, property_type, category, beds, baths, "
+            "size_sqft, price_aed, rent_frequency, furnishing, completion_status, "
+            "community, sub_community, location, agency_name, cover_photo, "
+            "image_urls, url "
+            f"from listings where {where} "
+            "order by price_aed asc nulls last "
+            "limit 40",
+            params,
+        )
+    except Exception as exc:
+        print("Listing title lookup error:", exc)
+        return None
+
+    needle_compact = needle.replace(" ", "")
+    best = None
+    best_score = 0.0
+    for row in rows or []:
+        cand = _normalize_listing_title(row.get("title"))
+        if not cand:
+            continue
+        cand_compact = cand.replace(" ", "")
+        if cand == needle or needle in cand or cand in needle:
+            score = 1.0 + min(len(cand), len(needle)) / 1000.0
+        elif needle_compact and (
+            needle_compact in cand_compact or cand_compact in needle_compact
+        ):
+            score = 0.92
+        else:
+            left = set(needle.split())
+            right = set(cand.split())
+            if not left or not right:
+                continue
+            score = len(left & right) / max(len(left), len(right))
+            if score < 0.72:
+                continue
+        if score > best_score:
+            best_score = score
+            best = row
+    return best
+
+
+def payment_plan_subject(question: str) -> str:
+    """Extract the named property from a payment-plan ask."""
+
+    text = (question or "").strip()
+    if not text:
+        return ""
+    match = re.search(
+        r"(?:create|show|give|tell(?:\s+me)?|what(?:'s| is)?|find)\s+"
+        r"(?:a\s+|the\s+|me\s+(?:a\s+|the\s+)?)?"
+        r"payment\s+plans?\s+for\s+(.+)$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        match = re.search(
+            r"payment\s+plans?\s+(?:for|of|about)\s+(.+)$",
+            text,
+            flags=re.IGNORECASE,
+        )
+    if not match:
+        return ""
+    name = match.group(1).strip(" .?!,")
+    name = re.sub(
+        r"\b(?:please|pls|project|projects|listing|listings|this|the)\b",
+        " ",
+        name,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(r"\s+", " ", name).strip(" .?!,")
+
+
+def asks_payment_plan(question: str) -> bool:
+    return bool(
+        re.search(
+            r"\bpayment\s+plans?\b|\binstallments?\b|\bdown\s+payment\b",
+            question or "",
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def retrieve_listing_by_title_result(title: str) -> Optional[Dict[str, Any]]:
+    """Return a single listing as a structured retrieval result."""
+
+    listing = lookup_listing_by_title(title)
+    if not listing:
+        return None
+    name = str(listing.get("title") or title).strip()
+    print("Listing title lookup:", name)
+    return {
+        "communities": [],
+        "projects": [],
+        "sub_communities": [],
+        "listings": [listing],
+        "listing_query": True,
+        "listing_total": 1,
+        "understood_subject": name,
+        "understood_kind": "listing",
+    }
+
+
+def retrieve_listing_title_comparison(
+    pair: tuple,
+) -> Optional[Dict[str, Any]]:
+    """Compare two rental listings named by title (Spots-style paste)."""
+
+    if not pair or len(pair) < 2:
+        return None
+
+    sides = []
+    rows = []
+    for name in pair[:2]:
+        listing = lookup_listing_by_title(name)
+        if not listing:
+            continue
+        title = str(listing.get("title") or name).strip()
+        sides.append({
+            "entity_type": "listing",
+            "requested_name": name,
+            "resolved_name": title,
+            "data": {
+                "listings": [listing],
+                "projects": [],
+                "communities": [],
+                "sub_communities": [],
+            },
+        })
+        rows.append(listing)
+
+    if len(sides) < 2:
+        return None
+
+    print(
+        "Listing title comparison:",
+        [side["resolved_name"] for side in sides],
+    )
+    return {
+        "communities": [],
+        "projects": [],
+        "sub_communities": [],
+        "listings": rows,
+        "listing_query": True,
+        "listing_total": 2,
+        "comparison": True,
+        "comparison_entities": sides,
+    }
+
+
 def retrieve_listing_comparison(
     db,
     filters: Dict[str, Any],
@@ -276,6 +447,86 @@ def row_has_bedrooms(record, wanted: int) -> bool:
         return False
 
 
+def _mentioned_rental_place(texts) -> str:
+    """Pull a place from 'rentals in Dubai South' style wording."""
+
+    for text in texts or []:
+        match = re.search(
+            r"\b(?:rentals?|listings?|apartments?|studios?|villas?|units?|"
+            r"options?|ones?)\s+in\s+(.+)$",
+            text or "",
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            match = re.search(
+                r"\bin\s+(.+?)(?:\s+and\s+tell|\s+which|\s+tell me|$)",
+                text or "",
+                flags=re.IGNORECASE,
+            )
+        if not match:
+            continue
+        place = re.split(
+            r"\b(?:and tell|tell me|which is|which one)\b",
+            match.group(1),
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
+        place = re.sub(
+            r"\b(?:rentals?|listings?|apartments?|studios?|villas?|"
+            r"units?|options?|ones?|best|better)\b",
+            " ",
+            place,
+            flags=re.IGNORECASE,
+        )
+        place = re.sub(r"\s+", " ", place).strip(" ,.")
+        if place and not re.fullmatch(r"\d+", place):
+            return place
+    return ""
+
+
+def _requested_listing_positions(texts):
+    """Return explicit 1-based slots such as (1, 7) when the user named them."""
+
+    for text in texts or []:
+        number_pair = re.search(
+            r"\b(\d+)\s*(?:st|nd|rd|th)?\s*"
+            r"(?:and|&|,|with|vs\.?|versus)\s*"
+            r"(\d+)\s*(?:st|nd|rd|th)?\b",
+            text or "",
+            flags=re.IGNORECASE,
+        )
+        if number_pair:
+            left = int(number_pair.group(1))
+            right = int(number_pair.group(2))
+            if left != right:
+                return [left, right]
+
+        ordinals = {
+            "first": 1,
+            "second": 2,
+            "third": 3,
+            "fourth": 4,
+            "fifth": 5,
+            "sixth": 6,
+            "seventh": 7,
+            "eighth": 8,
+            "ninth": 9,
+            "tenth": 10,
+        }
+        words = re.findall(
+            r"\b(first|second|third|fourth|fifth|sixth|seventh|"
+            r"eighth|ninth|tenth)\b",
+            text or "",
+            flags=re.IGNORECASE,
+        )
+        if len(words) >= 2:
+            left = ordinals[words[0].lower()]
+            right = ordinals[words[1].lower()]
+            if left != right:
+                return [left, right]
+    return None
+
+
 def previous_listing_comparison(
     question: str,
     conversation_context: Optional[Dict[str, Any]],
@@ -290,8 +541,6 @@ def previous_listing_comparison(
         and str(item.get("entity_type") or "").lower() == "listing"
         and (item.get("name") or item.get("title"))
     ]
-    if len(listings) < 2:
-        return None
 
     texts = _question_texts(question, conversation_context)
     if not texts:
@@ -299,6 +548,38 @@ def previous_listing_comparison(
     if not any(wants_shown_comparison(text) for text in texts):
         return None
     if any(names_outside_places(text) for text in texts):
+        return None
+
+    positions = _requested_listing_positions(texts)
+    place = _mentioned_rental_place(texts)
+
+    # If memory was shrunk by an earlier "first two" compare, reload the
+    # named place so "1 and 7th" can still resolve.
+    if (
+        positions
+        and place
+        and (
+            len(listings) < max(positions)
+            or len(listings) < 2
+        )
+    ):
+        try:
+            found = ListingRetriever().search(
+                f"listings in {place}",
+                {},
+            )
+            refreshed = found.get("listings") or []
+            if len(refreshed) >= max(positions):
+                listings = refreshed
+                print(
+                    "Listing comparison reload:",
+                    place,
+                    len(listings),
+                )
+        except Exception as exc:
+            print("Listing comparison reload error:", exc)
+
+    if len(listings) < 2:
         return None
 
     picked = pick_listed_rows(listings, texts)
@@ -445,6 +726,10 @@ def pick_listed_rows(listings, texts):
             and all(1 <= position <= len(listings) for position in positions[:2])
         )
 
+    # When the user names specific slots (1 and 7th), never silently fall
+    # back to the first two rows if those slots are missing from memory.
+    asked_specific_slots = False
+
     for text in texts:
         number_pair = re.search(
             r"\b(\d+)\s*(?:st|nd|rd|th)?\s*"
@@ -455,6 +740,8 @@ def pick_listed_rows(listings, texts):
         )
         if number_pair:
             positions = [int(number_pair.group(1)), int(number_pair.group(2))]
+            if positions[0] != positions[1]:
+                asked_specific_slots = True
             if in_range(positions):
                 return [listings[position - 1] for position in positions]
 
@@ -466,6 +753,8 @@ def pick_listed_rows(listings, texts):
         )
         if len(words) >= 2:
             positions = [ordinals[word.lower()] for word in words[:2]]
+            if positions[0] != positions[1]:
+                asked_specific_slots = True
             if in_range(positions):
                 return [listings[position - 1] for position in positions]
 
@@ -491,6 +780,9 @@ def pick_listed_rows(listings, texts):
         )
         if last_two and len(listings) >= 2:
             return listings[-2:]
+
+    if asked_specific_slots:
+        return []
 
     mentioned = []
     blob = "\n".join(texts).lower()
