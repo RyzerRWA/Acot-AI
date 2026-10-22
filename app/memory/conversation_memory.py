@@ -30,7 +30,7 @@ Responsibilities:
 - Fall back to the LLM only when deterministic resolution is not safe.
 
 Important:
-This module does NOT retrieve data from Supabase.
+This module does NOT retrieve data from PostgreSQL.
 It only maintains and resolves conversational context.
 """
 
@@ -1465,6 +1465,7 @@ Rules:
         )
 
         preserve_previous_project_list = False
+        preserve_previous_listing_list = False
 
         if (
             previous_candidates
@@ -1508,10 +1509,49 @@ Rules:
                     in searchable_question
                 )
 
+        # Comparing "1 and 2" / "1 and 7th" returns only those two rows.
+        # Keep the full rental shortlist so later ordinal asks still work.
+        if (
+            previous_candidates
+            and candidates
+            and len(previous_candidates) > len(candidates)
+            and len(candidates) >= 2
+        ):
+            previous_listings = [
+                item
+                for item in previous_candidates
+                if isinstance(item, dict)
+                and self._normalise(item.get("entity_type")) == "listing"
+                and self._get_name(item)
+            ]
+            new_listings = [
+                item
+                for item in candidates
+                if isinstance(item, dict)
+                and self._normalise(item.get("entity_type")) == "listing"
+                and self._get_name(item)
+            ]
+            if (
+                len(previous_listings) == len(previous_candidates)
+                and len(new_listings) == len(candidates)
+                and len(previous_listings) > len(new_listings)
+            ):
+                previous_keys = {
+                    self._normalise(self._get_name(item))
+                    for item in previous_listings
+                }
+                preserve_previous_listing_list = all(
+                    self._normalise(self._get_name(item)) in previous_keys
+                    for item in new_listings
+                )
+
         if candidates:
-            if not preserve_previous_project_list:
+            if (
+                not preserve_previous_project_list
+                and not preserve_previous_listing_list
+            ):
                 self.active_candidates = candidates
-            # Otherwise keep the previous multi-project list intact.
+            # Otherwise keep the previous shortlist intact.
 
         # ---------------------------------------------------------
         # If there is exactly one project, make it the active

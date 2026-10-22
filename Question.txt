@@ -128,6 +128,7 @@ Show me all Canal Heights projects.
 Show me all Al Haseen Residence projects.
 Show me all Binghatti Hills projects.
 
+
 # 9. Rental listings — 2,227 rows in public.listings
 
 Show me listings in Jumeirah Village Circle (JVC).

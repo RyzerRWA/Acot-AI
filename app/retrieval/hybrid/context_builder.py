@@ -3,8 +3,8 @@ ACOT Hybrid Context Builder
 
 Builds compact, grounded context for the RAG/LLM layer from:
 
-1. Supabase PostgreSQL structured data
-2. Supabase pgvector document chunks
+1. PostgreSQL structured data
+2. PostgreSQL pgvector document chunks
 
 Optimization goals:
 - Preserve project/community/sub-community ordering.
@@ -20,11 +20,13 @@ from datetime import datetime
 
 class HybridContextBuilder:
 
-    # Keep long database text bounded so simple requests do not send huge
-    # descriptions/knowledge fields to Gemini.
-    MAX_DESCRIPTION_CHARS = 2200
-    MAX_KNOWLEDGE_CHARS = 1200
-    MAX_DOCUMENT_CHARS = 3500
+    # Keep long database text bounded so prompts stay small.
+    MAX_DESCRIPTION_CHARS = 400
+    MAX_KNOWLEDGE_CHARS = 300
+    MAX_DOCUMENT_CHARS = 1200
+    MAX_PROJECTS = 8
+    MAX_LISTINGS = 8
+    MAX_AMENITIES = 12
 
     def __init__(self):
         pass
@@ -49,14 +51,16 @@ class HybridContextBuilder:
 
         return text[:max_chars].rstrip() + "..."
 
-    @staticmethod
-    def _list_text(value):
+    @classmethod
+    def _list_text(cls, value, max_items=None):
         """Convert list-like database fields into compact readable text."""
         if not value:
             return None
 
         if isinstance(value, (list, tuple)):
             values = [str(item).strip() for item in value if str(item).strip()]
+            if max_items is not None:
+                values = values[:max_items]
             return ", ".join(values) if values else None
 
         return str(value).strip() or None
@@ -214,7 +218,7 @@ class HybridContextBuilder:
             return ""
 
         context_parts = [
-            "SUPABASE STRUCTURED REAL ESTATE DATA",
+            "POSTGRES STRUCTURED REAL ESTATE DATA",
             "",
             "Use this as the primary source for structured facts.",
             "Project order below is authoritative and must be preserved.",
@@ -222,6 +226,7 @@ class HybridContextBuilder:
         ]
 
         if listings:
+            listings = listings[: self.MAX_LISTINGS]
             context_parts.extend([
                 "RENTAL LISTINGS",
                 "",
@@ -273,6 +278,7 @@ class HybridContextBuilder:
         # ========================================================
 
         if projects:
+            projects = projects[: self.MAX_PROJECTS]
             context_parts.extend([
                 "PROJECTS",
                 "",
@@ -347,7 +353,8 @@ class HybridContextBuilder:
                 )
 
                 amenities = self._list_text(
-                    project.get("amenities")
+                    project.get("amenities"),
+                    max_items=self.MAX_AMENITIES,
                 )
 
                 description = self._compact_text(
@@ -520,7 +527,7 @@ class HybridContextBuilder:
             return ""
 
         context_parts = [
-            "SUPABASE PGVECTOR DOCUMENT KNOWLEDGE",
+            "POSTGRES PGVECTOR DOCUMENT KNOWLEDGE",
             "",
             "Use these retrieved document chunks only for "
             "document-specific facts.",

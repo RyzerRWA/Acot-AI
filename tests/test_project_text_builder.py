@@ -17,12 +17,12 @@ def main():
     print("PROJECT TEXT BUILDER TEST")
     print("================================")
 
-    supabase = PostgresClient()
+    db = PostgresClient()
 
     project_id = 233000800
 
     response = (
-        supabase
+        db
         .table("projects")
         .select("*")
         .eq("id", project_id)

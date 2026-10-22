@@ -1,8 +1,8 @@
 import os
 from dotenv import load_dotenv
 
-from app.retrieval.supabase.structured_retriever import (
-    SupabaseStructuredRetriever
+from app.retrieval.postgres.structured_retriever import (
+    StructuredRetriever
 )
 
 
@@ -10,15 +10,15 @@ load_dotenv()
 
 
 print("\n================================")
-print("SUPABASE STRUCTURED RETRIEVER TEST")
+print("POSTGRES STRUCTURED RETRIEVER TEST")
 print("================================")
 
 
-print("\nInitializing Supabase structured retriever...")
+print("\nInitializing PostgreSQL structured retriever...")
 
-retriever = SupabaseStructuredRetriever()
+retriever = StructuredRetriever()
 
-print("Supabase structured retriever ready.")
+print("PostgreSQL structured retriever ready.")
 
 
 community = "Dubai Marina"

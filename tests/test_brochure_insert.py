@@ -4,7 +4,7 @@ from app.rag.ingestion.content_extractor import ContentExtractor
 from app.rag.ingestion.text_cleaner import TextCleaner
 from app.rag.ingestion.chunker import TextChunker
 from app.rag.embeddings.embedding_model import EmbeddingModel
-from app.rag.ingestion.supabase_embedding_writer import SupabaseEmbeddingWriter
+from app.rag.ingestion.embedding_writer import EmbeddingWriter
 
 
 URL = (
@@ -18,7 +18,7 @@ PROJECT_NAME = "Sky Edition at Seahaven"
 def main():
 
     print("=" * 60)
-    print("SUPABASE BROCHURE INGESTION TEST")
+    print("POSTGRES BROCHURE INGESTION TEST")
     print("=" * 60)
 
     # ---------------------------------------------------------
@@ -99,12 +99,12 @@ def main():
     )
 
     # ---------------------------------------------------------
-    # 7. Connect Supabase
+    # 7. Connect PostgreSQL
     # ---------------------------------------------------------
 
-    print("\nConnecting to Supabase...")
+    print("\nConnecting to PostgreSQL...")
 
-    writer = SupabaseEmbeddingWriter()
+    writer = EmbeddingWriter()
 
     # ---------------------------------------------------------
     # 8. Remove previous brochure chunks
@@ -113,7 +113,7 @@ def main():
     print("\nRemoving previous test ingestion...")
 
     delete_response = (
-        writer.supabase
+        writer.db
         .table("document_chunks")
         .delete()
         .eq("document_url", URL)
@@ -126,7 +126,7 @@ def main():
     # 9. Insert chunks
     # ---------------------------------------------------------
 
-    print("\nInserting chunks into Supabase...")
+    print("\nInserting chunks into PostgreSQL...")
 
     inserted = 0
 
@@ -166,7 +166,7 @@ def main():
 
     # Query database
     result = (
-        writer.supabase
+        writer.db
         .table("document_chunks")
         .select(
             "id, document_id, document_title, "
@@ -184,7 +184,7 @@ def main():
     rows = result.data or []
 
     print(
-        f"Chunks found in Supabase: {len(rows)}"
+        f"Chunks found in PostgreSQL: {len(rows)}"
     )
 
     if rows:
@@ -195,7 +195,7 @@ def main():
         print("-" * 60)
 
     print("\n" + "=" * 60)
-    print("SUPABASE INGESTION COMPLETE")
+    print("POSTGRES INGESTION COMPLETE")
     print("=" * 60)
 
 

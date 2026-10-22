@@ -1,7 +1,7 @@
 """
 PostgreSQL client for the ACOT AI retrieval and embedding pipeline.
 
-This is a small drop-in replacement for the parts of the Supabase Python
+This is a small drop-in replacement for the parts of the previous REST
 client that the pipeline uses, so the retrievers and ingestion code do
 not need to change:
 
@@ -12,7 +12,7 @@ not need to change:
 
 Queries go straight to PostgreSQL through psycopg, using DATABASE_URL.
 Rows are returned as JSON-style dicts (numbers stay numbers, timestamps
-are ISO strings), which matches what the Supabase client returned.
+are ISO strings), which matches the previous client shape.
 """
 
 import atexit
@@ -121,7 +121,7 @@ atexit.register(close_pools)
 # =========================================================
 
 class PostgresResponse:
-    """Mimics the Supabase response object (`.data`)."""
+    """Mimics the previous response object (`.data`)."""
 
     def __init__(self, data: Any):
         self.data = data

@@ -100,7 +100,7 @@ class QueryPlanner:
         # Raise via env if plans ever come back truncated (a truncated
         # response fails JSON parsing and silently falls back to rule_plan).
         self.max_output_tokens = int(
-            os.getenv("ACOT_PLANNER_MAX_TOKENS", "400")
+            os.getenv("ACOT_PLANNER_MAX_TOKENS", "220")
         )
 
         if self.use_llm and self._llm_client is None:
@@ -503,28 +503,32 @@ class QueryPlanner:
 
         These requests should not consume an LLM planning call because the
         rule planner already extracts their intent/entity/filter requirements.
-        Complex analytical, ranking, comparison, prediction, and document
-        queries continue through the LLM semantic planner.
+        Prediction, document, ranking, and comparison stay on the LLM planner.
         """
         if plan is None:
-            return False
-
-        if plan.intent != "search":
             return False
 
         if not plan.needs_structured_data:
             return False
 
-        if (
-            plan.needs_documents
-            or plan.needs_analytics
-            or plan.needs_prediction
-            or plan.needs_ranking
-            or plan.needs_comparison
-        ):
+        if plan.needs_documents or plan.needs_prediction:
             return False
 
-        return True
+        if plan.intent in {"prediction", "document", "calculation"}:
+            return False
+
+        # Ranking/comparison still benefit from LLM planning.
+        if plan.intent in {"ranking", "comparison"}:
+            return False
+
+        if plan.needs_ranking or plan.needs_comparison:
+            return False
+
+        # search / information / investment: rule planner is enough.
+        if plan.intent in {"search", "information", "investment", "general"}:
+            return True
+
+        return False
 
     async def _llm_plan(
         self,
@@ -539,8 +543,8 @@ Your job is to understand the user's request and create a retrieval/action plan.
 Do NOT answer the user. Do NOT invent database values.
 
 The downstream system has these capabilities:
-- structured Supabase PostgreSQL data: communities, sub_communities, projects
-- document RAG through Supabase pgvector: document_chunks
+- structured PostgreSQL data: communities, sub_communities, projects
+- document RAG through PostgreSQL pgvector: document_chunks
 - deterministic calculations/analytics over retrieved data
 - investment analysis over retrieved evidence
 - ranking and comparison over retrieved candidates
@@ -795,9 +799,12 @@ Rules:
         # ------------------------------------------------------------
         # Budget / price
         # ------------------------------------------------------------
+        # Multiplier must not steal the leading "m" from "month"/"monthly"
+        # after punctuation is stripped ("2,500 / month" → "2,500 month").
+        _amount_unit = r"(million|thousand|k|m)?(?![a-z])"
         budget_patterns = [
-            r"(?:under|below|less than|up to|max(?:imum)?(?: budget)?(?: of)?)\s*(?:aed|dh|د\.إ)?\s*([\d,.]+)\s*(million|m|k|thousand)?",
-            r"(?:budget|price range)\s*(?:of|is|:)?\s*(?:aed|dh|د\.إ)?\s*([\d,.]+)\s*(million|m|k|thousand)?",
+            rf"(?:under|below|less than|up to|max(?:imum)?(?: budget)?(?: of)?)\s*(?:aed|dh|د\.إ)?\s*([\d,.]+)\s*{_amount_unit}",
+            rf"(?:budget|price range)\s*(?:of|is|:)?\s*(?:aed|dh|د\.إ)?\s*([\d,.]+)\s*{_amount_unit}",
         ]
 
         for pattern in budget_patterns:
@@ -815,7 +822,7 @@ Rules:
         # Minimum price
         # ------------------------------------------------------------
         minimum_patterns = [
-            r"(?:above|over|more than|at least)\s*(?:aed|dh|د\.إ)?\s*([\d,.]+)\s*(million|m|k|thousand)?",
+            rf"(?:above|over|more than|at least)\s*(?:aed|dh|د\.إ)?\s*([\d,.]+)\s*{_amount_unit}",
         ]
 
         for pattern in minimum_patterns:
@@ -828,6 +835,14 @@ Rules:
                 if amount is not None:
                     filters["min_price_aed"] = amount
                     break
+
+        # Listings store yearly AED. Spots-style "under 2,500 / month"
+        # must be compared as yearly (×12), not as a raw yearly cap.
+        if re.search(r"\b(?:monthly|months?)\b", q):
+            for key in ("max_price_aed", "min_price_aed"):
+                if filters.get(key) is not None:
+                    filters[key] = float(filters[key]) * 12
+            filters["rent_period"] = "monthly"
 
         # ------------------------------------------------------------
         # Bedrooms
@@ -875,6 +890,21 @@ Rules:
 
         if re.search(r"\b(buy|buying|sale|for sale|purchase)\b", q):
             filters["transaction_type"] = "sale"
+
+        # ------------------------------------------------------------
+        # Handover year (hand over / handover / completion in 2028)
+        # ------------------------------------------------------------
+        handover_year = re.search(
+            r"\b(?:hand[\s-]?over|completion|ready)\b[^0-9]{0,40}\b(20\d{2})\b",
+            q,
+        )
+        if not handover_year:
+            handover_year = re.search(
+                r"\b(20\d{2})\b[^0-9]{0,40}\b(?:hand[\s-]?over|completion)\b",
+                q,
+            )
+        if handover_year:
+            filters["handover_year"] = int(handover_year.group(1))
 
         return filters
 

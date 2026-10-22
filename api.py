@@ -283,7 +283,7 @@ async def build_ai_summary(question, response, ai_analysis_engine):
 
         project = dict(project)
 
-        # Your Supabase/output format may use "developer".
+        # Your output format may use "developer".
         # AIAnalysisEngine also understands "developer_name".
         if (
             project.get("developer_name") is None

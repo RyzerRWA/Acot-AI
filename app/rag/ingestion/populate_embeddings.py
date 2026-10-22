@@ -16,8 +16,8 @@ import sys
 
 from app.database.postgres_client import PostgresClient
 from app.rag.embeddings.embedding_model import EmbeddingModel
-from app.rag.ingestion.supabase_embedding_writer import (
-    SupabaseEmbeddingWriter
+from app.rag.ingestion.embedding_writer import (
+    EmbeddingWriter
 )
 
 
@@ -37,7 +37,7 @@ def populate(table: str, writer, embedding_model) -> int:
     }[table]
 
     records = (
-        writer.supabase
+        writer.db
         .table(table)
         .select("id, name, knowledge_text")
         .is_("embedding", "null")
@@ -243,7 +243,7 @@ def main():
     print("================================")
 
     embedding_model = EmbeddingModel()
-    writer = SupabaseEmbeddingWriter()
+    writer = EmbeddingWriter()
     client = PostgresClient()
 
     for table in tables:

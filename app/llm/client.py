@@ -15,7 +15,7 @@ from app.subscription.token_usage import (
 
 # Limits concurrent in-flight LLM calls to AICredits. The provider's
 # concurrency cap is ~5, so anything above that risks HTTP 429s.
-_LLM_CONCURRENCY = int(os.getenv("AICREDITS_MAX_CONCURRENCY", "10"))
+_LLM_CONCURRENCY = int(os.getenv("AICREDITS_MAX_CONCURRENCY", "20"))
 _llm_semaphore = asyncio.Semaphore(_LLM_CONCURRENCY)
 
 # How long a request may wait for a free LLM slot before we give

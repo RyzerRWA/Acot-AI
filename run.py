@@ -16,20 +16,20 @@ load_dotenv()
 
 
 # =========================================================
-# SUPABASE STRUCTURED RETRIEVER
+# POSTGRES STRUCTURED RETRIEVER
 # =========================================================
 
-from app.retrieval.supabase.structured_retriever import (
-    SupabaseStructuredRetriever
+from app.retrieval.postgres.structured_retriever import (
+    StructuredRetriever
 )
 
 
 # =========================================================
-# SUPABASE PGVECTOR RETRIEVER
+# POSTGRES PGVECTOR RETRIEVER
 # =========================================================
 
-from app.retrieval.supabase.pgvector_retriever import (
-    SupabasePGVectorRetriever
+from app.retrieval.postgres.pgvector_retriever import (
+    PGVectorRetriever
 )
 
 
@@ -107,7 +107,7 @@ from app.memory.conversation_memory import (
 
 def initialize_acot():
 
-    structured_retriever = SupabaseStructuredRetriever()
+    structured_retriever = StructuredRetriever()
 
     query_planner = QueryPlanner()
 
@@ -115,7 +115,7 @@ def initialize_acot():
         structured_retriever
     )
 
-    pgvector_retriever = SupabasePGVectorRetriever(
+    pgvector_retriever = PGVectorRetriever(
         match_threshold=0.5,
         match_count=5
     )
@@ -152,19 +152,19 @@ def initialize_acot():
 
 
 # =========================================================
-# PRINT STRUCTURED SUPABASE DATA
+# PRINT STRUCTURED POSTGRES DATA
 # =========================================================
 
 def print_structured_data(structured_data):
 
     print("\n================================")
-    print("SUPABASE POSTGRES DATA")
+    print("POSTGRES DATA")
     print("================================")
 
 
     if not structured_data:
 
-        print("No structured Supabase data.")
+        print("No structured PostgreSQL data.")
 
         return
 
@@ -393,13 +393,13 @@ def print_structured_data(structured_data):
 def print_pgvector_data(documents):
 
     print("\n================================")
-    print("SUPABASE PGVECTOR DATA")
+    print("POSTGRES PGVECTOR DATA")
     print("================================")
 
 
     if not documents:
 
-        print("No Supabase PGVector document results.")
+        print("No PostgreSQL pgvector document results.")
 
         return
 

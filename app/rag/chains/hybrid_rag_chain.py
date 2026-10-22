@@ -22,17 +22,17 @@ class HybridRAGChain:
         # Keep more evidence for analytical questions, where several records
         # can matter, but still avoid sending unnecessarily large prompts.
         limits = {
-            "investment": 14000,
-            "comparison": 12000,
-            "ranking": 12000,
-            "prediction": 12000,
-            "calculation": 10000,
-            "document": 12000,
-            "information": 9000,
-            "search": 9000,
-            "general": 9000,
+            "investment": 5500,
+            "comparison": 5000,
+            "ranking": 5000,
+            "prediction": 5000,
+            "calculation": 4000,
+            "document": 5000,
+            "information": 4000,
+            "search": 4000,
+            "general": 4000,
         }
-        limit = limits.get(question_type, 9000)
+        limit = limits.get(question_type, 4000)
 
         if len(context) <= limit:
             return context
@@ -152,9 +152,12 @@ An earlier handover alone does NOT imply better investment performance.
 
 A larger amenity list alone does NOT imply better investment performance.
 
-When evidence is insufficient, use:
+When yield or ROI evidence is missing, say that clearly. Still list the
+retrieved projects with the facts that are present (location, price,
+bedrooms, status, handover) and do not invent missing metrics.
 
-"Cannot be determined from the available data."
+Only use "Cannot be determined from the available data." when no relevant
+projects or investment facts were retrieved at all.
 
 Do not force a positive or negative investment conclusion.
 
@@ -229,15 +232,15 @@ Now answer the user directly using ONLY the supplied evidence.
 """
 
         output_token_budgets = {
-            "investment": 1800,
-            "comparison": 1400,
-            "ranking": 1400,
-            "prediction": 1400,
-            "calculation": 1200,
-            "document": 1400,
-            "information": 1000,
-            "search": 1000,
-            "general": 1000,
+            "investment": 900,
+            "comparison": 800,
+            "ranking": 800,
+            "prediction": 800,
+            "calculation": 700,
+            "document": 800,
+            "information": 600,
+            "search": 600,
+            "general": 600,
         }
 
         max_output_tokens = output_token_budgets.get(

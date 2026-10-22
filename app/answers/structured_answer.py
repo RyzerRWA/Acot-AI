@@ -817,16 +817,11 @@ def _is_fast_structured_question(
     documents,
 ):
     """
-    Use the database template only for a browse/search that already has rows.
+    Use the database template when rows are already retrieved.
 
-    Price, bedroom, handover, comparison, and other follow-ups stay on the
-    model path so the reply is written instead of reprinted as a hit list.
+    Skips the answer LLM for browse/search, investment lists, and simple
+    field asks (price/handover/bedrooms) that the template already covers.
     """
-
-    del question
-
-    if question_type != "search":
-        return False
 
     if documents:
         return False
@@ -834,12 +829,37 @@ def _is_fast_structured_question(
     if structured_summary.get("filter_no_match"):
         return True
 
-    return bool(
+    has_rows = bool(
         structured_summary.get("projects")
         or structured_summary.get("community")
         or structured_summary.get("sub_communities")
         or structured_summary.get("listings")
     )
+    if not has_rows:
+        return False
+
+    if question_type in {"search", "investment"}:
+        return True
+
+    # Information field follow-ups: template already formats these.
+    if question_type == "information" and re.search(
+        r"\b(?:price|prices|cost|bedroom|bedrooms|hand[\s-]?over|"
+        r"developer|status|payment\s+plans?|installments?|"
+        r"down\s+payment)\b",
+        question or "",
+        flags=re.IGNORECASE,
+    ):
+        return True
+
+    # Payment-plan ask with a retrieved listing (rentals have no plan fields).
+    if structured_summary.get("listings") and re.search(
+        r"\b(?:payment\s+plans?|installments?|down\s+payment)\b",
+        question or "",
+        flags=re.IGNORECASE,
+    ):
+        return True
+
+    return False
 
 
 def _listing_bedroom_phrase(listing):
@@ -853,28 +873,51 @@ def _listing_bedroom_phrase(listing):
     return f"{beds} bedrooms"
 
 
-def _listing_rent_phrase(listing):
-    price_text = _format_aed(listing.get("price_aed"))
+def _wants_monthly_rent(question=None):
+    return bool(
+        re.search(
+            r"\b(?:monthly|months?)\b",
+            question or "",
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _listing_display_rent(listing, monthly=False):
+    """Return (amount, frequency label) for display."""
+
+    try:
+        amount = float(listing.get("price_aed"))
+    except (TypeError, ValueError):
+        return None, None
+    frequency = str(listing.get("rent_frequency") or "").strip().lower()
+    if monthly and frequency in {"yearly", "year", "annual", "annually", ""}:
+        return amount / 12.0, "month"
+    if monthly and frequency in {"monthly", "month"}:
+        return amount, "month"
+    return amount, frequency or None
+
+
+def _listing_rent_phrase(listing, monthly=False):
+    amount, frequency = _listing_display_rent(listing, monthly=monthly)
+    price_text = _format_aed(amount)
     if not price_text:
         return None
-    frequency = str(listing.get("rent_frequency") or "").strip()
+    if frequency == "month":
+        return f"Rent {price_text} / month"
     if frequency:
         return f"Rent {price_text} {frequency}"
     return f"Rent {price_text}"
 
 
-def _listing_price_clause(listings):
+def _listing_price_clause(listings, monthly=False):
     prices = []
     frequencies = set()
     for listing in listings:
-        price_text = _format_aed(listing.get("price_aed"))
-        if not price_text:
+        amount, frequency = _listing_display_rent(listing, monthly=monthly)
+        if amount is None or not _format_aed(amount):
             continue
-        try:
-            prices.append(float(listing.get("price_aed")))
-        except (TypeError, ValueError):
-            continue
-        frequency = str(listing.get("rent_frequency") or "").strip().lower()
+        prices.append(amount)
         if frequency:
             frequencies.add(frequency)
 
@@ -882,7 +925,8 @@ def _listing_price_clause(listings):
         return ""
 
     if len(frequencies) == 1:
-        label = f"{next(iter(frequencies))} rents"
+        freq = next(iter(frequencies))
+        label = "monthly rents" if freq == "month" else f"{freq} rents"
     else:
         label = "rents"
 
@@ -893,7 +937,7 @@ def _listing_price_clause(listings):
     return f", with {label} from {low} to {high}"
 
 
-def _listing_answer(listings, structured_summary):
+def _listing_answer(listings, structured_summary, question=None):
     """List rentals in the same shape as a project browse answer."""
 
     total = structured_summary.get("listing_total")
@@ -907,14 +951,34 @@ def _listing_answer(listings, structured_summary):
         place = f" in {named_place}"
     else:
         place = ""
-    price_clause = _listing_price_clause(listings)
+    monthly = _wants_monthly_rent(question)
+    price_clause = _listing_price_clause(listings, monthly=monthly)
     showing_sample = isinstance(total, int) and total > count
+    wants_payment_plan = bool(
+        re.search(
+            r"\b(?:payment\s+plans?|installments?|down\s+payment)\b",
+            question or "",
+            flags=re.IGNORECASE,
+        )
+    )
 
-    if count == 1 and not showing_sample:
+    if wants_payment_plan and count == 1 and not showing_sample:
+        title = listings[0].get("title") or "This listing"
+        intro = (
+            f"ACOT data does not include a payment plan for "
+            f"{title}{place}. It is a rental listing. "
+            "Here is what is on record:"
+        )
+    elif count == 1 and not showing_sample:
         title = listings[0].get("title") or "This listing"
         intro = (
             f"{title} is a rental listing{place}. "
             "Here is what is on record:"
+        )
+    elif wants_payment_plan:
+        intro = (
+            f"ACOT data does not include payment plans for these "
+            f"rental listings{place}. Here is what is on record:"
         )
     elif showing_sample:
         intro = (
@@ -938,7 +1002,7 @@ def _listing_answer(listings, structured_summary):
         details = []
         if repeat_community and listing.get("community"):
             details.append(f"Community {listing.get('community')}.")
-        rent_text = _listing_rent_phrase(listing)
+        rent_text = _listing_rent_phrase(listing, monthly=monthly)
         if rent_text:
             details.append(f"{rent_text}.")
         bedroom_text = _listing_bedroom_phrase(listing)
@@ -966,7 +1030,7 @@ def _build_fast_structured_answer(
     q = (question or "").lower()
     listings = structured_summary.get("listings", []) or []
     if listings:
-        return _listing_answer(listings, structured_summary)
+        return _listing_answer(listings, structured_summary, question)
 
     evidence_listings = structured_summary.get("filter_evidence_listings") or []
     if structured_summary.get("filter_no_match") and evidence_listings:
@@ -1003,7 +1067,7 @@ def _build_fast_structured_answer(
     #
     # `projects` is intentionally empty because no candidate matched the
     # filter. `filter_evidence_projects` contains the previous candidates
-    # so we can explain the result using the real Supabase data.
+    # so we can explain the result using the PostgreSQL data.
     if structured_summary.get("filter_no_match"):
         evidence_projects = (
             structured_summary.get(
@@ -1064,7 +1128,9 @@ def _build_fast_structured_answer(
             term in q
             for term in ("bedroom", "bedrooms")
         )
-        wants_handover = "handover" in q
+        wants_handover = bool(
+            re.search(r"hand[\s-]?over", q)
+        )
         wants_developer = any(
             term in q
             for term in ("developer", "developers")
