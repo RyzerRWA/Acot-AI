@@ -12,7 +12,7 @@ load_dotenv(ROOT / ".env")
 
 API_KEY = os.getenv("SUMMARY_AICREDITS_API_KEY")
 BASE_URL = os.getenv("SUMMARY_AICREDITS_BASE_URL")
-MODEL = os.getenv("SUMMARY_AICREDITS_MODEL", "z-ai/glm-5.3")
+MODEL = os.getenv("SUMMARY_AICREDITS_MODEL", "scaledown/summarize")
 
 if not API_KEY or not BASE_URL:
     raise RuntimeError("Summary AI Credits configuration is missing.")

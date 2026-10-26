@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -36,6 +37,22 @@ from app.subscription.token_usage import (
 # ============================================================
 
 logger = logging.getLogger("acot.api")
+
+# How many full chats may run at once. Each chat still takes several model
+# calls, and those stay capped by AICREDITS_MAX_CONCURRENCY. Past this limit
+# the API answers "busy" in a couple of seconds instead of holding the
+# client until the 110s stream abort.
+_CHAT_LIMIT = int(os.getenv("ACOT_MAX_INFLIGHT_CHATS", "40"))
+_CHAT_ADMIT_TIMEOUT = float(os.getenv("ACOT_CHAT_ADMIT_TIMEOUT_SECONDS", "2"))
+_BUSY_MESSAGE = "ACOT is busy right now, please try again in a moment."
+_chat_slots = None
+
+
+def _chat_gate():
+    global _chat_slots
+    if _chat_slots is None:
+        _chat_slots = asyncio.Semaphore(_CHAT_LIMIT)
+    return _chat_slots
 
 
 @asynccontextmanager
@@ -424,8 +441,6 @@ def health_check():
 @app.post("/api/ask")
 async def ask_endpoint(request: AskRequest):
 
-    use_request_collector(request.session_id)
-    reset_tokens()
     question = request.question.strip()
 
     # --------------------------------------------------------
@@ -438,6 +453,20 @@ async def ask_endpoint(request: AskRequest):
             status_code=400,
             detail="Question cannot be empty."
         )
+
+    try:
+        await asyncio.wait_for(
+            _chat_gate().acquire(),
+            timeout=_CHAT_ADMIT_TIMEOUT,
+        )
+    except TimeoutError:
+        raise HTTPException(
+            status_code=503,
+            detail=_BUSY_MESSAGE,
+        )
+
+    use_request_collector(request.session_id)
+    reset_tokens()
 
     try:
 
@@ -510,6 +539,9 @@ async def ask_endpoint(request: AskRequest):
             detail=f"ACOT processing error: {str(exc)}"
         )
 
+    finally:
+        _chat_gate().release()
+
 def _sse_data(payload):
     body = json.dumps(
         payload,
@@ -531,8 +563,20 @@ async def ask_stream_endpoint(request: AskRequest):
         )
 
     async def events():
-        use_request_collector(request.session_id)
         try:
+            await asyncio.wait_for(
+                _chat_gate().acquire(),
+                timeout=_CHAT_ADMIT_TIMEOUT,
+            )
+        except TimeoutError:
+            yield _sse_data({
+                "type": "error",
+                "message": _BUSY_MESSAGE,
+            })
+            return
+
+        try:
+            use_request_collector(request.session_id)
             reset_tokens()
             components = get_session_components(
                 request.session_id
@@ -553,11 +597,29 @@ async def ask_stream_endpoint(request: AskRequest):
                     # Only chatbot (ask) tokens count against the subscription.
                     # Snapshot before build_ai_summary so summary LLM usage is excluded.
                     chat_tokens = get_tokens()
-                    data["ai_summary"] = await build_ai_summary(
-                        question=question,
-                        response=data,
-                        ai_analysis_engine=components["ai_analysis_engine"],
-                    )
+                    # Send the answer first. Listing and search questions get an
+                    # empty summary with no model call. Comparison, ranking,
+                    # analysis, and investment still wait for the score, because
+                    # that score is part of the saved answer.
+                    question_type = data.get("question_type") or ""
+                    if question_type not in {
+                        "comparison",
+                        "ranking",
+                        "analysis",
+                        "investment",
+                    }:
+                        data["ai_summary"] = {
+                            "data": data.get("data") if isinstance(data.get("data"), dict) else {},
+                            "data_description": {},
+                            "acot_recommendation": {},
+                            "acot_score": None,
+                        }
+                    else:
+                        data["ai_summary"] = await build_ai_summary(
+                            question=question,
+                            response=data,
+                            ai_analysis_engine=components["ai_analysis_engine"],
+                        )
                     data = _slim_stream_response(data)
                     yield _sse_data({
                         "type": "done",
@@ -602,6 +664,7 @@ async def ask_stream_endpoint(request: AskRequest):
             )
         finally:
             release_request_collector()
+            _chat_gate().release()
 
     return StreamingResponse(
         events(),
