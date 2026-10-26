@@ -30,12 +30,13 @@ def fetch(sql: str, params: tuple = ()) -> list[dict]:
     """Run a SELECT; each row comes back as a plain JSON-style dict (numbers, ISO-string
     timestamps), the same shapes the previous REST client returned. Embeddings are dropped."""
     with _get_pool().connection() as conn:
-        return [row[0] for row in conn.execute(f"select to_jsonb(r) - 'embedding' from ({sql}) r", params)]
+        # no parameters -> no placeholder parsing, so a literal % (ILIKE '%x%') is safe
+        return [row[0] for row in conn.execute(f"select to_jsonb(r) - 'embedding' from ({sql}) r", params or None)]
 
 
 def execute(sql: str, params: tuple = ()) -> None:
     with _get_pool().connection() as conn:
-        conn.execute(sql, params)
+        conn.execute(sql, params or None)
 
 
 def match(function: str, embedding, threshold: float, count: int) -> list[dict]:

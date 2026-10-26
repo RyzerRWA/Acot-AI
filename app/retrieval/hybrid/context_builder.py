@@ -411,6 +411,7 @@ class HybridContextBuilder:
         # ========================================================
 
         if communities:
+            communities = communities[:12]
             context_parts.extend([
                 "COMMUNITIES",
                 "",
