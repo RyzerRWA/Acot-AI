@@ -171,6 +171,36 @@ def test_handover_follow_up_stays_on_the_current_projects():
     assert "projects" in scope
 
 
+def test_family_community_question_is_a_catalog_lookup():
+    question = "Which communities suit families?"
+    plan = _planner()._rule_plan(question)
+    assert HybridRetriever._asks_for_catalog(question)
+    ranked = HybridRetriever._prefer_matching_communities(
+        [
+            {"name": "Business Bay", "knowledge_text": "Offices and towers."},
+            {
+                "name": "Arabian Ranches",
+                "knowledge_text": "Villas and family communities with schools.",
+            },
+        ],
+        question,
+    )
+    assert ranked[0]["name"] == "Arabian Ranches"
+    assert plan.needs_structured_data is True
+
+
+def test_yield_community_question_keeps_projects():
+    question = "Best communities for rental yield"
+    plan = _planner()._rule_plan(question)
+    scope = HybridRetriever._requested_data_scope(
+        question,
+        query_plan=plan,
+    )
+    assert plan.intent == "investment"
+    assert "communities" in scope
+    assert "projects" in scope
+
+
 def test_bedroom_follow_up_skips_fast_path():
     question = "Which of these have 2-bedroom options?"
     plan = _planner()._rule_plan(question)
