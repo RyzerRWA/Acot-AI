@@ -13,6 +13,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from app.listings.agent import ListingAgent, ListingsUnavailable
+from app.listings.router import is_rent_question
+
 
 # =========================================================
 # SUPABASE STRUCTURED RETRIEVER
@@ -136,7 +139,16 @@ def initialize_acot():
         llm_client=query_planner._llm_client
     )
 
+    # Rental listings (scraped data in PostgreSQL) have their own agent; if it cannot start,
+    # the rest of ACOT still works and rental questions fall back to the normal pipeline.
+    try:
+        listing_agent = ListingAgent()
+    except Exception as exc:
+        print(f"Listings agent unavailable: {exc}")
+        listing_agent = None
+
     return {
+        "listing_agent": listing_agent,
         "structured_retriever": structured_retriever,
         "query_planner": query_planner,
         "entity_resolver": entity_resolver,
@@ -1716,10 +1728,103 @@ def _finalize_acot_turn(prepared, answer, answer_started):
     return response
 
 
+# =========================================================
+# RENTAL LISTINGS TURN
+# =========================================================
+
+_LISTING_CHIPS = (
+    "What is the average rent for a 2 bedroom in Dubai Marina?",
+    "Show me the cheapest studios in JVC",
+    "Compare 1 bedroom rents in Business Bay and Downtown Dubai",
+    "Furnished 3 bedroom villas under 250,000 a year",
+)
+
+
+def _wants_listings(question, components):
+    if components.get("listing_agent") is None:
+        return False
+    turns = getattr(components["conversation_memory"], "turns", None) or []
+    last_type = turns[-1].get("question_type") if turns and isinstance(turns[-1], dict) else None
+    return is_rent_question(question, last_type)
+
+
+def _memory_history(memory, limit=4):
+    history = []
+    for turn in (getattr(memory, "turns", None) or [])[-limit:]:
+        if isinstance(turn, dict):
+            if turn.get("user_question"):
+                history.append({"role": "user", "content": turn["user_question"]})
+            if turn.get("answer"):
+                history.append({"role": "assistant", "content": turn["answer"]})
+    return history
+
+
+def _run_listing_agent(question, components):
+    """Run the listings agent; a failure becomes a readable answer, never an exception."""
+    started = time.perf_counter()
+    try:
+        result = components["listing_agent"].answer(
+            question, _memory_history(components["conversation_memory"])
+        )
+        return result.answer, result.cards, result.tools, _elapsed_ms(started)
+    except ListingsUnavailable:
+        message = "I can't reach the rental data right now. Please try again in a moment."
+    except Exception:
+        message = "Something went wrong while looking that up. Please try again."
+    return message, [], [], _elapsed_ms(started)
+
+
+def _finalize_listing_turn(question, answer, cards, tools, ms, components):
+    components["conversation_memory"].update(
+        user_question=question,
+        standalone_question=question,
+        answer=answer,
+        retrieval_result={
+            "question_type": "listings",
+            "structured_data": {"community": [], "projects": [], "sub_communities": []},
+            "documents": [],
+        },
+        question_type="listings",
+    )
+    return {
+        "status": "success",
+        "response_type": "listing_list" if cards else "listing_answer",
+        "question": question,
+        "standalone_question": question,
+        "question_type": "listings",
+        "answer": answer,
+        "data": {
+            "communities": [],
+            "projects": [],
+            "sub_communities": [],
+            "documents": [],
+            "listings": cards,
+            "investment_analysis": None,
+        },
+        "meta": {
+            "counts": {"communities": 0, "projects": 0, "sub_communities": 0, "documents": 0, "listings": len(cards)},
+            "timing_ms": {"listings": ms, "ask": ms},
+            "tools": tools,
+        },
+    }
+
+
+def _listing_followups(question, components):
+    asked = {_normalize_chat_text(question)}
+    for turn in getattr(components["conversation_memory"], "turns", None) or []:
+        if isinstance(turn, dict):
+            asked.add(_normalize_chat_text(turn.get("user_question") or ""))
+    return [chip for chip in _LISTING_CHIPS if _normalize_chat_text(chip) not in asked][:3]
+
+
 def ask_acot(
     question,
     components
 ):
+    if _wants_listings(question, components):
+        answer, cards, tools, ms = _run_listing_agent(question, components)
+        return _finalize_listing_turn(question, answer, cards, tools, ms, components)
+
     prepared = _prepare_acot_turn(
         question,
         components
@@ -1922,6 +2027,18 @@ def stream_acot(
     them like a typewriter. Model answers keep the provider's own tokens.
     Memory is updated only after the full answer is assembled.
     """
+
+    if _wants_listings(question, components):
+        yield ("meta", {"type": "meta", "sources": []})
+        answer, cards, tools, ms = _run_listing_agent(question, components)
+        for piece in _iter_typewriter_pieces(answer):
+            yield ("delta", {"type": "delta", "text": piece})
+            time.sleep(0.02)
+        followups = _listing_followups(question, components)
+        if followups:
+            yield ("followups", {"type": "followups", "questions": followups})
+        yield ("done", _finalize_listing_turn(question, answer, cards, tools, ms, components))
+        return
 
     with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
         prepared = _prepare_acot_turn(

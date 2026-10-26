@@ -347,10 +347,15 @@ def ask_endpoint(request: AskRequest):
         # ----------------------------------------------------
 
         summary_started = time.perf_counter()
-        response["ai_summary"] = build_ai_summary(
-            question=question,
-            response=response,
-            ai_analysis_engine=components["ai_analysis_engine"],
+        # the ACOT score rates projects; rental-listing answers have none
+        response["ai_summary"] = (
+            None
+            if response.get("question_type") == "listings"
+            else build_ai_summary(
+                question=question,
+                response=response,
+                ai_analysis_engine=components["ai_analysis_engine"],
+            )
         )
 
         timing = response.setdefault("meta", {}).setdefault("timing_ms", {})
@@ -412,10 +417,14 @@ def ask_stream_endpoint(request: AskRequest):
 
                 if event_name == "done" and isinstance(data, dict):
                     data = dict(data)
-                    data["ai_summary"] = build_ai_summary(
-                        question=question,
-                        response=data,
-                        ai_analysis_engine=components["ai_analysis_engine"],
+                    data["ai_summary"] = (
+                        None
+                        if data.get("question_type") == "listings"
+                        else build_ai_summary(
+                            question=question,
+                            response=data,
+                            ai_analysis_engine=components["ai_analysis_engine"],
+                        )
                     )
                     data = _slim_stream_response(data)
                     yield _sse_data({
