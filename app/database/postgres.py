@@ -1,4 +1,4 @@
-"""Single PostgreSQL access point for the ACOT AI service (replaces the Supabase clients)."""
+"""Single PostgreSQL access point for the ACOT AI service (PostgreSQL access layer)."""
 import os
 from pathlib import Path
 
@@ -28,7 +28,7 @@ def _get_pool() -> ConnectionPool:
 
 def fetch(sql: str, params: tuple = ()) -> list[dict]:
     """Run a SELECT; each row comes back as a plain JSON-style dict (numbers, ISO-string
-    timestamps), the same shapes the old Supabase REST client returned. Embeddings are dropped."""
+    timestamps), the same shapes the previous REST client returned. Embeddings are dropped."""
     with _get_pool().connection() as conn:
         # no parameters -> no placeholder parsing, so a literal % (ILIKE '%x%') is safe
         return [row[0] for row in conn.execute(f"select to_jsonb(r) - 'embedding' from ({sql}) r", params or None)]

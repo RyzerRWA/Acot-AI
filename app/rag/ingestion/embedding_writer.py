@@ -1,11 +1,16 @@
 from app.database.postgres import execute
+from app.database.postgres_client import PostgresClient
 
 
 # =========================================================
 # POSTGRES EMBEDDING WRITER
 # =========================================================
 
-class SupabaseEmbeddingWriter:
+class EmbeddingWriter:
+
+    def __init__(self):
+
+        self.db = PostgresClient()
 
     # =========================================================
     # PROJECT
@@ -182,7 +187,7 @@ class SupabaseEmbeddingWriter:
             )
 
         # -----------------------------------------------------
-        # Insert into Supabase document_chunks
+        # Insert into document_chunks
         # -----------------------------------------------------
 
         execute(

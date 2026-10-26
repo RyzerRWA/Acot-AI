@@ -31,7 +31,23 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
 from app.retrieval.hybrid.entity_resolver import EntityResolver
+from app.retrieval.hybrid.catalog_turns import retrieve_catalog
+from app.retrieval.hybrid.listing_turns import (
+    asks_payment_plan,
+    payment_plan_subject,
+    previous_listing_comparison,
+    retrieve_bedroom_comparison,
+    retrieve_listing_by_title_result,
+    retrieve_listing_comparison,
+    retrieve_listing_title_comparison,
+    retrieve_listings,
+    shown_listing_followup,
+)
 from app.retrieval.hybrid.question_text import (
+    asks_for_listings,
+    bedroom_rental_pair,
+    catalog_request,
+    comparison_pair,
     display_phrase,
     interpret_search,
     is_group_attribute_question,
@@ -69,7 +85,7 @@ class HybridRetriever:
 
     Responsibilities:
         1. Plan the query
-        2. Resolve real entities from Supabase
+        2. Resolve real entities from PostgreSQL
         3. Retrieve structured PostgreSQL data
         4. Retrieve pgvector documents only when required
         5. Apply supported user filters
@@ -226,14 +242,9 @@ class HybridRetriever:
         #   Compare A vs B
         #   Compare A versus B
         #   Compare A & B
-        match = re.search(
-            r"^\s*compare\s+(.+?)\s+(?:and|vs\.?|versus|&)\s+(.+?)\s*$",
-            q,
-            flags=re.IGNORECASE,
-        )
-        if match:
-            extracted = [match.group(1).strip(), match.group(2).strip()]
-            for value in extracted:
+        pair = comparison_pair(q)
+        if pair:
+            for value in pair:
                 if value and value not in candidates:
                     candidates.append(value)
 
@@ -569,7 +580,7 @@ class HybridRetriever:
         self,
         sub_community_name: str,
     ) -> Dict[str, Any]:
-        """Retrieve sub-community records from the current schema."""
+        """Retrieve projects and rental listings for a sub-community / cluster."""
         if not self.structured_retriever:
             return self._empty_structured_result()
 
@@ -578,11 +589,31 @@ class HybridRetriever:
                 "select * from sub_communities where name ilike %s limit 1000",
                 (f"%{sub_community_name}%",),
             )
+            projects = fetch(
+                "select * from projects where sub_community ilike %s limit 1000",
+                (f"%{sub_community_name}%",),
+            )
+            listings = fetch(
+                "select listing_id, title, purpose, property_type, category, "
+                "beds, baths, size_sqft, price_aed, rent_frequency, furnishing, "
+                "completion_status, community, sub_community, location, "
+                "agency_name, cover_photo, image_urls, url "
+                "from listings "
+                "where sub_community ilike %s "
+                "order by price_aed asc nulls last "
+                "limit 50",
+                (f"%{sub_community_name}%",),
+            )
 
             return {
                 "communities": [],
-                "projects": [],
-                "sub_communities": sub_communities,
+                "projects": projects or [],
+                "sub_communities": sub_communities or [],
+                "listings": listings or [],
+                "listing_query": bool(listings),
+                "listing_total": len(listings or []),
+                "understood_subject": sub_community_name,
+                "understood_kind": "listing" if listings else "place",
             }
         except Exception as exc:
             print("Sub-community retrieval error:", exc)
@@ -777,6 +808,23 @@ class HybridRetriever:
                     TypeError,
                     ValueError,
                 ):
+                    continue
+
+            # ----------------------------------------------------
+            # HANDOVER YEAR
+            # ----------------------------------------------------
+
+            handover_year = (
+                filters.get("handover_year")
+                if filters
+                else None
+            )
+
+            if handover_year is not None:
+                handover_text = str(
+                    project.get("handover_time") or ""
+                )
+                if str(handover_year) not in handover_text:
                     continue
 
             filtered.append(
@@ -992,7 +1040,7 @@ class HybridRetriever:
                 or {}
             )
 
-            # `SupabaseStructuredRetriever.retrieve()` returns the
+            # `StructuredRetriever.retrieve()` returns the
             # community collection under `community`. Keep accepting
             # `communities` too so the retrieval layer stays compatible
             # with older callers.
@@ -1099,24 +1147,9 @@ class HybridRetriever:
 
         q = question.lower()
         structured_terms = (
-            "price",
-            "prices",
-            "cost",
-            "rent",
-            "rental price",
-            "bedroom",
-            "bedrooms",
-            "size",
-            "area",
-            "sqft",
-            "square foot",
-            "developer",
-            "handover",
-            "status",
-            "projects",
-            "project",
-            "properties",
-            "property",
+            ["price","prices","cost","rent","rental price","bedroom","bedrooms","size",
+            "area","sqft","square foot","developer","handover","status","projects",
+            "project","properties","property",]
         )
         return any(term in q for term in structured_terms)
 
@@ -1132,6 +1165,9 @@ class HybridRetriever:
             ),
             "projects": result.get("projects", []) or [],
             "sub_communities": result.get("sub_communities", []) or [],
+            "listings": result.get("listings", []) or [],
+            "listing_query": bool(result.get("listing_query", False)),
+            "listing_total": result.get("listing_total"),
             "comparison": bool(result.get("comparison", False)),
             "comparison_entities": (
                 result.get("comparison_entities", []) or []
@@ -1145,10 +1181,17 @@ class HybridRetriever:
             "filter_evidence_projects": (
                 result.get("filter_evidence_projects", []) or []
             ),
+            "filter_evidence_listings": (
+                result.get("filter_evidence_listings", []) or []
+            ),
             "understood_subject": result.get("understood_subject") or None,
             "understood_kind": result.get("understood_kind") or None,
             "closest_match": result.get("closest_match") or None,
             "ambiguous_label": result.get("ambiguous_label") or None,
+            "catalog": bool(result.get("catalog", False)),
+            "catalog_place": result.get("catalog_place") or None,
+            "project_total": result.get("project_total"),
+            "community_total": result.get("community_total"),
         }
 
     @staticmethod
@@ -1291,6 +1334,11 @@ class HybridRetriever:
                 if "sub_communities" in allowed
                 else []
             ),
+            "listings": structured_result.get("listings", []) or [],
+            "listing_query": bool(
+                structured_result.get("listing_query", False)
+            ),
+            "listing_total": structured_result.get("listing_total"),
             "comparison": bool(
                 structured_result.get("comparison", False)
             ),
@@ -1307,6 +1355,9 @@ class HybridRetriever:
                 )
                 or []
             ),
+            "filter_evidence_listings": (
+                structured_result.get("filter_evidence_listings", []) or []
+            ),
             "understood_subject": (
                 structured_result.get("understood_subject") or None
             ),
@@ -1319,6 +1370,10 @@ class HybridRetriever:
             "ambiguous_label": (
                 structured_result.get("ambiguous_label") or None
             ),
+            "catalog": bool(structured_result.get("catalog", False)),
+            "catalog_place": structured_result.get("catalog_place") or None,
+            "project_total": structured_result.get("project_total"),
+            "community_total": structured_result.get("community_total"),
         }
 
     # ============================================================
@@ -1470,16 +1525,28 @@ class HybridRetriever:
                 developer_name=shape.get("developer"),
                 community_name=community_name,
             )
+            # Empty shaped results must fall through to entity resolution
+            # (e.g. "suggest me projects in jvc to invest").
+            if not projects:
+                return None
             return self._project_result(projects)
 
         if kind == "developer":
-            return self._retrieve_by_developer(shape.get("developer") or "")
+            developer = (shape.get("developer") or "").strip()
+            if not developer or re.fullmatch(r"20\d{2}", developer):
+                return None
+            result = self._retrieve_by_developer(developer)
+            if not (result.get("projects") or []):
+                return None
+            return result
 
         if kind == "community":
             community_name = self._canonical_community(
                 shape.get("community") or "",
                 resolved_entity=resolved_entity,
             )
+            if not community_name or re.fullmatch(r"20\d{2}", community_name):
+                return None
             projects = self._filtered_projects(community_name=community_name)
             if not projects:
                 return None
@@ -1520,7 +1587,7 @@ class HybridRetriever:
         return self._retrieve_by_project(resolved_name)
 
     def _annotate_miss(self, result: Dict[str, Any], shape: Dict[str, Any]):
-        if result.get("projects"):
+        if result.get("listing_query") or result.get("projects"):
             return result
 
         subject, kind = subject_for(shape or {})
@@ -1575,11 +1642,19 @@ class HybridRetriever:
                 or []
             )
 
+            # Only prior PROJECT shortlists can drive multi-project /
+            # investment follow-ups. Listing titles from a Spots-style
+            # browse must not be looked up as project names when the user
+            # later asks "suggest projects in JVC to invest".
             candidate_names = [
                 str(item.get("name")).strip()
                 for item in active_candidates
                 if isinstance(item, dict)
                 and item.get("name")
+                and str(
+                    item.get("entity_type") or "project"
+                ).strip().lower()
+                == "project"
             ]
 
             question_lower = (question or "").lower()
@@ -1607,32 +1682,30 @@ class HybridRetriever:
             # In these cases the retriever must use ALL previous candidates
             # in the exact order stored by ConversationMemory.
             candidate_list_reference = any(
-    phrase in question_lower
-    for phrase in (
-        "these projects",
-        "those projects",
-        "these properties",
-        "those properties",
-        "these project",
-        "those project",
-        "these property",
-        "those property",
-
-        # IMPORTANT: these survive ConversationMemory rewriting
-        "which of the projects",
-        "which of the properties",
-        "which projects",
-        "which properties",
-        "what are the projects",
-        "what are the properties",
-
-        "which of these",
-        "which ones",
-        "which one",
-        "their",
-        "them",
-    )
-)
+                phrase in question_lower
+                for phrase in (
+                    "these projects",
+                    "those projects",
+                    "these properties",
+                    "those properties",
+                    "these project",
+                    "those project",
+                    "these property",
+                    "those property",
+                    # IMPORTANT: these survive ConversationMemory rewriting
+                    "which of the projects",
+                    "which of the properties",
+                    "which projects",
+                    "which properties",
+                    "what are the projects",
+                    "what are the properties",
+                    "which of these",
+                    "which ones",
+                    "which one",
+                    "their",
+                    "them",
+                )
+            )
             if candidate_names and is_group_attribute_question(question):
                 candidate_list_reference = True
 
@@ -1683,20 +1756,128 @@ class HybridRetriever:
             )
 
             # ----------------------------------------------------
+            # LISTINGS ALREADY ON SCREEN
+            # ----------------------------------------------------
+            shape = interpret_search(question)
+
+            # A fresh shaped place search must not be hijacked by a prior
+            # shortlist just because the question mentions invest/compare.
+            if (
+                wants_multi_project
+                and self._shape_takes_priority(shape)
+                and not candidate_list_reference
+                and not explicit_multi_project_reference
+            ):
+                wants_multi_project = False
+            pair = comparison_pair(question)
+            compared_listings = previous_listing_comparison(
+                question,
+                conversation_context,
+            )
+            shown_listings = None
+            if compared_listings is None:
+                shown_listings = shown_listing_followup(
+                    question,
+                    conversation_context,
+                )
+
+            # ----------------------------------------------------
             # EXPLICIT MULTI-ENTITY COMPARISON
             # ----------------------------------------------------
-            comparison_entities = self._resolve_comparison_entities(
-                question=question,
-                query_plan=query_plan,
-            )
+            if compared_listings is not None or shown_listings is not None:
+                comparison_entities = []
+            else:
+                comparison_entities = self._resolve_comparison_entities(
+                    question=question,
+                    query_plan=query_plan,
+                )
 
             explicit_multi_entity_comparison = (
                 len(comparison_entities) >= 2
             )
 
-            shape = interpret_search(question)
+            bedroom_pair = bedroom_rental_pair(question)
+            if compared_listings is None and bedroom_pair:
+                print("\n================================")
+                print("BEDROOM LISTING COMPARISON")
+                print("================================")
+                compared_listings = retrieve_bedroom_comparison(
+                    self.structured_retriever.db,
+                    bedroom_pair[:2],
+                    bedroom_pair[2],
+                )
 
-            if explicit_multi_entity_comparison:
+            # Compare two pasted listing titles even when the question
+            # also says "invest" / does not say "rental".
+            if compared_listings is None and pair:
+                titled = retrieve_listing_title_comparison(pair)
+                if titled is not None:
+                    print("\n================================")
+                    print("LISTING TITLE COMPARISON")
+                    print("================================")
+                    compared_listings = titled
+
+            if compared_listings is None and pair and asks_for_listings(question):
+                print("\n================================")
+                print("LISTING COMPARISON")
+                print("================================")
+                compared_listings = retrieve_listing_comparison(
+                    self.structured_retriever.db,
+                    filters or {},
+                    pair,
+                )
+
+            # Payment-plan ask about a pasted listing title.
+            named_listing = None
+            if compared_listings is None and asks_payment_plan(question):
+                subject = (
+                    payment_plan_subject(question)
+                    or (shape or {}).get("mentioned_name")
+                    or ""
+                ).strip()
+                if subject:
+                    named_listing = retrieve_listing_by_title_result(subject)
+                    if named_listing is not None:
+                        print("\n================================")
+                        print("LISTING TITLE LOOKUP")
+                        print("================================")
+
+            result = None
+
+            if compared_listings is not None:
+
+                result = compared_listings
+
+            elif shown_listings is not None:
+
+                result = shown_listings
+
+            elif named_listing is not None:
+
+                result = named_listing
+
+            elif catalog_request(question):
+
+                print("\n================================")
+                print("CATALOG BROWSE")
+                print("================================")
+                result = retrieve_catalog(
+                    self.structured_retriever.db,
+                    catalog_request(question),
+                )
+
+            elif asks_for_listings(question):
+
+                print("\n================================")
+                print("LISTING SEARCH")
+                print("================================")
+                result = retrieve_listings(
+                    self.structured_retriever.db,
+                    question,
+                    filters or {},
+                )
+
+            elif explicit_multi_entity_comparison:
 
                 print("\n================================")
                 print("MULTI-ENTITY COMPARISON")
@@ -1783,6 +1964,13 @@ class HybridRetriever:
                     )
                 elif (
                     resolved_entity
+                    and resolved_entity.entity_type == "sub_community"
+                ):
+                    result = self._retrieve_by_sub_community(
+                        resolved_entity.name
+                    )
+                elif (
+                    resolved_entity
                     and resolved_entity.entity_type == "community"
                 ):
                     result = self._retrieve_by_community(
@@ -1803,11 +1991,15 @@ class HybridRetriever:
                         resolved_entity.name
                     )
                 else:
-                    result = self._empty_structured_result()
+                    # Empty shaped browse must not block year/investment defaults.
+                    result = None
 
             # ----------------------------------------------------
             # PROJECT
             # ----------------------------------------------------
+
+            if result is not None:
+                pass
 
             elif (
                 resolved_entity
@@ -1819,6 +2011,23 @@ class HybridRetriever:
                 result = self._retrieve_project_family(
                     shape,
                     resolved_entity.name,
+                )
+
+            # ----------------------------------------------------
+            # SUB-COMMUNITY
+            # ----------------------------------------------------
+
+            elif (
+                resolved_entity
+                and
+                resolved_entity.entity_type
+                == "sub_community"
+            ):
+
+                result = (
+                    self._retrieve_by_sub_community(
+                        resolved_entity.name
+                    )
                 )
 
             # ----------------------------------------------------
@@ -1873,10 +2082,37 @@ class HybridRetriever:
                 )
 
             else:
-
-                result = (
-                    self._empty_structured_result()
+                # No place name: still answer year / investment asks.
+                intent = (
+                    str(getattr(query_plan, "intent", "") or "").lower()
+                    if query_plan is not None
+                    else ""
                 )
+                handover_year = (
+                    (filters or {}).get("handover_year")
+                )
+                if handover_year is not None:
+                    try:
+                        year_projects = fetch(
+                            "select * from projects "
+                            "where handover_time::text ilike %s "
+                            "limit 1000",
+                            (f"%{handover_year}%",),
+                        )
+                        result = {
+                            "communities": [],
+                            "projects": year_projects or [],
+                            "sub_communities": [],
+                        }
+                    except Exception as exc:
+                        print("Handover-year retrieval error:", exc)
+                        result = self._empty_structured_result()
+                elif intent == "investment":
+                    result = self._retrieve_by_city("Dubai")
+                else:
+                    result = (
+                        self._empty_structured_result()
+                    )
 
             self._annotate_miss(result, shape)
 
@@ -1890,33 +2126,34 @@ class HybridRetriever:
             # APPLY FILTERS
             # ----------------------------------------------------
 
-            original_projects = list(
-                result.get("projects", []) or []
-            )
+            if not result.get("listing_query"):
+                original_projects = list(
+                    result.get("projects", []) or []
+                )
 
-            filtered_projects = self._apply_project_filters(
-                original_projects,
-                filters,
-            )
+                filtered_projects = self._apply_project_filters(
+                    original_projects,
+                    filters,
+                )
 
-            # For a conversational candidate-list follow-up, keep the
-            # original projects as evidence when the requested filter
-            # matches none of them. The actual `projects` collection stays
-            # filtered (empty), so downstream data is never presented as a
-            # false match.
-            filter_no_match = (
-                bool(original_projects)
-                and not filtered_projects
-                and bool(filters)
-                and wants_multi_project
-                and not explicit_multi_entity_comparison
-            )
+                # For a conversational candidate-list follow-up, keep the
+                # original projects as evidence when the requested filter
+                # matches none of them. The actual `projects` collection stays
+                # filtered (empty), so downstream data is never presented as a
+                # false match.
+                filter_no_match = (
+                    bool(original_projects)
+                    and not filtered_projects
+                    and bool(filters)
+                    and wants_multi_project
+                    and not explicit_multi_entity_comparison
+                )
 
-            result["projects"] = filtered_projects
-            result["filter_no_match"] = filter_no_match
-            result["filter_evidence_projects"] = (
-                original_projects if filter_no_match else []
-            )
+                result["projects"] = filtered_projects
+                result["filter_no_match"] = filter_no_match
+                result["filter_evidence_projects"] = (
+                    original_projects if filter_no_match else []
+                )
 
             # A community lookup may internally fetch its projects and
             # sub-communities so the hierarchy is available. Do not pass
@@ -1986,7 +2223,7 @@ class HybridRetriever:
     # MAIN RETRIEVAL
     # ============================================================
 
-    def retrieve(
+    async def retrieve(
         self,
         question: str,
         community_name: Optional[str] = None,
@@ -2011,7 +2248,7 @@ class HybridRetriever:
         try:
 
             query_plan = (
-                self.query_planner.plan(
+                await self.query_planner.plan(
                     question,
                     conversation_context=
                         conversation_context,
@@ -2044,7 +2281,9 @@ class HybridRetriever:
         entity_started = time.perf_counter()
         resolved_entity = None
 
-        if self.entity_resolver:
+        browsing = catalog_request(question)
+
+        if self.entity_resolver and not browsing:
 
             try:
 
@@ -2175,7 +2414,7 @@ class HybridRetriever:
             # If the user asks for database fields such as price, bedrooms,
             # projects, developers, handover, etc., do not call pgvector
             # unless the question explicitly asks for document/brochure data.
-            # This prevents unnecessary Supabase document RPC calls for
+            # This prevents unnecessary PostgreSQL document RPC calls for
             # questions such as: "Which of these have 2 bedroom options?"
             if (
                 self._needs_structured_data_from_question(question)
@@ -2259,6 +2498,14 @@ class HybridRetriever:
             if self._needs_structured_data_from_question(question):
                 needs_structured = True
 
+        if asks_for_listings(question) or browsing:
+            needs_structured = True
+            needs_documents = False
+            if browsing and question_type not in {
+                "comparison", "investment", "ranking",
+            }:
+                question_type = "search"
+
         # ========================================================
         # 6. PRINT PIPELINE
         # ========================================================
@@ -2332,7 +2579,7 @@ class HybridRetriever:
             started = time.perf_counter()
             print()
             print(
-                "Retrieving Supabase "
+                "Retrieving PostgreSQL "
                 "PGVector documents..."
             )
             result = self.retrieve_documents(question)
@@ -2374,6 +2621,14 @@ class HybridRetriever:
         sub_communities = (
             structured_result.get(
                 "sub_communities",
+                []
+            )
+            or []
+        )
+
+        listings = (
+            structured_result.get(
+                "listings",
                 []
             )
             or []
@@ -2436,6 +2691,11 @@ class HybridRetriever:
         )
 
         print(
+            f"Listings found: "
+            f"{len(listings)}"
+        )
+
+        print(
             f"Documents found: "
             f"{len(documents)}"
         )
@@ -2455,6 +2715,38 @@ class HybridRetriever:
             "sub_communities":
                 sub_communities,
 
+            "listings":
+                listings,
+
+            "listing_query":
+                bool(
+                    structured_result.get(
+                        "listing_query",
+                        False
+                    )
+                ),
+
+            "listing_total":
+                structured_result.get("listing_total"),
+
+            "catalog":
+                bool(structured_result.get("catalog", False)),
+
+            "catalog_place":
+                structured_result.get("catalog_place"),
+
+            "project_total":
+                structured_result.get("project_total"),
+
+            "community_total":
+                structured_result.get("community_total"),
+
+            "comparison":
+                bool(structured_result.get("comparison", False)),
+
+            "comparison_entities":
+                structured_result.get("comparison_entities", []) or [],
+
             "filter_no_match":
                 bool(
                     structured_result.get(
@@ -2469,6 +2761,12 @@ class HybridRetriever:
                         "filter_evidence_projects",
                         []
                     )
+                    or []
+                ) if needs_structured else [],
+
+            "filter_evidence_listings":
+                (
+                    structured_result.get("filter_evidence_listings", [])
                     or []
                 ) if needs_structured else [],
 
@@ -2587,6 +2885,9 @@ class HybridRetriever:
             "sub_communities":
                 sub_communities,
 
+            "listings":
+                listings,
+
             "documents":
                 documents,
 
@@ -2600,6 +2901,12 @@ class HybridRetriever:
             "filter_evidence_projects":
                 structured_data.get(
                     "filter_evidence_projects",
+                    []
+                ),
+
+            "filter_evidence_listings":
+                structured_data.get(
+                    "filter_evidence_listings",
                     []
                 ),
 
@@ -2629,76 +2936,13 @@ class HybridRetriever:
 
             "brochure",
             "document",
-            "documents",
-
-            "building code",
-            "building codes",
-
-            "requirement",
-            "requirements",
-
-            "regulation",
-            "regulations",
-
-            "law",
-            "laws",
-
-            "safety",
-
-            "security",
-            "security features",
-
-            "guideline",
-            "guidelines",
-
-            "amenities",
-            "amenity",
-
-            "facilities",
-            "facility",
-
-            "features",
-
-            "interior",
-            "interiors",
-
-            "finish",
-            "finishes",
-
-            "kitchen",
-            "appliances",
-
-            "views",
-            "view",
-
-            "floor plan",
-            "floor plans",
-
-            "layout",
-            "layouts",
-
-            "dimensions",
-
-            "clubhouse",
-            "pool",
-            "gym",
-            "cinema",
-            "lobby",
-
-            "surveillance",
-
-            "balcony",
-            "bathroom",
-
-            "smart home",
-            "smart wc",
-
-            "concierge",
-            "valet",
-
-            "sauna",
-            "steam",
-        ]
+            "documents",  "building code", "building codes","requirement","requirements",
+            "regulation","regulations","law","laws","safety","security","security features",
+            "guideline","guidelines","amenities","amenity", "facilities","facility","features",
+            "interior","interiors","finish","finishes","kitchen","appliances","views","view",
+            "floor plan","floor plans","layout","layouts","dimensions","clubhouse","pool",
+            "gym","cinema","lobby","surveillance","balcony",
+            "bathroom","smart home","smart wc","concierge","valet","sauna","steam",]
 
         return any(
             term in q

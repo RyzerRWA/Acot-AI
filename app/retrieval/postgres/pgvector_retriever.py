@@ -3,7 +3,7 @@ from app.rag.embeddings.embedding_model import EmbeddingModel
 from app.database.postgres import match
 
 
-class SupabasePGVectorRetriever:
+class PGVectorRetriever:
     """
     Semantic retriever over PostgreSQL (cosine similarity in SQL).
 

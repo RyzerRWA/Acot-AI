@@ -103,7 +103,7 @@ def analyze_questions(user_id: str) -> dict:
     rows = fetch(
         "select * from public.get_user_questions(%s)",
         (user_id,),
-    )
+    ) or []
 
     all_conversations = {
         row["conversation_id"] for row in rows

@@ -13,23 +13,12 @@ class RelevanceFilter:
         # -----------------------------
 
         investment_keywords = [
-            "investment",
-            "roi",
-            "return",
-            "market",
-            "growth",
-            "trend",
-            "opportunity"
+            "investment","roi","return","market","growth","trend","opportunity"
         ]
 
         building_keywords = [
-            "building",
-            "safety",
-            "code",
-            "construction",
-            "requirements"
+            "building","safety","code","construction","requirements"
         ]
-
 
         # -----------------------------
         # DETECT QUESTION TYPE

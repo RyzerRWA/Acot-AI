@@ -1,10 +1,11 @@
+import asyncio
 import os
 import re
 import io
 import time
 import json
 from contextlib import redirect_stdout, redirect_stderr
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 # =========================================================
@@ -18,20 +19,20 @@ from app.listings.router import is_rent_question
 
 
 # =========================================================
-# SUPABASE STRUCTURED RETRIEVER
+# POSTGRES STRUCTURED RETRIEVER
 # =========================================================
 
-from app.retrieval.supabase.structured_retriever import (
-    SupabaseStructuredRetriever
+from app.retrieval.postgres.structured_retriever import (
+    StructuredRetriever
 )
 
 
 # =========================================================
-# SUPABASE PGVECTOR RETRIEVER
+# POSTGRES PGVECTOR RETRIEVER
 # =========================================================
 
-from app.retrieval.supabase.pgvector_retriever import (
-    SupabasePGVectorRetriever
+from app.retrieval.postgres.pgvector_retriever import (
+    PGVectorRetriever
 )
 
 
@@ -52,6 +53,7 @@ from app.retrieval.hybrid.entity_resolver import (
     EntityResolver
 )
 from app.retrieval.hybrid.question_text import (
+    asks_for_listings,
     collapse_stretched_letters,
     prepare_user_question,
 )
@@ -108,7 +110,7 @@ from app.memory.conversation_memory import (
 
 def initialize_acot():
 
-    structured_retriever = SupabaseStructuredRetriever()
+    structured_retriever = StructuredRetriever()
 
     query_planner = QueryPlanner()
 
@@ -116,7 +118,7 @@ def initialize_acot():
         structured_retriever
     )
 
-    pgvector_retriever = SupabasePGVectorRetriever(
+    pgvector_retriever = PGVectorRetriever(
         match_threshold=0.5,
         match_count=5
     )
@@ -162,19 +164,19 @@ def initialize_acot():
 
 
 # =========================================================
-# PRINT STRUCTURED SUPABASE DATA
+# PRINT STRUCTURED POSTGRES DATA
 # =========================================================
 
 def print_structured_data(structured_data):
 
     print("\n================================")
-    print("SUPABASE POSTGRES DATA")
+    print("POSTGRES DATA")
     print("================================")
 
 
     if not structured_data:
 
-        print("No structured Supabase data.")
+        print("No structured PostgreSQL data.")
 
         return
 
@@ -403,13 +405,13 @@ def print_structured_data(structured_data):
 def print_pgvector_data(documents):
 
     print("\n================================")
-    print("SUPABASE PGVECTOR DATA")
+    print("POSTGRES PGVECTOR DATA")
     print("================================")
 
 
     if not documents:
 
-        print("No Supabase PGVector document results.")
+        print("No PostgreSQL pgvector document results.")
 
         return
 
@@ -585,893 +587,18 @@ def print_entity_resolution(entity):
 # FRONTEND-READY RESPONSE FORMATTER
 # =========================================================
 
-def _json_safe(value):
-    """
-    Convert backend/database values into JSON-safe Python values.
-
-    This keeps the existing retrieval data untouched while making the
-    final response safe for a REST API or frontend client.
-    """
-
-    if value is None:
-        return None
-
-    if isinstance(value, (str, int, float, bool)):
-        return value
-
-    if isinstance(value, (list, tuple)):
-        return [
-            _json_safe(item)
-            for item in value
-        ]
-
-    if isinstance(value, dict):
-        return {
-            str(key): _json_safe(item)
-            for key, item in value.items()
-        }
-
-    # Handles Decimal, datetime, UUID, and other database values.
-    return str(value)
-
-
-def _format_bedrooms(record):
-    """
-    Return the bedroom range exactly from the available project data.
-    """
-
-    minimum = record.get("bedroom_min")
-    maximum = record.get("bedroom_max")
-
-    if minimum is None and maximum is None:
-        return None
-
-    if minimum is None:
-        return str(maximum)
-
-    if maximum is None:
-        return str(minimum)
-
-    if minimum == maximum:
-        return str(minimum)
-
-    return f"{minimum}-{maximum}"
-
-
-def _bedroom_bounds(project):
-    minimum = project.get("bedroom_min")
-    maximum = project.get("bedroom_max")
-    bedrooms = project.get("bedrooms")
-
-    if isinstance(bedrooms, dict):
-        if minimum is None:
-            minimum = bedrooms.get("min")
-        if maximum is None:
-            maximum = bedrooms.get("max")
-
-    return minimum, maximum
-
-
-def _format_bedroom_phrase(project):
-    minimum, maximum = _bedroom_bounds(project)
-
-    if minimum is None and maximum is None:
-        return None
-
-    if minimum == 0 and maximum not in (None, 0):
-        noun = "bedroom" if maximum == 1 else "bedrooms"
-        return f"Studios to {maximum} {noun}"
-
-    if minimum == 0:
-        return "Studios"
-
-    if minimum is None:
-        return f"{maximum} bedrooms"
-
-    if maximum is None or minimum == maximum:
-        noun = "bedroom" if minimum == 1 else "bedrooms"
-        return f"{minimum} {noun}"
-
-    return f"{minimum} to {maximum} bedrooms"
-
-
-def _format_aed(value):
-    if value is None:
-        return None
-
-    if isinstance(value, str):
-        cleaned = value.replace("AED", "").replace(",", "").strip()
-        if not cleaned:
-            return None
-        try:
-            value = float(cleaned)
-        except ValueError:
-            return value
-
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-
-    if number.is_integer():
-        return f"AED {int(number):,}"
-
-    return f"AED {number:,.0f}"
-
-
-def _format_handover_month(value):
-    if value is None:
-        return None
-
-    text = str(value).strip()
-    if not text:
-        return None
-
-    try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-    return parsed.strftime("%B %Y")
-
-
-def _format_project_card(record):
-    """
-    Convert a project database row into a frontend-friendly project card.
-
-    Only fields that exist in the current database are exposed.
-    No rental yield, fair value, deal score, ROI, or other missing
-    investment metrics are invented here.
-    """
-
-    return {
-        "id": _json_safe(record.get("id")),
-        "name": record.get("name"),
-        "developer": record.get("developer_name"),
-        "developer_id": _json_safe(record.get("developer_id")),
-        "city": record.get("city"),
-        "community": record.get("community"),
-        "sub_community": record.get("sub_community"),
-        "price": _json_safe(record.get("price")),
-        "price_label": (
-            f"AED {record.get('price')}"
-            if record.get("price") is not None
-            else None
-        ),
-        "bedrooms": {
-            "min": _json_safe(record.get("bedroom_min")),
-            "max": _json_safe(record.get("bedroom_max")),
-            "label": _format_bedrooms(record),
-        },
-        "size_sqft": {
-            "min": _json_safe(record.get("size_min")),
-            "max": _json_safe(record.get("size_max")),
-        },
-        "property_types": _json_safe(
-            record.get("property_types") or []
-        ),
-        "status": record.get("status"),
-        "project_status": record.get("project_status"),
-        "pool_type": record.get("pool_type"),
-        "handover_time": _json_safe(
-            record.get("handover_time")
-        ),
-        "amenities": _json_safe(
-            record.get("amenities") or []
-        ),
-        "photos": _json_safe(
-            record.get("photos") or []
-        ),
-        "description": record.get("description"),
-        "brochure_url": record.get("brochure_url"),
-        "property_finder_url": record.get(
-            "property_finder_url"
-        ),
-        "source": record.get("source"),
-    }
-
-
-def _format_community_card(record):
-    """
-    Convert a community database row into a frontend-friendly card.
-    """
-
-    return {
-        "id": _json_safe(record.get("id")),
-        "name": record.get("name"),
-        "slug": record.get("slug"),
-        "city": record.get("city"),
-        "location": {
-            "latitude": _json_safe(record.get("latitude")),
-            "longitude": _json_safe(record.get("longitude")),
-        },
-        "inventory": {
-            "sell_properties_count": _json_safe(
-                record.get("sell_properties_count")
-            ),
-            "rent_properties_count": _json_safe(
-                record.get("rent_properties_count")
-            ),
-            "projects_count": _json_safe(
-                record.get("projects_count")
-            ),
-            "pool_projects_count": _json_safe(
-                record.get("pool_projects_count")
-            ),
-            "total_count": _json_safe(
-                record.get("total_count")
-            ),
-        },
-        "assigned_agents": _json_safe(
-            record.get("assigned_agents")
-        ),
-        "knowledge_text": record.get("knowledge_text"),
-        "source": record.get("source"),
-    }
-
-
-def _format_sub_community_card(record):
-    """
-    Convert a sub-community database row into a frontend-friendly card.
-    """
-
-    return {
-        "id": _json_safe(record.get("id")),
-        "name": record.get("name"),
-        "slug": record.get("slug"),
-        "city": record.get("city"),
-        "community": record.get("community"),
-        "community_slug": record.get("community_slug"),
-        "location": {
-            "latitude": _json_safe(record.get("latitude")),
-            "longitude": _json_safe(record.get("longitude")),
-        },
-        "photos": _json_safe(
-            record.get("photos") or []
-        ),
-        "knowledge_text": record.get("knowledge_text"),
-        "source": record.get("source"),
-    }
-
-
-def _format_document_card(record):
-    """
-    Convert a pgvector document result into a frontend-friendly source.
-    """
-
-    return {
-        "id": _json_safe(record.get("id")),
-        "document_id": _json_safe(
-            record.get("document_id")
-        ),
-        "title": record.get("document_title"),
-        "type": record.get("document_type"),
-        "publisher": record.get("publisher"),
-        "chunk_id": record.get("chunk_id"),
-        "similarity": _json_safe(
-            record.get("similarity")
-        ),
-        "url": record.get("document_url"),
-        "content": record.get("content"),
-    }
-
-
-def _detect_response_type(
-    question,
-    question_type,
-    structured_summary
-):
-    """
-    Determine the frontend response component from the actual result.
-
-    This is presentation metadata only. It does not affect retrieval.
-    """
-
-    question_lower = (question or "").lower()
-
-    projects = structured_summary.get(
-        "projects",
-        []
-    )
-    communities = structured_summary.get(
-        "community",
-        []
-    )
-    sub_communities = structured_summary.get(
-        "sub_communities",
-        []
-    )
-
-    if question_type == "investment":
-        return "investment_analysis"
-
-    if any(
-        phrase in question_lower
-        for phrase in (
-            "compare",
-            "comparison",
-            "difference between",
-            "vs ",
-            " versus "
-        )
-    ) and len(projects) >= 2:
-        return "project_comparison"
-
-    if question_type == "search" and projects:
-        return "project_list"
-
-    if sub_communities:
-        return "sub_community_list"
-
-    if communities:
-        return "community_list"
-
-    return "general"
-
-
-def build_frontend_response(
-    question,
-    standalone_question,
-    answer,
-    question_type,
-    structured_summary,
-    documents,
-    investment_analysis=None,
-):
-    """
-    Build the single response object that a future frontend/API can consume.
-
-    The AI answer remains available as `answer`.
-    Structured database records are exposed as frontend-friendly `data`.
-    """
-
-    projects = structured_summary.get(
-        "projects",
-        []
-    ) or []
-
-    communities = structured_summary.get(
-        "community",
-        []
-    ) or []
-
-    sub_communities = structured_summary.get(
-        "sub_communities",
-        []
-    ) or []
-
-    formatted_projects = [
-        _format_project_card(project)
-        for project in projects
-        if isinstance(project, dict)
-    ]
-
-    formatted_communities = [
-        _format_community_card(community)
-        for community in communities
-        if isinstance(community, dict)
-    ]
-
-    formatted_sub_communities = [
-        _format_sub_community_card(sub_community)
-        for sub_community in sub_communities
-        if isinstance(sub_community, dict)
-    ]
-
-    formatted_documents = [
-        _format_document_card(document)
-        for document in documents
-        if isinstance(document, dict)
-    ]
-
-    response_type = _detect_response_type(
-        question,
-        question_type,
-        structured_summary,
-    )
-
-    return {
-        "status": "success",
-        "response_type": response_type,
-        "question": question,
-        "standalone_question": standalone_question,
-        "question_type": question_type,
-        "answer": answer,
-        "data": {
-            "communities": formatted_communities,
-            "projects": formatted_projects,
-            "sub_communities": formatted_sub_communities,
-            "documents": formatted_documents,
-            "investment_analysis": _json_safe(
-                investment_analysis
-            ),
-        },
-        "meta": {
-            "counts": {
-                "communities": len(formatted_communities),
-                "projects": len(formatted_projects),
-                "sub_communities": len(
-                    formatted_sub_communities
-                ),
-                "documents": len(formatted_documents),
-            }
-        },
-    }
-
-
-# =========================================================
-# FAST STRUCTURED ANSWER
-# =========================================================
-
-def _is_fast_structured_question(
-    question,
-    question_type,
-    structured_summary,
-    documents,
-):
-    """
-    Use the database template only for a browse/search that already has rows.
-
-    Price, bedroom, handover, comparison, and other follow-ups stay on the
-    model path so the reply is written instead of reprinted as a hit list.
-    """
-
-    del question
-
-    if question_type != "search":
-        return False
-
-    if documents:
-        return False
-
-    if structured_summary.get("filter_no_match"):
-        return True
-
-    return bool(
-        structured_summary.get("projects")
-        or structured_summary.get("community")
-        or structured_summary.get("sub_communities")
-    )
-
-
-def _build_fast_structured_answer(
-    question,
-    structured_summary,
-):
-    """
-    Build a concise, grounded answer directly from PostgreSQL records.
-    No model call is made for this path.
-    """
-
-    q = (question or "").lower()
-    projects = structured_summary.get("projects", []) or []
-    communities = structured_summary.get("community", []) or []
-    sub_communities = structured_summary.get("sub_communities", []) or []
-
-    # ---------------------------------------------------------
-    # CONVERSATIONAL FILTER: ZERO MATCHES
-    # ---------------------------------------------------------
-    # Example:
-    #   Q1: Show me projects in Dubai Marina
-    #   Q2: Which of these have 2 bedroom options?
-    #
-    # `projects` is intentionally empty because no candidate matched the
-    # filter. `filter_evidence_projects` contains the previous candidates
-    # so we can explain the result using the real Supabase data.
-    if structured_summary.get("filter_no_match"):
-        evidence_projects = (
-            structured_summary.get(
-                "filter_evidence_projects",
-                []
-            )
-            or []
-        )
-
-        bedroom_match = re.search(
-            r"\b(\d+)\s*(?:-?\s*)bed(?:room)?s?\b",
-            q,
-        )
-
-        if bedroom_match and evidence_projects:
-            requested_bedrooms = int(
-                bedroom_match.group(1)
-            )
-
-            lines = [
-                f"No retrieved projects have "
-                f"{requested_bedrooms}-bedroom options."
-            ]
-
-            for project in evidence_projects:
-                name = project.get("name") or "Unknown project"
-                bedroom_label = _format_bedrooms(project)
-
-                if bedroom_label is not None:
-                    lines.append(
-                        f"{name} offers {bedroom_label} bedrooms."
-                    )
-                else:
-                    lines.append(
-                        f"{name} does not have bedroom information "
-                        f"available in the current data."
-                    )
-
-            return "\n".join(lines)
-
-        # Generic fallback for other conversational filters.
-        if evidence_projects:
-            names = [
-                project.get("name") or "Unknown project"
-                for project in evidence_projects
-            ]
-            return (
-                "None of the previously retrieved projects matched "
-                "the requested filter. Previous candidates: "
-                + ", ".join(names)
-                + "."
-            )
-
-    if projects:
-        lines = []
-
-        wants_bedrooms = any(
-            term in q
-            for term in ("bedroom", "bedrooms")
-        )
-        wants_handover = "handover" in q
-        wants_developer = any(
-            term in q
-            for term in ("developer", "developers")
-        )
-        wants_status = "status" in q
-        wants_price = any(
-            term in q
-            for term in ("price", "prices", "cost")
-        )
-
-        # Field-specific follow-up answers.
-        if len(projects) == 1:
-            project = projects[0]
-            name = project.get("name") or "Unknown project"
-
-            if wants_bedrooms:
-                bedroom_label = _format_bedrooms(project)
-                value = (
-                    bedroom_label
-                    if bedroom_label is not None
-                    else "Not available"
-                )
-                return f"{name} offers {value} bedrooms."
-
-            if wants_handover:
-                value = project.get("handover_time")
-                if value is None:
-                    return f"Handover date for {name} is not available in the current data."
-                return f"{name} handover date: {value}"
-
-            if wants_developer:
-                value = project.get("developer_name")
-                value = (
-                    str(value).strip()
-                    if value is not None and str(value).strip()
-                    else "Not available"
-                )
-                return f"{name} developer: {value}"
-
-            if wants_status:
-                status = project.get("status")
-                project_status = project.get("project_status")
-
-                if status and project_status:
-                    return (
-                        f"{name} status: {status}; "
-                        f"project status: {project_status}"
-                    )
-
-                value = status or project_status or "Not available"
-                return f"{name} status: {value}"
-
-            if wants_price:
-                value = project.get("price")
-                value = (
-                    f"AED {value}"
-                    if value is not None
-                    else "Not available"
-                )
-                return f"{name} starting price: {value}"
-
-        # Multi-project field-specific answers.
-        if wants_bedrooms:
-            lines = [
-                f"Found {len(projects)} project(s) matching your request:"
-            ]
-            for index, project in enumerate(projects, start=1):
-                name = project.get("name") or "Unknown project"
-                bedroom_label = _format_bedrooms(project)
-                bedroom_text = (
-                    bedroom_label
-                    if bedroom_label is not None
-                    else "Not available"
-                )
-                lines.append(
-                    f"{index}. {name} | Bedrooms: {bedroom_text}"
-                )
-            return "\n".join(lines)
-
-        if wants_handover:
-            lines = [
-                f"Found {len(projects)} project(s) matching your request:"
-            ]
-            for index, project in enumerate(projects, start=1):
-                name = project.get("name") or "Unknown project"
-                value = project.get("handover_time")
-                value = value if value is not None else "Not available"
-                lines.append(
-                    f"{index}. {name} | Handover: {value}"
-                )
-            return "\n".join(lines)
-
-        if wants_developer:
-            lines = [
-                f"Found {len(projects)} project(s) matching your request:"
-            ]
-            for index, project in enumerate(projects, start=1):
-                name = project.get("name") or "Unknown project"
-                developer = project.get("developer_name")
-                developer_text = (
-                    str(developer).strip()
-                    if developer is not None and str(developer).strip()
-                    else "Not available"
-                )
-                lines.append(
-                    f"{index}. {name} | Developer: {developer_text}"
-                )
-            return "\n".join(lines)
-
-        if wants_price:
-            lines = [
-                f"Found {len(projects)} project(s) matching your request:"
-            ]
-            for index, project in enumerate(projects, start=1):
-                name = project.get("name") or "Unknown project"
-                price = project.get("price")
-                price_text = (
-                    f"AED {price}" if price is not None else "Not available"
-                )
-                lines.append(
-                    f"{index}. {name} | Starting price: {price_text}"
-                )
-            return "\n".join(lines)
-
-        # Default browse answer.
-        lines = [
-            _browse_intro(
-                projects,
-                ambiguous_label=structured_summary.get("ambiguous_label"),
-            ),
-            "",
-        ]
-
-        for project in projects:
-            name = project.get("name") or "Unknown project"
-            developer = project.get("developer_name") or project.get("developer")
-            developer_text = (
-                str(developer).strip()
-                if developer is not None and str(developer).strip()
-                else ""
-            )
-            sentence = f"- **{name}**"
-            sentence += f" by {developer_text}." if developer_text else "."
-
-            details = []
-            price_text = _format_aed(project.get("price"))
-            if price_text:
-                details.append(f"Starting price {price_text}.")
-
-            bedroom_text = _format_bedroom_phrase(project)
-            if bedroom_text:
-                details.append(f"{bedroom_text}.")
-
-            handover_text = _format_handover_month(project.get("handover_time"))
-            if handover_text:
-                details.append(f"Handover {handover_text}.")
-
-            if details:
-                sentence = f"{sentence} {' '.join(details)}"
-
-            lines.append(sentence)
-
-        return "\n".join(lines)
-
-    if sub_communities:
-        lines = [
-            f"Found {len(sub_communities)} sub-community(s) matching your request:"
-        ]
-        for index, record in enumerate(sub_communities, start=1):
-            lines.append(
-                f"{index}. {record.get('name') or 'Unknown sub-community'}"
-            )
-        return "\n".join(lines)
-
-    if communities:
-        lines = [
-            f"Found {len(communities)} community(s) matching your request:"
-        ]
-        for index, record in enumerate(communities, start=1):
-            name = record.get("name") or "Unknown community"
-            city = record.get("city")
-            if city:
-                lines.append(f"{index}. {name} | City: {city}")
-            else:
-                lines.append(f"{index}. {name}")
-        return "\n".join(lines)
-
-    return _missing_data_answer(structured_summary)
-
-
-# =========================================================
-# SMALL TALK
-# =========================================================
-
-_SMALL_TALK_KINDS = {
-    "hi": "greeting",
-    "hii": "greeting",
-    "hello": "greeting",
-    "hey": "greeting",
-    "good morning": "greeting",
-    "good evening": "greeting",
-    "good afternoon": "greeting",
-    "thanks": "thanks",
-    "thank you": "thanks",
-    "bye": "bye",
-    "goodbye": "bye",
-    "who are you": "identity",
-    "what are you": "identity",
-    "what can you do": "capabilities",
-    "what do you do": "capabilities",
-    "how can you help": "capabilities",
-    "help": "capabilities",
-}
-
-_STARTER_CHIPS = (
-    "Show me projects in Jumeirah Village Circle.",
-    "What can you do?",
-    "Who are you?",
+from app.answers.structured_answer import (
+    _SMALL_TALK_KINDS,
+    _STARTER_CHIPS,
+    _build_comparison,
+    _build_fast_structured_answer,
+    _detect_response_type,
+    _is_fast_structured_question,
+    _normalize_chat_text,
+    build_frontend_response,
 )
 
 
-def _normalize_chat_text(question):
-    text = collapse_stretched_letters(question or "").strip().lower()
-    text = text.replace("\u2019", "'")
-    text = re.sub(r"[!?.]+$", "", text).strip()
-    text = re.sub(r"\s+", " ", text)
-    return text
-
-
-def _unique_field(projects, key):
-    values = []
-    for project in projects:
-        raw = project.get(key)
-        if raw is None and key == "developer_name":
-            raw = project.get("developer")
-        text = str(raw).strip() if raw is not None else ""
-        if text and text not in values:
-            values.append(text)
-    return values
-
-
-def _price_range_clause(projects):
-    prices = []
-    for project in projects:
-        value = project.get("price")
-        if value is None:
-            continue
-        try:
-            if isinstance(value, str):
-                value = value.replace("AED", "").replace(",", "").strip()
-            number = float(value)
-        except (TypeError, ValueError):
-            continue
-        prices.append(number)
-
-    if not prices:
-        return ""
-
-    low = min(prices)
-    high = max(prices)
-    if low == high:
-        return f", with a starting price of {_format_aed(low)}"
-    return (
-        f", with starting prices from {_format_aed(low)} "
-        f"to {_format_aed(high)}"
-    )
-
-
-def _browse_intro(projects, ambiguous_label=None):
-    """Open a project list in one sentence."""
-
-    count = len(projects)
-    noun = "project" if count == 1 else "projects"
-    all_active = all(
-        str(project.get("status") or "").strip().upper() == "ACTIVE"
-        for project in projects
-    )
-    active = "active " if all_active else ""
-
-    if ambiguous_label and count > 1:
-        return f"{ambiguous_label} matches {count} {noun}. Here they are:"
-
-    communities = _unique_field(projects, "community")
-    developers = _unique_field(projects, "developer_name")
-    price_clause = _price_range_clause(projects)
-
-    if count == 1:
-        name = projects[0].get("name") or "This project"
-        place = f" in {communities[0]}" if communities else ""
-        kind = f"{active}project".strip()
-        article = "an" if kind.startswith("active") else "a"
-        return (
-            f"{name} is {article} {kind}{place}. "
-            "Here is what is on record:"
-        )
-
-    if len(communities) == 1:
-        return (
-            f"I found {count} {active}{noun} in {communities[0]}"
-            f"{price_clause}. Here is a short look at each one:"
-        )
-
-    if len(developers) == 1:
-        return (
-            f"I found {count} {active}{developers[0]} {noun}"
-            f"{price_clause}. Here is a short look at each one:"
-        )
-
-    return (
-        f"I found {count} {active}{noun}{price_clause}. "
-        "Here is a short look at each one:"
-    )
-
-
-def _missing_data_answer(structured_summary):
-    subject = str(
-        structured_summary.get("understood_subject") or ""
-    ).strip()
-    closest = str(structured_summary.get("closest_match") or "").strip()
-    kind = structured_summary.get("understood_kind") or "place"
-
-    if not subject:
-        return "I don't have a match for that in the current data."
-
-    if kind == "project":
-        return (
-            f"I don't have a project called {subject} "
-            "in the current data."
-        )
-
-    if kind == "developer":
-        return (
-            f"I don't have {subject} projects in the current data."
-        )
-
-    if kind == "developer_community":
-        return f"I don't have {subject} in the current data."
-
-    if kind == "pattern":
-        return (
-            f"I don't have projects matching {subject} "
-            "in the current data."
-        )
-
-    if closest:
-        return (
-            f"I don't have projects in {subject}. "
-            f"The closest community I do have is {closest}."
-        )
-
-    return (
-        f"I don't have projects in {subject} in the current data."
-    )
 
 
 def _classify_small_talk(question):
@@ -1520,6 +647,7 @@ def _empty_structured_summary():
         "community": [],
         "projects": [],
         "sub_communities": [],
+        "listings": [],
         "filter_no_match": False,
         "filter_evidence_projects": [],
     }
@@ -1529,7 +657,7 @@ def _empty_structured_summary():
 # PROCESS QUESTION
 # =========================================================
 
-def _prepare_acot_turn(
+async def _prepare_acot_turn(
     question,
     components
 ):
@@ -1579,14 +707,16 @@ def _prepare_acot_turn(
 
     rewrite_started = time.perf_counter()
     question_for_search = prepare_user_question(question) or question
-    standalone_question = conversation_memory.rewrite_question(
+    standalone_question = await conversation_memory.rewrite_question(
         question_for_search
     )
     timing_ms["rewrite"] = _elapsed_ms(rewrite_started)
 
-    result = hybrid_retriever.retrieve(
+    context = conversation_memory.context()
+    context["current_user_question"] = question_for_search
+    result = await hybrid_retriever.retrieve(
         question=standalone_question,
-        conversation_context=conversation_memory.context(),
+        conversation_context=context,
     )
     timing_ms.update(result.get("timing_ms") or {})
 
@@ -1618,6 +748,17 @@ def _prepare_acot_turn(
             "sub_communities",
             []
         ),
+        "listings": structured_data.get(
+            "listings",
+            []
+        ) or result.get("listings", []),
+        "listing_total": structured_data.get("listing_total"),
+        "catalog": structured_data.get("catalog", False),
+        "catalog_place": structured_data.get("catalog_place"),
+        "project_total": structured_data.get("project_total"),
+        "community_total": structured_data.get("community_total"),
+        "comparison": structured_data.get("comparison", False),
+        "comparison_entities": structured_data.get("comparison_entities") or [],
         "filter_no_match": result.get(
             "filter_no_match",
             structured_data.get(
@@ -1629,6 +770,13 @@ def _prepare_acot_turn(
             "filter_evidence_projects",
             structured_data.get(
                 "filter_evidence_projects",
+                []
+            )
+        ) or [],
+        "filter_evidence_listings": result.get(
+            "filter_evidence_listings",
+            structured_data.get(
+                "filter_evidence_listings",
                 []
             )
         ) or [],
@@ -1653,12 +801,29 @@ def _prepare_acot_turn(
 
     timing_ms["investment"] = _elapsed_ms(investment_started)
 
+    comparison_built = _build_comparison(structured_summary)
+    if comparison_built:
+        structured_summary["comparison_view"] = comparison_built["sides"]
+
     use_fast = _is_fast_structured_question(
         question=standalone_question,
         question_type=question_type,
         structured_summary=structured_summary,
         documents=documents,
     )
+    if comparison_built:
+        use_fast = True
+    elif re.search(
+        r"\b(?:which of these|which ones|which of those|which of the)\b",
+        f"{question} {standalone_question}",
+        flags=re.IGNORECASE,
+    ) and (
+        structured_summary.get("listings")
+        or structured_summary.get("filter_evidence_listings")
+        or structured_summary.get("projects")
+        or structured_summary.get("filter_evidence_projects")
+    ):
+        use_fast = True
     if (
         not documents
         and not structured_summary.get("projects")
@@ -1667,7 +832,10 @@ def _prepare_acot_turn(
     ):
         use_fast = True
 
-    if use_fast:
+    if comparison_built:
+        fast_answer = comparison_built["answer"]
+        context = None
+    elif use_fast:
         fast_answer = _build_fast_structured_answer(
             question=standalone_question,
             structured_summary=structured_summary,
@@ -1728,104 +896,11 @@ def _finalize_acot_turn(prepared, answer, answer_started):
     return response
 
 
-# =========================================================
-# RENTAL LISTINGS TURN
-# =========================================================
-
-_LISTING_CHIPS = (
-    "What is the average rent for a 2 bedroom in Dubai Marina?",
-    "Show me the cheapest studios in JVC",
-    "Compare 1 bedroom rents in Business Bay and Downtown Dubai",
-    "Furnished 3 bedroom villas under 250,000 a year",
-)
-
-
-def _wants_listings(question, components):
-    if components.get("listing_agent") is None:
-        return False
-    turns = getattr(components["conversation_memory"], "turns", None) or []
-    last_type = turns[-1].get("question_type") if turns and isinstance(turns[-1], dict) else None
-    return is_rent_question(question, last_type)
-
-
-def _memory_history(memory, limit=4):
-    history = []
-    for turn in (getattr(memory, "turns", None) or [])[-limit:]:
-        if isinstance(turn, dict):
-            if turn.get("user_question"):
-                history.append({"role": "user", "content": turn["user_question"]})
-            if turn.get("answer"):
-                history.append({"role": "assistant", "content": turn["answer"]})
-    return history
-
-
-def _run_listing_agent(question, components):
-    """Run the listings agent; a failure becomes a readable answer, never an exception."""
-    started = time.perf_counter()
-    try:
-        result = components["listing_agent"].answer(
-            question, _memory_history(components["conversation_memory"])
-        )
-        return result.answer, result.cards, result.tools, _elapsed_ms(started)
-    except ListingsUnavailable:
-        message = "I can't reach the rental data right now. Please try again in a moment."
-    except Exception:
-        message = "Something went wrong while looking that up. Please try again."
-    return message, [], [], _elapsed_ms(started)
-
-
-def _finalize_listing_turn(question, answer, cards, tools, ms, components):
-    components["conversation_memory"].update(
-        user_question=question,
-        standalone_question=question,
-        answer=answer,
-        retrieval_result={
-            "question_type": "listings",
-            "structured_data": {"community": [], "projects": [], "sub_communities": []},
-            "documents": [],
-        },
-        question_type="listings",
-    )
-    return {
-        "status": "success",
-        "response_type": "listing_list" if cards else "listing_answer",
-        "question": question,
-        "standalone_question": question,
-        "question_type": "listings",
-        "answer": answer,
-        "data": {
-            "communities": [],
-            "projects": [],
-            "sub_communities": [],
-            "documents": [],
-            "listings": cards,
-            "investment_analysis": None,
-        },
-        "meta": {
-            "counts": {"communities": 0, "projects": 0, "sub_communities": 0, "documents": 0, "listings": len(cards)},
-            "timing_ms": {"listings": ms, "ask": ms},
-            "tools": tools,
-        },
-    }
-
-
-def _listing_followups(question, components):
-    asked = {_normalize_chat_text(question)}
-    for turn in getattr(components["conversation_memory"], "turns", None) or []:
-        if isinstance(turn, dict):
-            asked.add(_normalize_chat_text(turn.get("user_question") or ""))
-    return [chip for chip in _LISTING_CHIPS if _normalize_chat_text(chip) not in asked][:3]
-
-
-def ask_acot(
+async def ask_acot(
     question,
     components
 ):
-    if _wants_listings(question, components):
-        answer, cards, tools, ms = _run_listing_agent(question, components)
-        return _finalize_listing_turn(question, answer, cards, tools, ms, components)
-
-    prepared = _prepare_acot_turn(
+    prepared = await _prepare_acot_turn(
         question,
         components
     )
@@ -1834,7 +909,7 @@ def ask_acot(
     if prepared["use_fast"]:
         answer = prepared["fast_answer"]
     else:
-        answer = prepared["rag_chain"].generate_answer(
+        answer = await prepared["rag_chain"].generate_answer(
             question=prepared["standalone_question"],
             context=prepared["context"],
             question_type=prepared["question_type"]
@@ -1955,22 +1030,78 @@ def _unused_followups(prepared, chips):
     return unused[:3]
 
 
+def _followup_place(prepared):
+    summary = prepared.get("structured_summary") or {}
+    for key in ("listings", "projects"):
+        places = []
+        for row in summary.get(key) or []:
+            if not isinstance(row, dict):
+                continue
+            place = str(row.get("community") or "").strip()
+            if place and place not in places:
+                places.append(place)
+        if len(places) == 1:
+            return places[0]
+
+    subject = str(summary.get("understood_subject") or "").strip()
+    if subject and subject.lower() not in {"that request", "your request"}:
+        return subject
+
+    match = re.search(r"\bin\s+(.+)$", prepared.get("question") or "", flags=re.I)
+    if not match:
+        return None
+    place = re.split(
+        r"\b(?:and tell|tell me|which is|for rent|to rent)\b",
+        match.group(1),
+        maxsplit=1,
+        flags=re.I,
+    )[0]
+    place = place.strip(" .?")
+    return place or None
+
+
+def _listing_followup_chips(place, listings):
+    if len(listings) == 1:
+        title = listings[0].get("title") or listings[0].get("name") or "this rental"
+        return [
+            f"What is the yearly rent of {title}?",
+            f"How many bedrooms does {title} have?",
+            f"What is the size of {title}?",
+        ]
+
+    where = f" in {place}" if place else ""
+    return [
+        f"Compare the first two rentals{where} and tell me which is best.",
+        "Which of these has the lowest yearly rent?",
+        "Which of these are 1-bedroom apartments?",
+    ]
+
+
 def _followup_questions(prepared):
     question = prepared.get("question") or ""
 
     if prepared.get("small_talk"):
         return _unused_followups(prepared, _STARTER_CHIPS)
 
+    summary = prepared.get("structured_summary") or {}
     projects = [
         project
-        for project in (prepared["structured_summary"].get("projects") or [])
+        for project in (summary.get("projects") or [])
         if isinstance(project, dict)
     ]
-    if len(projects) >= 2:
+    listings = [
+        listing
+        for listing in (summary.get("listings") or [])
+        if isinstance(listing, dict)
+    ]
+    place = _followup_place(prepared)
+
+    if listings or asks_for_listings(question):
         return _unused_followups(
             prepared,
-            [chip for _, chip in _PROJECT_FOLLOWUPS],
+            _listing_followup_chips(place, listings),
         )
+
     if len(projects) == 1:
         name = projects[0].get("name") or "this project"
         return _unused_followups(
@@ -1983,7 +1114,24 @@ def _followup_questions(prepared):
                 f"What is the bedroom range of {name}?",
             ],
         )
-    return _unused_followups(prepared, _STARTER_CHIPS)
+
+    if len(projects) >= 2:
+        return _unused_followups(
+            prepared,
+            [chip for _, chip in _PROJECT_FOLLOWUPS],
+        )
+
+    if place and re.search(r"\bprojects?\b", question, flags=re.I):
+        return _unused_followups(
+            prepared,
+            [
+                f"What are the starting prices of projects in {place}?",
+                f"What are the handover dates of projects in {place}?",
+                f"Compare the first and second projects in {place}.",
+            ],
+        )
+
+    return []
 
 
 def _slim_stream_response(response):
@@ -2005,6 +1153,26 @@ def _slim_stream_response(response):
             item["photos"] = photos[:4]
         projects.append(item)
     data["projects"] = projects
+    listings = []
+    for listing in data.get("listings") or []:
+        if not isinstance(listing, dict):
+            continue
+        item = dict(listing)
+        photos = item.get("photos")
+        if isinstance(photos, list):
+            item["photos"] = photos[:1]
+        listings.append(item)
+    data["listings"] = listings
+    comparison = []
+    for side in data.get("comparison") or []:
+        if not isinstance(side, dict):
+            continue
+        item = dict(side)
+        photos = item.get("photos")
+        if isinstance(photos, list):
+            item["photos"] = photos[:1]
+        comparison.append(item)
+    data["comparison"] = comparison
     slim["data"] = data
 
     summary = slim.get("ai_summary")
@@ -2017,7 +1185,7 @@ def _slim_stream_response(response):
     return slim
 
 
-def stream_acot(
+async def stream_acot(
     question,
     components
 ):
@@ -2028,23 +1196,13 @@ def stream_acot(
     Memory is updated only after the full answer is assembled.
     """
 
-    if _wants_listings(question, components):
-        yield ("meta", {"type": "meta", "sources": []})
-        answer, cards, tools, ms = _run_listing_agent(question, components)
-        for piece in _iter_typewriter_pieces(answer):
-            yield ("delta", {"type": "delta", "text": piece})
-            time.sleep(0.02)
-        followups = _listing_followups(question, components)
-        if followups:
-            yield ("followups", {"type": "followups", "questions": followups})
-        yield ("done", _finalize_listing_turn(question, answer, cards, tools, ms, components))
-        return
-
-    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-        prepared = _prepare_acot_turn(
-            question,
-            components
-        )
+    # No stdout redirect: the API installs a logging-backed sys.stdout at
+    # startup, so pipeline output is captured without mutating global state
+    # per request (which interleaved output across concurrent requests).
+    prepared = await _prepare_acot_turn(
+        question,
+        components
+    )
 
     yield (
         "meta",
@@ -2062,11 +1220,11 @@ def stream_acot(
                 "delta",
                 {"type": "delta", "text": piece}
             )
-            time.sleep(0.02)
+            await asyncio.sleep(0.02)
     else:
         parts = []
 
-        for delta in prepared["rag_chain"].stream_answer(
+        async for delta in prepared["rag_chain"].stream_answer(
             question=prepared["standalone_question"],
             context=prepared["context"],
             question_type=prepared["question_type"]
@@ -2170,10 +1328,10 @@ def main():
         try:
             # Hide all internal ACOT/RAG/retriever/library output.
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                response = ask_acot(
+                response = asyncio.run(ask_acot(
                     question,
                     components
-                )
+                ))
 
             print("\nACOT:")
             print_answer_sequentially(

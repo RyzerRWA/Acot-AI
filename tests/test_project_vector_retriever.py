@@ -1,5 +1,5 @@
-from app.retrieval.supabase.project_vector_retriever import (
-    SupabaseProjectVectorRetriever
+from app.retrieval.postgres.project_vector_retriever import (
+    ProjectVectorRetriever
 )
 
 
@@ -9,7 +9,7 @@ def main():
     print("PROJECT VECTOR RETRIEVER TEST")
     print("================================")
 
-    retriever = SupabaseProjectVectorRetriever(
+    retriever = ProjectVectorRetriever(
         match_threshold=0.0,
         match_count=5
     )

@@ -1,5 +1,5 @@
-from app.retrieval.supabase.pgvector_retriever import (
-    SupabasePGVectorRetriever
+from app.retrieval.postgres.pgvector_retriever import (
+    PGVectorRetriever
 )
 
 from app.retrieval.hybrid.context_builder import (
@@ -18,7 +18,7 @@ print("================================")
 
 print("\nInitializing pgvector retriever...")
 
-retriever = SupabasePGVectorRetriever(
+retriever = PGVectorRetriever(
     match_threshold=0.5,
     match_count=5
 )
@@ -35,10 +35,10 @@ print(question)
 
 
 # ==================================================
-# 3. RETRIEVE FROM SUPABASE
+# 3. RETRIEVE FROM POSTGRES
 # ==================================================
 
-print("\nSearching Supabase pgvector...")
+print("\nSearching PostgreSQL pgvector...")
 
 community_results = retriever.search(
     question

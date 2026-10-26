@@ -1,9 +1,8 @@
-import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from supabase import create_client
 
+from app.database.postgres_client import PostgresClient
 from app.rag.embeddings.embedding_model import EmbeddingModel
 
 
@@ -16,40 +15,22 @@ ENV_FILE = PROJECT_ROOT / ".env"
 
 load_dotenv(ENV_FILE)
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SECRET_KEY")
-
-
-if not SUPABASE_URL:
-    raise ValueError(
-        f"SUPABASE_URL is missing. Checked .env at:\n{ENV_FILE}"
-    )
-
-if not SUPABASE_KEY:
-    raise ValueError(
-        f"SUPABASE_SECRET_KEY is missing. Checked .env at:\n{ENV_FILE}"
-    )
-
-
 print("================================")
-print("SUPABASE PGVECTOR TEST")
+print("POSTGRESQL PGVECTOR TEST")
 print("================================")
 
-print("\nSupabase environment loaded successfully.")
+print("\nEnvironment loaded successfully.")
 
 
 # ============================================================
-# 2. CREATE SUPABASE CLIENT
+# 2. CREATE POSTGRES CLIENT
 # ============================================================
 
-print("\nConnecting to Supabase...")
+print("\nConnecting to PostgreSQL...")
 
-supabase = create_client(
-    SUPABASE_URL,
-    SUPABASE_KEY
-)
+db = PostgresClient()
 
-print("Supabase connection initialized.")
+print("PostgreSQL connection initialized.")
 
 
 # ============================================================
@@ -84,7 +65,7 @@ query_embedding = embedding_model.embed_query(question)
 
 # IMPORTANT:
 # The embedding model returns a NumPy ndarray.
-# Supabase RPC requires a normal Python list.
+# PostgreSQL RPC requires a normal Python list.
 if hasattr(query_embedding, "tolist"):
     query_embedding = query_embedding.tolist()
 
@@ -110,14 +91,14 @@ print("\nEmbedding dimension is correct: 384")
 
 
 # ============================================================
-# 7. SEARCH SUPABASE PGVECTOR
+# 7. SEARCH POSTGRES PGVECTOR
 # ============================================================
 
-print("\nSearching Supabase pgvector...")
+print("\nSearching PostgreSQL pgvector...")
 
 try:
 
-    response = supabase.rpc(
+    response = db.rpc(
         "match_communities",
         {
             "query_embedding": query_embedding,

@@ -1,7 +1,11 @@
-import io
+import asyncio
 import json
+import logging
+import os
+import threading
 import time
-from contextlib import redirect_stdout, redirect_stderr
+from collections import OrderedDict
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,11 +13,22 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from run import initialize_acot, ask_acot, stream_acot, _slim_stream_response
+from app.llm.client import LLMQueueTimeoutError
+from app.logging_utils import (
+    install_stdout_logger,
+    set_request_tag,
+)
 from app.memory.conversation_memory import ConversationMemory
 from app.intelligence.ai_analysis_engine import AIAnalysisEngine
 from app.intelligence.account_summary_service import (
     clear_summary_cache,
     get_account_summary,
+)
+from app.subscription.token_usage import (
+    reset_tokens,
+    get_tokens,
+    use_request_collector,
+    release_request_collector,
 )
 
 
@@ -21,10 +36,60 @@ from app.intelligence.account_summary_service import (
 # FASTAPI APP
 # ============================================================
 
+logger = logging.getLogger("acot.api")
+
+# How many full chats may run at once. Each chat still takes several model
+# calls, and those stay capped by AICREDITS_MAX_CONCURRENCY. Past this limit
+# the API answers "busy" in a couple of seconds instead of holding the
+# client until the 110s stream abort.
+_CHAT_LIMIT = int(os.getenv("ACOT_MAX_INFLIGHT_CHATS", "40"))
+_CHAT_ADMIT_TIMEOUT = float(os.getenv("ACOT_CHAT_ADMIT_TIMEOUT_SECONDS", "2"))
+_BUSY_MESSAGE = "ACOT is busy right now, please try again in a moment."
+_chat_slots = None
+
+
+def _chat_gate():
+    global _chat_slots
+    if _chat_slots is None:
+        _chat_slots = asyncio.Semaphore(_CHAT_LIMIT)
+    return _chat_slots
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Warm the ACOT pipeline at boot rather than on the first request.
+    # Lazy init cost the first user ~11s; doing it here moves that cost to
+    # startup and surfaces failures in the logs instead of as a user-facing
+    # timeout. Failures are not fatal: get_api_components() retries lazily.
+    started = time.perf_counter()
+    try:
+        # Route every print() in the pipeline through logging once, instead of
+        # swapping global sys.stdout on each request.
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        )
+        install_stdout_logger(logging.getLogger("acot.pipeline"))
+
+        get_api_components()
+        print(
+            f"[boot] ACOT pipeline warm in "
+            f"{int((time.perf_counter() - started) * 1000)}ms",
+            flush=True,
+        )
+    except Exception as exc:
+        print(
+            f"[boot] ACOT warmup failed ({exc}); will retry on first request",
+            flush=True,
+        )
+    yield
+
+
 app = FastAPI(
     title="ACOT AI Real Estate Intelligence API",
     description="Backend API for ACOT Dubai Real Estate Intelligence",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 
@@ -55,7 +120,15 @@ class AskRequest(BaseModel):
 # ============================================================
 
 _api_components = None
-_api_sessions = {}
+
+# Session components are cached per conversation and were previously kept in a
+# plain dict that was never pruned, so every conversation leaked a
+# ConversationMemory for the life of the process. It is now an LRU bounded by
+# count and idle time.
+_api_sessions: "OrderedDict[str, dict]" = OrderedDict()
+_api_sessions_lock = threading.Lock()
+API_SESSION_MAX = int(os.getenv("ACOT_SESSION_MAX", "500"))
+API_SESSION_TTL_SECONDS = int(os.getenv("ACOT_SESSION_TTL", "7200"))
 
 
 # ============================================================
@@ -70,8 +143,10 @@ def get_api_components():
 
         print("Initializing ACOT backend...")
 
-        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            _api_components = initialize_acot()
+        # No stdout redirect here: sys.stdout is already routed through the
+        # logging stream installed at startup, so library chatter lands in the
+        # log without mutating global state.
+        _api_components = initialize_acot()
 
         # Reuse the same AICredits client used by QueryPlanner.
         _api_components["ai_analysis_engine"] = AIAnalysisEngine(
@@ -87,11 +162,36 @@ def get_api_components():
 # SESSION MANAGEMENT
 # ============================================================
 
+def _evict_sessions_locked(now: float) -> None:
+
+    """Drop idle sessions, then trim the oldest until within the cap."""
+
+    expired = [
+        sid
+        for sid, (_, touched) in _api_sessions.items()
+        if now - touched > API_SESSION_TTL_SECONDS
+    ]
+    for sid in expired:
+        _api_sessions.pop(sid, None)
+
+    while len(_api_sessions) > API_SESSION_MAX:
+        _api_sessions.popitem(last=False)
+
+
 def get_session_components(session_id: str):
 
     base_components = get_api_components()
+    now = time.time()
 
-    if session_id not in _api_sessions:
+    with _api_sessions_lock:
+        entry = _api_sessions.get(session_id)
+
+        if entry is not None:
+            components, _ = entry
+            # Refresh recency and idle timer.
+            _api_sessions[session_id] = (components, now)
+            _api_sessions.move_to_end(session_id)
+            return components
 
         session_components = dict(base_components)
 
@@ -99,9 +199,43 @@ def get_session_components(session_id: str):
             llm_client=base_components["query_planner"]._llm_client
         )
 
-        _api_sessions[session_id] = session_components
+        _api_sessions[session_id] = (session_components, now)
+        _api_sessions.move_to_end(session_id)
+        _evict_sessions_locked(now)
 
-    return _api_sessions[session_id]
+        return session_components
+
+
+def drop_session(session_id: str) -> bool:
+
+    """Free a session's memory. Returns True if an entry was removed."""
+
+    with _api_sessions_lock:
+        entry = _api_sessions.pop(session_id, None)
+
+    if entry is None:
+        return False
+
+    try:
+        entry[0]["conversation_memory"].clear()
+    except Exception:
+        pass
+
+    return True
+
+
+def session_cache_stats() -> dict:
+
+    now = time.time()
+    with _api_sessions_lock:
+        ages = [now - touched for _, touched in _api_sessions.values()]
+
+    return {
+        "sessions": len(_api_sessions),
+        "max": API_SESSION_MAX,
+        "ttl_seconds": API_SESSION_TTL_SECONDS,
+        "oldest_idle_seconds": int(max(ages)) if ages else 0,
+    }
 
 
 # ============================================================
@@ -141,7 +275,7 @@ def _normalize_analysis_data(data):
     return normalized
 
 
-def build_ai_summary(question, response, ai_analysis_engine):
+async def build_ai_summary(question, response, ai_analysis_engine):
     """
     Run the ACOT AI Analysis Engine for analytical queries.
 
@@ -166,7 +300,7 @@ def build_ai_summary(question, response, ai_analysis_engine):
 
         project = dict(project)
 
-        # Your Supabase/output format may use "developer".
+        # Your output format may use "developer".
         # AIAnalysisEngine also understands "developer_name".
         if (
             project.get("developer_name") is None
@@ -227,7 +361,7 @@ def build_ai_summary(question, response, ai_analysis_engine):
     # Run the actual ACOT AI Analysis Engine
     # ---------------------------------------------------------
     try:
-        analysis = ai_analysis_engine.analyze(
+        analysis = await ai_analysis_engine.analyze(
             question=question,
             structured_summary=data,
             documents=documents,
@@ -289,6 +423,7 @@ def root():
 # HEALTH CHECK
 # ============================================================
 
+@app.get("/health")
 @app.get("/api/healths")
 def health_check():
 
@@ -304,7 +439,7 @@ def health_check():
 # ============================================================
 
 @app.post("/api/ask")
-def ask_endpoint(request: AskRequest):
+async def ask_endpoint(request: AskRequest):
 
     question = request.question.strip()
 
@@ -318,6 +453,20 @@ def ask_endpoint(request: AskRequest):
             status_code=400,
             detail="Question cannot be empty."
         )
+
+    try:
+        await asyncio.wait_for(
+            _chat_gate().acquire(),
+            timeout=_CHAT_ADMIT_TIMEOUT,
+        )
+    except TimeoutError:
+        raise HTTPException(
+            status_code=503,
+            detail=_BUSY_MESSAGE,
+        )
+
+    use_request_collector(request.session_id)
+    reset_tokens()
 
     try:
 
@@ -335,27 +484,25 @@ def ask_endpoint(request: AskRequest):
         # Run existing ACOT pipeline
         # ----------------------------------------------------
 
-        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+        set_request_tag(request.session_id)
 
-            response = ask_acot(
-                question,
-                components
-            )
+        response = await ask_acot(
+            question,
+            components
+        )
 
         # ----------------------------------------------------
         # Add short ACOT score + recommendation
         # ----------------------------------------------------
 
         summary_started = time.perf_counter()
-        # the ACOT score rates projects; rental-listing answers have none
-        response["ai_summary"] = (
-            None
-            if response.get("question_type") == "listings"
-            else build_ai_summary(
-                question=question,
-                response=response,
-                ai_analysis_engine=components["ai_analysis_engine"],
-            )
+        # Only chatbot (ask) tokens count against the subscription.
+        # Snapshot before build_ai_summary so summary LLM usage is excluded.
+        chat_tokens = get_tokens()
+        response["ai_summary"] = await build_ai_summary(
+            question=question,
+            response=response,
+            ai_analysis_engine=components["ai_analysis_engine"],
         )
 
         timing = response.setdefault("meta", {}).setdefault("timing_ms", {})
@@ -365,21 +512,35 @@ def ask_endpoint(request: AskRequest):
         timing["total"] = int(
             round((time.perf_counter() - endpoint_started) * 1000)
         )
+        response["tokens_used"] = chat_tokens
+        response.setdefault("meta", {})["tokens_used"] = chat_tokens
         print(f"ACOT timing_ms: {timing}")
 
         # ----------------------------------------------------
         # Return complete ACOT response
         # ----------------------------------------------------
 
+        release_request_collector()
         return response
+
+    except LLMQueueTimeoutError as exc:
+
+        release_request_collector()
+        raise HTTPException(
+            status_code=503,
+            detail=str(exc)
+        )
 
     except Exception as exc:
 
+        release_request_collector()
         raise HTTPException(
             status_code=500,
             detail=f"ACOT processing error: {str(exc)}"
         )
 
+    finally:
+        _chat_gate().release()
 
 def _sse_data(payload):
     body = json.dumps(
@@ -391,7 +552,7 @@ def _sse_data(payload):
 
 
 @app.post("/api/ask/stream")
-def ask_stream_endpoint(request: AskRequest):
+async def ask_stream_endpoint(request: AskRequest):
 
     question = request.question.strip()
 
@@ -401,13 +562,29 @@ def ask_stream_endpoint(request: AskRequest):
             detail="Question cannot be empty."
         )
 
-    def events():
+    async def events():
         try:
+            await asyncio.wait_for(
+                _chat_gate().acquire(),
+                timeout=_CHAT_ADMIT_TIMEOUT,
+            )
+        except TimeoutError:
+            yield _sse_data({
+                "type": "error",
+                "message": _BUSY_MESSAGE,
+            })
+            return
+
+        try:
+            use_request_collector(request.session_id)
+            reset_tokens()
             components = get_session_components(
                 request.session_id
             )
 
-            for event_name, data in stream_acot(
+            chat_tokens = 0
+
+            async for event_name, data in stream_acot(
                 question,
                 components
             ):
@@ -417,19 +594,40 @@ def ask_stream_endpoint(request: AskRequest):
 
                 if event_name == "done" and isinstance(data, dict):
                     data = dict(data)
-                    data["ai_summary"] = (
-                        None
-                        if data.get("question_type") == "listings"
-                        else build_ai_summary(
+                    # Only chatbot (ask) tokens count against the subscription.
+                    # Snapshot before build_ai_summary so summary LLM usage is excluded.
+                    chat_tokens = get_tokens()
+                    # Send the answer first. Listing and search questions get an
+                    # empty summary with no model call. Comparison, ranking,
+                    # analysis, and investment still wait for the score, because
+                    # that score is part of the saved answer.
+                    question_type = data.get("question_type") or ""
+                    if question_type not in {
+                        "comparison",
+                        "ranking",
+                        "analysis",
+                        "investment",
+                    }:
+                        data["ai_summary"] = {
+                            "data": data.get("data") if isinstance(data.get("data"), dict) else {},
+                            "data_description": {},
+                            "acot_recommendation": {},
+                            "acot_score": None,
+                        }
+                    else:
+                        data["ai_summary"] = await build_ai_summary(
                             question=question,
                             response=data,
                             ai_analysis_engine=components["ai_analysis_engine"],
                         )
-                    )
                     data = _slim_stream_response(data)
                     yield _sse_data({
                         "type": "done",
                         "response": data,
+                    })
+                    yield _sse_data({
+                        "type": "usage",
+                        "tokens_used": chat_tokens,
                     })
                     continue
 
@@ -442,7 +640,20 @@ def ask_stream_endpoint(request: AskRequest):
                     **(data if isinstance(data, dict) else {"text": data}),
                 })
 
+        except LLMQueueTimeoutError as exc:
+            yield _sse_data(
+                {
+                    "type": "error",
+                    "message": str(exc),
+                },
+            )
         except Exception as exc:
+            error_tokens = chat_tokens if chat_tokens else get_tokens()
+            if error_tokens > 0:
+                yield _sse_data({
+                    "type": "usage",
+                    "tokens_used": error_tokens,
+                })
             yield _sse_data(
                 {
                     "type": "error",
@@ -451,6 +662,9 @@ def ask_stream_endpoint(request: AskRequest):
                     )
                 },
             )
+        finally:
+            release_request_collector()
+            _chat_gate().release()
 
     return StreamingResponse(
         events(),
@@ -509,14 +723,20 @@ def account_summary_refresh(user_id: str):
 @app.delete("/api/session/{session_id}")
 def clear_session(session_id: str):
 
-    components = get_session_components(
-        session_id
-    )
-
-    components["conversation_memory"].clear()
+    # Previously this called get_session_components(), which *created* an
+    # entry when none existed and never removed it. Closing a conversation
+    # therefore leaked memory instead of freeing it.
+    removed = drop_session(session_id)
 
     return {
         "status": "success",
         "session_id": session_id,
-        "message": "Conversation memory cleared."
+        "removed": removed,
+        "message": "Conversation memory cleared.",
     }
+
+
+@app.get("/api/session/stats")
+def session_stats():
+
+    return session_cache_stats()

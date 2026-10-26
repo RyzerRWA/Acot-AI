@@ -1,5 +1,5 @@
-from app.retrieval.supabase.pgvector_retriever import (
-    SupabasePGVectorRetriever
+from app.retrieval.postgres.pgvector_retriever import (
+    PGVectorRetriever
 )
 
 
@@ -9,7 +9,7 @@ def main():
     print("BROCHURE PGVECTOR SEARCH TEST")
     print("=" * 60)
 
-    retriever = SupabasePGVectorRetriever(
+    retriever = PGVectorRetriever(
         match_threshold=0.3,
         match_count=5
     )

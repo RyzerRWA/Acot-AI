@@ -3,8 +3,8 @@ ACOT Hybrid Context Builder
 
 Builds compact, grounded context for the RAG/LLM layer from:
 
-1. Supabase PostgreSQL structured data
-2. Supabase pgvector document chunks
+1. PostgreSQL structured data
+2. PostgreSQL pgvector document chunks
 
 Optimization goals:
 - Preserve project/community/sub-community ordering.
@@ -20,11 +20,13 @@ from datetime import datetime
 
 class HybridContextBuilder:
 
-    # Keep long database text bounded so simple requests do not send huge
-    # descriptions/knowledge fields to Gemini.
-    MAX_DESCRIPTION_CHARS = 2200
-    MAX_KNOWLEDGE_CHARS = 1200
-    MAX_DOCUMENT_CHARS = 3500
+    # Keep long database text bounded so prompts stay small.
+    MAX_DESCRIPTION_CHARS = 400
+    MAX_KNOWLEDGE_CHARS = 300
+    MAX_DOCUMENT_CHARS = 1200
+    MAX_PROJECTS = 8
+    MAX_LISTINGS = 8
+    MAX_AMENITIES = 12
 
     def __init__(self):
         pass
@@ -49,14 +51,16 @@ class HybridContextBuilder:
 
         return text[:max_chars].rstrip() + "..."
 
-    @staticmethod
-    def _list_text(value):
+    @classmethod
+    def _list_text(cls, value, max_items=None):
         """Convert list-like database fields into compact readable text."""
         if not value:
             return None
 
         if isinstance(value, (list, tuple)):
             values = [str(item).strip() for item in value if str(item).strip()]
+            if max_items is not None:
+                values = values[:max_items]
             return ", ".join(values) if values else None
 
         return str(value).strip() or None
@@ -108,6 +112,9 @@ class HybridContextBuilder:
                 ) or [],
                 "sub_communities": structured_summary.get(
                     "sub_communities", []
+                ) or [],
+                "listings": structured_summary.get(
+                    "listings", []
                 ) or [],
                 "documents": document_results or [],
             }
@@ -197,40 +204,83 @@ class HybridContextBuilder:
             or []
         )
 
+        listings = (
+            retrieval_result.get("listings", [])
+            or []
+        )
+
         if not (
             communities
             or projects
             or sub_communities
+            or listings
         ):
             return ""
 
         context_parts = [
-            "SUPABASE STRUCTURED REAL ESTATE DATA",
+            "POSTGRES STRUCTURED REAL ESTATE DATA",
             "",
             "Use this as the primary source for structured facts.",
             "Project order below is authoritative and must be preserved.",
             "",
         ]
 
+        if listings:
+            listings = listings[: self.MAX_LISTINGS]
+            context_parts.extend([
+                "RENTAL LISTINGS",
+                "",
+                "These rows are individual rental listings.",
+                "Use each listing's rent, bedrooms, size, and community.",
+                "Do not add listings that are not listed here.",
+                "",
+            ])
+            for index, listing in enumerate(listings, start=1):
+                beds = listing.get("beds")
+                if beds == 0:
+                    bedroom_text = "studio"
+                elif beds is None:
+                    bedroom_text = "N/A"
+                else:
+                    bedroom_text = str(beds)
+
+                price = listing.get("price_aed")
+                frequency = listing.get("rent_frequency") or ""
+                if isinstance(price, (int, float)):
+                    price_text = f"AED {int(price):,} {frequency}".strip()
+                elif price:
+                    price_text = f"AED {price} {frequency}".strip()
+                else:
+                    price_text = "N/A"
+
+                size = listing.get("size_sqft")
+                size_text = f"{size} sqft" if size else "N/A"
+                context_parts.extend([
+                    f"LISTING {index}",
+                    f"Title: {self._value(listing.get('title'))}",
+                    f"Community: {self._value(listing.get('community'))}",
+                    f"Sub-community: {self._value(listing.get('sub_community'))}",
+                    f"Type: {self._value(listing.get('property_type'))}",
+                    f"Bedrooms: {bedroom_text}",
+                    f"Bathrooms: {self._value(listing.get('baths'))}",
+                    f"Size: {size_text}",
+                    f"Rent: {price_text}",
+                    f"Furnishing: {self._value(listing.get('furnishing'))}",
+                    f"Status: {self._value(listing.get('completion_status'))}",
+                    f"Agency: {self._value(listing.get('agency_name'))}",
+                    "",
+                    "------------------------",
+                    "",
+                ])
+
         # ========================================================
         # PROJECTS
         # ========================================================
 
         if projects:
+            projects = projects[: self.MAX_PROJECTS]
             context_parts.extend([
                 "PROJECTS",
-                "",
-                "COMPLETE PROJECT FACTS",
-                "Every retrieved project is listed here. Use every row, in this order.",
-                "",
-            ])
-
-            for index, project in enumerate(projects, start=1):
-                context_parts.append(
-                    f"{index}. {self._project_fact_line(project)}"
-                )
-
-            context_parts.extend([
                 "",
                 "PROJECT DETAIL",
                 "",
@@ -303,7 +353,8 @@ class HybridContextBuilder:
                 )
 
                 amenities = self._list_text(
-                    project.get("amenities")
+                    project.get("amenities"),
+                    max_items=self.MAX_AMENITIES,
                 )
 
                 description = self._compact_text(
@@ -476,7 +527,7 @@ class HybridContextBuilder:
             return ""
 
         context_parts = [
-            "SUPABASE PGVECTOR DOCUMENT KNOWLEDGE",
+            "POSTGRES PGVECTOR DOCUMENT KNOWLEDGE",
             "",
             "Use these retrieved document chunks only for "
             "document-specific facts.",

@@ -1,5 +1,90 @@
 class InvestmentAnalyzer:
 
+    @staticmethod
+    def summary_from_structured(structured_summary: dict) -> dict:
+        """
+        Build the community_summary shape analyze() expects from a
+        hybrid retriever bag (projects / community / listings).
+
+        Without this adapter, analyze() sees records_found=0 and
+        refuses every investment question even when projects loaded.
+        """
+
+        if not isinstance(structured_summary, dict):
+            return {"records_found": 0}
+
+        # Already in analyzer shape.
+        if "records_found" in structured_summary and (
+            "property_status_distribution" in structured_summary
+            or "rental_yield_percent" in structured_summary
+        ):
+            return structured_summary
+
+        projects = structured_summary.get("projects") or []
+        communities = structured_summary.get("communities") or []
+        listings = structured_summary.get("listings") or []
+
+        community_name = None
+        if communities and isinstance(communities[0], dict):
+            community_name = communities[0].get("name")
+        if not community_name and projects:
+            community_name = projects[0].get("community")
+
+        status_distribution = {}
+        property_types = []
+        for project in projects:
+            if not isinstance(project, dict):
+                continue
+            status = (
+                project.get("project_status")
+                or project.get("status")
+                or "unknown"
+            )
+            status_key = str(status).strip() or "unknown"
+            status_distribution[status_key] = (
+                status_distribution.get(status_key, 0) + 1
+            )
+            for value in project.get("property_types") or []:
+                text = str(value).strip()
+                if text and text not in property_types:
+                    property_types.append(text)
+
+        # Optional rental yield from listings when present.
+        rental_yield_percent = {}
+        yields = []
+        for listing in listings:
+            if not isinstance(listing, dict):
+                continue
+            raw = listing.get("rental_yield_percent")
+            if raw is None:
+                raw = listing.get("yield_percent")
+            try:
+                if raw is not None:
+                    yields.append(float(raw))
+            except (TypeError, ValueError):
+                continue
+        if yields:
+            rental_yield_percent = {
+                "average": round(sum(yields) / len(yields), 2),
+                "min": round(min(yields), 2),
+                "max": round(max(yields), 2),
+                "sample_size": len(yields),
+            }
+
+        return {
+            "community": community_name,
+            "district": None,
+            "records_found": len(projects) or len(listings),
+            "rental_yield_percent": rental_yield_percent,
+            "property_statuses": list(status_distribution.keys()),
+            "property_status_distribution": status_distribution,
+            "property_types": property_types,
+            "market_positions": [],
+            "amenities": [],
+            "landmarks": [],
+            "projects": projects,
+        }
+
     def analyze(self, community_summary: dict):
         """
         Analyze structured community data and generate
@@ -12,6 +97,10 @@ class InvestmentAnalyzer:
         This analysis is based only on the available dataset
         and should not be considered financial advice.
         """
+
+        community_summary = self.summary_from_structured(
+            community_summary or {}
+        )
 
         # =============================================
         # GET BASIC DATA

@@ -128,3 +128,48 @@ Show me all Canal Heights projects.
 Show me all Al Haseen Residence projects.
 Show me all Binghatti Hills projects.
 
+
+# 9. Rental listings — 2,227 rows in public.listings
+
+Show me listings in Jumeirah Village Circle (JVC).
+Show me apartments for rent in Business Bay.
+Show me 1 bedroom apartments for rent in Business Bay.
+Show me studio apartments for rent in Jumeirah Village Circle (JVC).
+Show me 2 bedroom apartments for rent in Dubai Marina.
+Show me apartments for rent in Downtown Dubai.
+Show me 1 bedroom apartments for rent in Downtown Dubai.
+Show me listings in Arjan.
+Show me studio apartments for rent in Arjan.
+Show me villas for rent in Dubai Hills Estate.
+Show me 4 bedroom villas for rent in Dubai Hills Estate.
+Show me 4 bedroom villas for rent in Jumeirah Village Circle (JVC).
+Show me 4 bedroom villas for rent in Al Furjan.
+Show me townhouses for rent in DAMAC Lagoons.
+Show me apartments for rent in Jumeirah Lake Towers (JLT).
+Show me apartments for rent in Dubai Creek Harbour.
+Show me listings in Meydan.
+Show me apartments for rent in Dubai South.
+Show me villas for rent in Business Bay.
+
+# 10. Follow-ups after a listing search
+
+Which of these are 1-bedroom apartments?
+Which of these are 2-bedroom apartments?
+Which of these are 3-bedroom apartments?
+Which of these are 4-bedroom apartments?
+Which of these are 4-bedroom villas?
+Which of these has the lowest yearly rent?
+Compare the first two rentals and tell me which is best.
+Compare 1 and 2 rentals and tell me the best.
+What is the yearly rent of the first listing?
+How many bedrooms does the second listing have?
+What is the size of the first rental?
+
+# 11. Compare two areas
+
+Compare apartments for rent in Dubai Marina and Business Bay.
+Compare 1 bedroom apartments for rent in Downtown Dubai and Dubai Marina.
+Compare studio apartments for rent in Jumeirah Village Circle (JVC) and Arjan.
+Compare 4 bedroom villas for rent in Dubai Hills Estate and Al Furjan.
+Compare Dubai Marina and Business Bay and tell me which is better to invest.
+

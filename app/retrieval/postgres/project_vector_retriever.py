@@ -2,7 +2,7 @@ from app.database.postgres import match
 from app.rag.embeddings.embedding_model import EmbeddingModel
 
 
-class SupabaseProjectVectorRetriever:
+class ProjectVectorRetriever:
 
     def __init__(
         self,
@@ -42,7 +42,7 @@ class SupabaseProjectVectorRetriever:
         )
 
         print("\n================================")
-        print("SUPABASE PROJECT VECTOR SEARCH")
+        print("POSTGRES PROJECT VECTOR SEARCH")
         print("================================")
 
         print(f"Question: {question}")
@@ -71,7 +71,7 @@ class SupabaseProjectVectorRetriever:
             )
 
         # -----------------------------------------------------
-        # Call Supabase RPC
+        # Call PostgreSQL match RPC
         # -----------------------------------------------------
 
         results = match(

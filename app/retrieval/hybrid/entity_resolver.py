@@ -1,7 +1,7 @@
 """
 ACOT Entity Resolver
 
-Resolves the geographic/project hierarchy from live Supabase data.
+Resolves the geographic/project hierarchy from live PostgreSQL data.
 
 Hierarchy:
 
@@ -32,7 +32,7 @@ Important:
 - Dubai Marina is a community inside Dubai.
 - Project resolution is based on project name only.
 - Community names do NOT resolve projects.
-- Data is loaded from live Supabase.
+- Data is loaded from live PostgreSQL.
 """
 
 from app.database.postgres import fetch
@@ -102,27 +102,15 @@ class EntityResolver:
     CATALOG_TTL_SECONDS = 600
 
     # ========================================================
-    # SUPABASE FIELDS
+    # POSTGRES FIELDS
     # ========================================================
 
     COMMUNITY_FIELDS = """
-        id,
-        slug,
-        name,
-        city
+        id,slug,name,city
     """
 
     PROJECT_FIELDS = """
-        id,
-        slug,
-        name,
-        developer_name,
-        city,
-        community,
-        sub_community,
-        price,
-        bedroom_min,
-        bedroom_max,
+        id,slug,name,developer_name,city,community,sub_community,price,bedroom_min,bedroom_max,
         property_types
     """
 
@@ -131,66 +119,13 @@ class EntityResolver:
     # ========================================================
 
     STOP_WORDS = {
-        "show",
-        "give",
-        "tell",
-        "me",
-        "about",
-        "the",
-        "best",
-        "top",
-        "properties",
-        "property",
-        "projects",
-        "project",
-        "apartments",
-        "apartment",
-        "villas",
-        "villa",
-        "homes",
-        "home",
-        "in",
-        "at",
-        "near",
-        "around",
-        "within",
-        "for",
-        "under",
-        "below",
-        "above",
-        "over",
-        "with",
-        "and",
-        "or",
-        "rental",
-        "rent",
-        "investment",
-        "invest",
-        "buy",
-        "sale",
-        "selling",
-        "aed",
-        "price",
-        "prices",
-        "available",
-        "options",
-        "all",
-        "every",
-        "good",
-        "better",
-        "recommend",
-        "recommendation",
-        "looking",
-        "find",
-        "search",
-        "which",
-        "what",
-        "are",
-        "is",
-        "can",
-        "you",
-        "city",
-        "location",
+        "show","give","tell","me","about","the","best","top","properties",
+        "property","projects","project","apartments","apartment","villas",
+        "villa","homes","home","in","at","near","around","within",
+        "for","under","below","above","over","with","and","or","rental","rent",
+        "investment","invest","buy","sale","selling","aed","price","prices","available",
+        "options","all","every","good","better","recommend","recommendation","looking","find",
+        "search","which","what","are","is","can","you","city","location",
     }
 
     # ========================================================
@@ -213,6 +148,7 @@ class EntityResolver:
         self._catalog_lock = Lock()
         self._communities_cache = None
         self._projects_cache = None
+        self._listing_sub_communities_cache = None
         self._catalog_loaded_at = 0.0
 
     # ========================================================
@@ -751,6 +687,129 @@ class EntityResolver:
         )
 
     # ========================================================
+    # RESOLVE SUB-COMMUNITY
+    # ========================================================
+
+    def _listing_sub_communities(self) -> List[Dict[str, Any]]:
+        """Listing clusters such as Morocco Cluster in International City."""
+
+        now = time.monotonic()
+        with self._catalog_lock:
+            if (
+                self._listing_sub_communities_cache is not None
+                and now - self._catalog_loaded_at < self.CATALOG_TTL_SECONDS
+            ):
+                return self._listing_sub_communities_cache
+
+        try:
+            rows = fetch(
+                "select distinct sub_community as name, community "
+                "from listings "
+                "where sub_community is not null "
+                "  and btrim(sub_community) <> '' "
+                "limit 5000"
+            ) or []
+        except Exception as exc:
+            print(f"Listing sub-community catalog failed: {exc}")
+            rows = []
+
+        with self._catalog_lock:
+            self._listing_sub_communities_cache = rows
+            return rows
+
+    def _resolve_sub_community(
+        self,
+        phrases: List[str],
+        projects: List[Dict[str, Any]],
+        question: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """Match a phrase to project or listing sub_community values."""
+
+        question_norm = self.normalize(question or "")
+        names: Dict[str, Dict[str, Any]] = {}
+
+        def _add(raw, community=None, city=None, source="project"):
+            if not raw or not str(raw).strip():
+                return
+            name = str(raw).strip()
+            key = self.normalize(name)
+            if not key:
+                return
+            entry = names.get(key)
+            if entry is None:
+                names[key] = {
+                    "name": name,
+                    "community": community,
+                    "city": city,
+                    "count": 1,
+                    "sources": {source},
+                }
+            else:
+                entry["count"] += 1
+                entry["sources"].add(source)
+                if not entry.get("community") and community:
+                    entry["community"] = community
+                if not entry.get("city") and city:
+                    entry["city"] = city
+
+        for record in projects:
+            _add(
+                record.get("sub_community"),
+                record.get("community"),
+                record.get("city"),
+                "project",
+            )
+
+        for record in self._listing_sub_communities():
+            _add(
+                record.get("name"),
+                record.get("community"),
+                None,
+                "listing",
+            )
+
+        matches = []
+
+        for info in names.values():
+            name = info["name"]
+            best_score = 0.0
+            matched_phrase = None
+
+            for phrase in phrases:
+                score = self._score(phrase, name)
+                if score > best_score:
+                    best_score = score
+                    matched_phrase = phrase
+
+            if best_score < 0.70:
+                continue
+
+            # Prefer a sub-community whose parent community is also in the question.
+            parent = self.normalize(str(info.get("community") or ""))
+            if parent and parent in question_norm:
+                best_score = min(1.0, best_score + 0.08)
+
+            matches.append(
+                {
+                    "entity_type": "sub_community",
+                    "name": name,
+                    "id": None,
+                    "score": best_score,
+                    "matched_phrase": matched_phrase,
+                    "record": {
+                        "name": name,
+                        "community": info.get("community"),
+                        "city": info.get("city"),
+                        "project_count": info["count"],
+                        "sources": sorted(info["sources"]),
+                    },
+                }
+            )
+
+        matches.sort(key=lambda x: x["score"], reverse=True)
+        return matches[0] if matches else None
+
+    # ========================================================
     # MAIN RESOLUTION
     # ========================================================
 
@@ -804,7 +863,7 @@ class EntityResolver:
                 )
 
         # ====================================================
-        # LOAD LIVE SUPABASE DATA
+        # LOAD LIVE POSTGRES DATA
         # ====================================================
 
         communities, projects = self._catalog()
@@ -888,7 +947,7 @@ class EntityResolver:
 
                         f"Resolved project "
                         f"'{project_match['name']}' "
-                        f"from live Supabase data.",
+                        f"from live PostgreSQL data.",
 
                         f"Matched query phrase: "
                         f"'{project_match['matched_phrase']}'.",
@@ -908,7 +967,80 @@ class EntityResolver:
                 )
 
         # ====================================================
-        # 2. COMMUNITY
+        # 2. SUB-COMMUNITY
+        # ====================================================
+        #
+        # "Morocco Cluster, International City" is a sub-community
+        # name, not a community or project. Resolve it before the
+        # broader community match so the parent area does not win.
+
+        if entity_type in (
+            None,
+            "sub_community"
+        ):
+
+            sub_match = (
+                self._resolve_sub_community(
+                    unique_phrases,
+                    projects,
+                    question,
+                )
+            )
+
+            if sub_match:
+
+                record = sub_match["record"]
+
+                location = None
+                if record.get("city"):
+                    location = {
+                        "name": record["city"],
+                        "city": record["city"],
+                    }
+
+                community = None
+                if record.get("community"):
+                    community = {
+                        "name": record["community"],
+                    }
+
+                return ResolvedEntity(
+
+                    entity_type="sub_community",
+
+                    name=sub_match["name"],
+
+                    entity_id=sub_match["id"],
+
+                    confidence=sub_match["score"],
+
+                    record=record,
+
+                    candidates=[sub_match],
+
+                    location=location,
+
+                    community=community,
+
+                    reasoning=[
+
+                        f"Resolved sub-community "
+                        f"'{sub_match['name']}' "
+                        f"from live project data.",
+
+                        f"Matched query phrase: "
+                        f"'{sub_match['matched_phrase']}'.",
+
+                        f"Community: "
+                        f"{record.get('community')}.",
+
+                        f"Confidence: "
+                        f"{sub_match['score']:.2f}.",
+                    ],
+                )
+
+        # ====================================================
+        # 3. COMMUNITY
         # ====================================================
 
         if entity_type in (
@@ -973,7 +1105,7 @@ class EntityResolver:
 
                         f"Resolved community "
                         f"'{community_match['name']}' "
-                        f"from live Supabase data.",
+                        f"from live PostgreSQL data.",
 
                         f"City: "
                         f"{record.get('city')}.",
@@ -987,7 +1119,7 @@ class EntityResolver:
                 )
 
         # ====================================================
-        # 3. CITY
+        # 4. CITY
         # ====================================================
 
         if entity_type in (
@@ -1037,7 +1169,7 @@ class EntityResolver:
 
                         f"Resolved location "
                         f"'{city_match['name']}' "
-                        f"from live Supabase data.",
+                        f"from live PostgreSQL data.",
 
                         f"Matched query phrase: "
                         f"'{city_match['matched_phrase']}'.",
@@ -1048,7 +1180,7 @@ class EntityResolver:
                 )
 
         # ====================================================
-        # 4. DEVELOPER
+        # 5. DEVELOPER
         # ====================================================
         #
         # "Show me all Binghatti projects" is not one project name.
@@ -1087,7 +1219,7 @@ class EntityResolver:
 
                     f"Resolved developer "
                     f"'{developer_match['name']}' "
-                    f"from live Supabase data.",
+                    f"from live PostgreSQL data.",
 
                     f"Matched query phrase: "
                     f"'{developer_match['matched_phrase']}'.",
@@ -1098,32 +1230,21 @@ class EntityResolver:
             )
 
         # ====================================================
-        # 5. NOTHING FOUND
+        # 6. NOTHING FOUND
         # ====================================================
 
         return ResolvedEntity(
 
-            entity_type=None,
+            entity_type=None,name=None,entity_id=None,confidence=0.0,
 
-            name=None,
-
-            entity_id=None,
-
-            confidence=0.0,
-
-            record=None,
-
-            candidates=[],
-
-            location=None,
-
-            community=None,
+            record=None,candidates=[],location=None,community=None,
 
             reasoning=[
 
                 "No sufficiently strong "
-                "project, community, or "
+                "project, community, "
+                "sub-community, or "
                 "city match was found in "
-                "live Supabase data."
+                "live PostgreSQL data."
             ],
         )
