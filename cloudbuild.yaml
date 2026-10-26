@@ -30,8 +30,8 @@ steps:
       - DOCKER_BUILDKIT=1
     args:
       - build
-      - -t
-      - ${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}/${_SERVICE}:$COMMIT_SHA
+      - --file=docker/Dockerfile
+      - --tag=${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}/${_SERVICE}:$COMMIT_SHA
       - .
 
   - name: gcr.io/cloud-builders/docker
