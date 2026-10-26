@@ -14,6 +14,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from app.listings.agent import ListingAgent, ListingsUnavailable
+from app.listings.router import is_rent_question
+
 
 # =========================================================
 # POSTGRES STRUCTURED RETRIEVER
@@ -138,7 +141,16 @@ def initialize_acot():
         llm_client=query_planner._llm_client
     )
 
+    # Rental listings (scraped data in PostgreSQL) have their own agent; if it cannot start,
+    # the rest of ACOT still works and rental questions fall back to the normal pipeline.
+    try:
+        listing_agent = ListingAgent()
+    except Exception as exc:
+        print(f"Listings agent unavailable: {exc}")
+        listing_agent = None
+
     return {
+        "listing_agent": listing_agent,
         "structured_retriever": structured_retriever,
         "query_planner": query_planner,
         "entity_resolver": entity_resolver,
