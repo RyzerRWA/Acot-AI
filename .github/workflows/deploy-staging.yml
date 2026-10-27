@@ -120,7 +120,32 @@ jobs:
             df -h / /var/lib/docker 2>/dev/null || df -h /
             docker system df || true
 
-            docker pull "$IMAGE_REF"
+            # Require enough free space for extract (root was 29G in prior runs).
+            AVAIL_KB=$(df -Pk / | awk 'NR==2 {print $4}')
+            if [ "${AVAIL_KB:-0}" -lt 5000000 ]; then
+              echo "Not enough free disk on / (${AVAIL_KB}KB). Need >= 5GB."
+              exit 1
+            fi
+
+            # Pull with one retry: containerd "rename ... no such file" is often
+            # a corrupt/interrupted ingest after a large-layer failure.
+            pull_ok=0
+            for attempt in 1 2; do
+              if docker pull "$IMAGE_REF"; then
+                pull_ok=1
+                break
+              fi
+              echo "docker pull failed (attempt ${attempt}); clearing containerd ingest..."
+              sudo systemctl stop docker containerd 2>/dev/null || true
+              sudo rm -rf /var/lib/containerd/io.containerd.content.v1.content/ingest/* 2>/dev/null || true
+              sudo systemctl start containerd docker 2>/dev/null || true
+              sleep 3
+            done
+            if [ "$pull_ok" -ne 1 ]; then
+              echo "docker pull failed after retries"
+              exit 1
+            fi
+
             touch .env.images
             grep -v '^ACOT_AI_IMAGE=' .env.images > .env.images.tmp || true
             echo "ACOT_AI_IMAGE=$IMAGE_REF" >> .env.images.tmp
