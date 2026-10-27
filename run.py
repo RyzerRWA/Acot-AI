@@ -16,6 +16,8 @@ load_dotenv()
 
 from app.listings.agent import ListingAgent, ListingsUnavailable
 from app.listings.router import is_rent_question
+from app.llm.client import LLMQueueTimeoutError
+from app.subscription.token_usage import add_tokens
 
 
 # =========================================================
@@ -144,7 +146,8 @@ def initialize_acot():
     # Rental listings (scraped data in PostgreSQL) have their own agent; if it cannot start,
     # the rest of ACOT still works and rental questions fall back to the normal pipeline.
     try:
-        listing_agent = ListingAgent()
+        # The agent answers project and rental questions with tools. It shares the brochure retriever.
+        listing_agent = ListingAgent(pgvector=pgvector_retriever)
     except Exception as exc:
         print(f"Listings agent unavailable: {exc}")
         listing_agent = None
@@ -601,10 +604,45 @@ from app.answers.structured_answer import (
 
 
 
+# A greeting, thanks, or goodbye followed by nothing but filler is still
+# small talk: "hey, how are you today?", "thanks a lot", "hello acot".
+# Any other word ("hi, show me projects") means a real request, so the
+# message goes through the normal pipeline.
+_SMALL_TALK_LEADS = (
+    (re.compile(r"^(?:hi+|hey+|hel+o+|hiya|yo|greetings)$"), "greeting"),
+    (re.compile(r"^(?:thanks?|thx|ty|thank|cheers)$"), "thanks"),
+    (re.compile(r"^(?:bye+|goodbye)$"), "bye"),
+)
+
+_SMALL_TALK_FILLER = {
+    "there", "how", "are", "you", "u", "doing", "today", "is", "it",
+    "going", "what's", "whats", "up", "acot", "assistant", "bot",
+    "buddy", "friend", "bro", "sir", "madam", "dear", "again", "so",
+    "much", "a", "lot", "very", "for", "your", "the", "help", "all",
+    "everyone", "team", "good", "morning", "afternoon", "evening",
+    "night", "hi", "hello", "hey", "thanks", "thank", "bye", "nice",
+    "to", "meet", "see", "later", "take", "care", "and", "i", "am",
+    "fine", "well", "great",
+}
+
+
 def _classify_small_talk(question):
     """Return a small-talk kind when the whole message is a greeting or identity question."""
 
-    return _SMALL_TALK_KINDS.get(_normalize_chat_text(question))
+    text = _normalize_chat_text(question)
+    kind = _SMALL_TALK_KINDS.get(text)
+    if kind:
+        return kind
+
+    words = re.findall(r"[a-z']+", text)
+    if not words or len(words) > 8:
+        return None
+    for pattern, lead_kind in _SMALL_TALK_LEADS:
+        if pattern.match(words[0]):
+            if all(word in _SMALL_TALK_FILLER for word in words[1:]):
+                return lead_kind
+            return None
+    return None
 
 
 def _small_talk_answer(kind):
@@ -657,6 +695,158 @@ def _empty_structured_summary():
 # PROCESS QUESTION
 # =========================================================
 
+# =========================================================
+# TOOL-CALLING AGENT TURN
+# =========================================================
+# The model chooses read-only tools (projects, brochures, rentals) and explains
+# the result. It is switched on with ACOT_USE_AGENT=1. If it is off, or it
+# fails for any reason, the standard pipeline below answers as before.
+
+_AGENT_TAG = re.compile(r"\[\[(\d{1,12})\]\]")
+
+
+def _agent_enabled(components):
+    on = os.getenv("ACOT_USE_AGENT", "0").strip().lower() in ("1", "true", "yes", "on")
+    return on and components.get("listing_agent") is not None
+
+
+def _agent_listing_record(card):
+    """Rental card from the agent, in the row shape the frontend card builder reads."""
+    return {
+        "listing_id": card["listing_id"],
+        "title": card.get("title"),
+        "property_type": card.get("property_type"),
+        "price_aed": card.get("annual_rent_aed"),
+        "rent_frequency": "yearly",
+        "beds": card.get("beds"),
+        "baths": card.get("baths"),
+        "size_sqft": card.get("size_sqft"),
+        "furnishing": card.get("furnishing"),
+        "community": card.get("community"),
+        "sub_community": card.get("sub_community"),
+        "cover_photo": card.get("cover_photo"),
+        "url": card.get("path"),
+    }
+
+
+def _drop_repeated_name_lines(text, names):
+    """Remove lines that only repeat a project name (for example "- **ID:** Samana Waves") after it was already shown."""
+    wanted = {name.lower() for name in names if name}
+    kept, seen_names = [], set()
+    for line in text.split("\n"):
+        bare = re.sub(r"^[\s>*\-•\d.)]*(?:\*{0,2}id\*{0,2}\s*:?\s*\*{0,2})?", "", line, flags=re.I).strip(" *_:")
+        if bare.lower() in wanted:
+            if bare.lower() in seen_names:
+                continue  # a stray line that only repeats a name already written
+            seen_names.add(bare.lower())
+        else:
+            seen_names.update(name for name in wanted if name in line.lower())
+        kept.append(line)
+    return "\n".join(kept)
+
+
+async def _try_agent_turn(question, components, timing_ms, ask_started):
+    """Answer with the agent, or return None so the standard pipeline answers."""
+
+    if not _agent_enabled(components):
+        return None
+
+    agent = components["listing_agent"]
+    history = components.setdefault("agent_history", [])
+    profile = components.setdefault("profile", {})
+    llm = components["rag_chain"].llm
+
+    started = time.perf_counter()
+    # Same concurrency cap as every other model call, so the provider is not flooded.
+    await llm._acquire_slot()
+    try:
+        result = await asyncio.to_thread(
+            agent.answer, question, list(history), None, profile
+        )
+    except LLMQueueTimeoutError:
+        raise
+    except Exception as exc:
+        # Model unreachable, out of credit, or anything unexpected.
+        print(f"ACOT agent unavailable, using the standard pipeline: {exc}")
+        return None
+    finally:
+        llm._release_slot()
+
+    add_tokens(result.tokens)
+    if not (result.answer or "").strip():
+        return None
+
+    projects, listings, labels = [], [], {}
+    for card in result.cards:
+        if card.get("kind") == "project":
+            row = card["row"]
+            projects.append(row)
+            labels[card["listing_id"]] = row.get("name") or "this project"
+        else:
+            listings.append(_agent_listing_record(card))
+            labels[card["listing_id"]] = card.get("title") or "this rental"
+
+    # [[id]] tags become the project or rental name; the card is in the response data.
+    answer = _AGENT_TAG.sub(lambda m: labels.get(m.group(1), ""), result.answer)
+    answer = _drop_repeated_name_lines(answer, set(labels.values()))
+    answer = re.sub(r"[ \t]{2,}", " ", answer).strip()
+
+    used = {tool["name"] for tool in result.tools if tool.get("ok")}
+    if "compare_projects" in used and len(projects) >= 2:
+        question_type = "comparison"
+    elif len(projects) + len(listings) > 1:
+        question_type = "search"
+    elif len(projects) + len(listings) == 1:
+        question_type = "information"
+    else:
+        question_type = "general"
+
+    shown = "; ".join(f"{name} (id {key})" for key, name in labels.items())
+    history.append({"role": "user", "content": question})
+    history.append({
+        "role": "assistant",
+        "content": answer + (f"\n[internal note, not part of the reply. Shown: {shown}]" if shown else ""),
+    })
+    del history[:-12]
+
+    structured_summary = _empty_structured_summary()
+    structured_summary["projects"] = projects
+    structured_summary["listings"] = listings
+    timing_ms["agent"] = _elapsed_ms(started)
+
+    return {
+        "question": question,
+        "standalone_question": question,
+        "question_type": question_type,
+        "structured_summary": structured_summary,
+        "documents": [],
+        "investment_analysis": None,
+        "retrieval_result": {
+            "question_type": question_type,
+            "structured_data": {
+                "community": [],
+                "projects": projects,
+                "sub_communities": [],
+                "listings": listings,
+            },
+            "documents": [],
+        },
+        "rag_chain": components["rag_chain"],
+        "conversation_memory": components["conversation_memory"],
+        "use_fast": True,
+        "fast_answer": answer,
+        "context": None,
+        "timing_ms": timing_ms,
+        "ask_started": ask_started,
+        "small_talk": None,
+        "agent": {
+            "model": result.model,
+            "tools": [tool["name"] for tool in result.tools],
+            "tokens": result.tokens,
+        },
+    }
+
+
 async def _prepare_acot_turn(
     question,
     components
@@ -704,6 +894,12 @@ async def _prepare_acot_turn(
             "ask_started": ask_started,
             "small_talk": small_talk,
         }
+
+    agent_turn = await _try_agent_turn(
+        question, components, timing_ms, ask_started
+    )
+    if agent_turn is not None:
+        return agent_turn
 
     rewrite_started = time.perf_counter()
     question_for_search = prepare_user_question(question) or question
@@ -893,6 +1089,8 @@ def _finalize_acot_turn(prepared, answer, answer_started):
         investment_analysis=prepared["investment_analysis"],
     )
     response.setdefault("meta", {})["timing_ms"] = timing_ms
+    if prepared.get("agent"):
+        response["meta"]["agent"] = prepared["agent"]
     return response
 
 

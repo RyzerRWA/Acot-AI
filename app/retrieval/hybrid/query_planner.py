@@ -32,6 +32,8 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
+from app.retrieval.hybrid.question_text import contains_any_term
+
 
 @dataclass
 class QueryPlan:
@@ -754,7 +756,9 @@ Rules:
 
     @staticmethod
     def _contains_any(text: str, terms) -> bool:
-        return any(term in text for term in terms)
+        # Whole-word matching, so "review" is not a "view" and
+        # "current" is not a "rent".
+        return contains_any_term(text, terms)
 
     @staticmethod
     def _dedupe(values: List[str]) -> List[str]:

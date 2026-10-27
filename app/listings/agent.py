@@ -50,7 +50,9 @@ def strip_links(text: str) -> str:
 
 
 class ListingAgent:
-    def __init__(self, client: OpenAI | None = None):
+    def __init__(self, client: OpenAI | None = None, pgvector=None):
+        # pgvector: the shared brochure retriever, so the agent does not load a second embedding model
+        self.pgvector = pgvector
         if client is None:
             if not AICREDITS_API_KEY:
                 raise ValueError("AICREDITS_API_KEY is not configured.")
@@ -67,7 +69,7 @@ class ListingAgent:
             try:
                 response = self.client.chat.completions.create(
                     model=model, messages=messages, tools=TOOLS, tool_choice="auto",
-                    temperature=0.2, max_tokens=700)
+                    temperature=0.2, max_tokens=900)
                 return model, response
             except Exception as exc:  # network, rate limit, provider error
                 last = f"{model}: {exc}"
@@ -75,9 +77,17 @@ class ListingAgent:
                     break
         raise ListingsUnavailable(last)
 
-    def answer(self, question: str, history: list[dict] | None = None, listing_id: str | None = None) -> AgentResult:
+    def answer(self, question: str, history: list[dict] | None = None, listing_id: str | None = None,
+               profile: dict | None = None) -> AgentResult:
+        """profile: what is known about the user. The update_profile tool writes into this same dict."""
         started = time.perf_counter()
+        profile = {} if profile is None else profile
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        if profile:
+            messages.append({"role": "system", "content":
+                             "What is known about this user (from their own earlier messages or the app). Use it to "
+                             "personalise, but never present it as something they just said, and if their question "
+                             "conflicts with it, the question wins: " + json.dumps(profile, default=str)})
         if listing_id:
             messages.append({"role": "system", "content":
                              f'The user is looking at listing {listing_id}. "this one" or "is this fair" means that '
@@ -107,7 +117,8 @@ class ListingAgent:
             })
             for call in message.tool_calls:
                 try:
-                    result = run_tool(call.function.name, json.loads(call.function.arguments or "{}"))
+                    result = run_tool(call.function.name, json.loads(call.function.arguments or "{}"),
+                                      pgvector=self.pgvector, profile=profile)
                     output = result.output
                     used.append({"name": call.function.name, "ok": True})
                     for card in result.cards:
@@ -130,7 +141,15 @@ class ListingAgent:
     def _finish(text, seen, used, model, tokens, started) -> AgentResult:
         cleaned = strip_links(text)
         cited = list(dict.fromkeys(_ID_TAG.findall(cleaned)))
-        cards = [seen[i] for i in cited if i in seen][:6]   # only ids a tool really returned
+        # A card is shown for every id the model tagged. If it described a project or listing by name
+        # without tagging it, the card is still shown (only items a tool returned, only if named).
+        lowered = cleaned.lower()
+        for key, card in seen.items():
+            row = card.get("row") or {}
+            name = str(row.get("name") or card.get("title") or "").strip().lower()
+            if key not in cited and len(name) >= 6 and name in lowered:
+                cited.append(key)
+        cards = [seen[i] for i in cited if i in seen][:10]   # only ids a tool really returned
         answer = _ID_TAG.sub(lambda m: m.group(0) if m.group(1) in seen else "", cleaned).strip()
         ms = int(round((time.perf_counter() - started) * 1000))
         log.info("listings: %s | %s tokens | %sms | %s",

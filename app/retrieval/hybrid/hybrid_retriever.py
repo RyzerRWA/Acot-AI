@@ -25,6 +25,7 @@ Document data:
 """
 
 from app.database.postgres import fetch
+import asyncio
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -2659,21 +2660,29 @@ class HybridRetriever:
             result = self.retrieve_documents(question)
             return result, _elapsed_ms(started)
 
+        # Both retrievers do blocking work (database calls, and the
+        # sentence-transformers encode for documents). Run them on worker
+        # threads and await the result so the event loop stays free to serve
+        # other requests while this one waits.
+        loop = asyncio.get_running_loop()
+
         if needs_structured and needs_documents:
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                structured_future = pool.submit(_run_structured)
-                documents_future = pool.submit(_run_documents)
-                structured_result, structured_ms = structured_future.result()
-                documents, document_ms = documents_future.result()
+            (
+                (structured_result, structured_ms),
+                (documents, document_ms),
+            ) = await asyncio.gather(
+                loop.run_in_executor(None, _run_structured),
+                loop.run_in_executor(None, _run_documents),
+            )
             timing_ms["structured_retrieval"] = structured_ms
             timing_ms["document_retrieval"] = document_ms
         elif needs_structured:
             structured_result, timing_ms["structured_retrieval"] = (
-                _run_structured()
+                await loop.run_in_executor(None, _run_structured)
             )
         elif needs_documents:
             documents, timing_ms["document_retrieval"] = (
-                _run_documents()
+                await loop.run_in_executor(None, _run_documents)
             )
 
         communities = (

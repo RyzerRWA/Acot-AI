@@ -65,5 +65,71 @@ class RouterTests(unittest.TestCase):
         self.assertFalse(is_rent_question("", "listings"))
 
 
+class ProjectToolTests(unittest.TestCase):
+    """Project tools and the user profile. These checks need no database and no language model."""
+
+    def test_unknown_price_is_never_shown_as_zero_and_bad_sizes_are_blanked(self):
+        from app.listings.tools import _project_for_model
+        row = {"id": 1, "name": "X", "price": 0, "size_min": 0, "size_max": 225, "bedroom_min": 0,
+               "bedroom_max": 2, "handover_time": None, "developer_name": " Dev "}
+        shown = _project_for_model(row)
+        self.assertIsNone(shown["starting_price_aed"])
+        self.assertIsNone(shown["size_sqft_min"])
+        self.assertEqual(shown["size_sqft_max"], 225.0)
+        self.assertEqual(shown["developer"], "Dev")
+
+    def test_budget_filters_exclude_projects_with_no_price(self):
+        from app.listings.tools import _project_filters, _project_where
+        where, params = _project_where(_project_filters({"max_price_aed": 1_500_000}))
+        self.assertIn("price > 0", where)
+        self.assertEqual(params, [1_500_000])
+
+    def test_bad_project_arguments_are_rejected(self):
+        from app.listings.tools import search_projects, compare_projects, get_project
+        for tool, arguments in ((search_projects, {"sort": "x; drop table projects"}),
+                                (search_projects, {"min_price_aed": 9, "max_price_aed": 1}),
+                                (search_projects, {"communities": ["a"] * 9}),
+                                (compare_projects, {"projects": ["only one"]}),
+                                (compare_projects, {"projects": "not a list"}),
+                                (get_project, {})):
+            with self.assertRaises(ToolInputError, msg=str(arguments)):
+                tool(arguments)
+
+    def test_profile_is_validated_and_kept_in_the_session_dict(self):
+        from app.listings.tools import clean_profile, update_profile
+        self.assertEqual(clean_profile({"budget_max_aed": "1500000", "goal": "invest", "family_size": 4}),
+                         {"budget_max_aed": 1500000, "goal": "invest", "family_size": 4})
+        for bad in ({"goal": "flip"}, {"budget_min_aed": 5, "budget_max_aed": 1}, {"family_size": 0}, [1]):
+            with self.assertRaises(ToolInputError, msg=str(bad)):
+                clean_profile(bad)
+        saved: dict = {}
+        update_profile({"budget_max_aed": 900000}, profile=saved)
+        update_profile({"goal": "buy_to_live"}, profile=saved)
+        self.assertEqual(saved, {"budget_max_aed": 900000, "goal": "buy_to_live"})
+        update_profile({"clear": True}, profile=saved)
+        self.assertEqual(saved, {})
+
+    def test_project_cards_are_kept_only_for_ids_a_tool_returned(self):
+        seen = {"233000800": {"listing_id": "233000800", "kind": "project", "row": {"name": "Sky"}}}
+        result = ListingAgent._finish("Try [[233000800]] or [[999]].", seen, [], "m", 0, 0.0)
+        self.assertEqual([c["kind"] for c in result.cards], ["project"])
+        self.assertNotIn("999", result.answer)
+
+    def test_a_project_named_without_a_tag_still_gets_its_card(self):
+        seen = {"1": {"listing_id": "1", "kind": "project", "row": {"name": "Sky Edition at Seahaven"}},
+                "2": {"listing_id": "2", "kind": "project", "row": {"name": "Other Tower"}}}
+        result = ListingAgent._finish("Sky Edition at Seahaven starts from AED 21,132,340.", seen, [], "m", 0, 0.0)
+        self.assertEqual([c["listing_id"] for c in result.cards], ["1"])
+
+    def test_stray_name_and_id_lines_are_removed(self):
+        from run import _drop_repeated_name_lines
+        text = "1. **Samana Waves**\n   - Starting: AED 483,277\n   - **ID:** Samana Waves\n2. Azizi Ruby\n   - Azizi Ruby"
+        out = _drop_repeated_name_lines(text, {"Samana Waves", "Azizi Ruby"})
+        self.assertNotIn("ID:", out)
+        self.assertEqual(out.count("Samana Waves"), 1)
+        self.assertEqual(out.count("Azizi Ruby"), 1)
+        self.assertIn("AED 483,277", out)
+
+
 if __name__ == "__main__":
     unittest.main()

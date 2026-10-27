@@ -1,3 +1,6 @@
+from app.retrieval.hybrid.question_text import contains_any_term
+
+
 class HybridRouter:
 
     def route(self, question: str):
@@ -131,28 +134,30 @@ class HybridRouter:
             "building",
         ]
 
-        has_project_indicator = any(
-            keyword in question_lower
-            for keyword in project_indicators
+        # Whole-word matching: "view" must not fire inside "review",
+        # nor "rent" inside "current" or "different".
+        has_project_indicator = contains_any_term(
+            question_lower,
+            project_indicators,
         )
 
         # =====================================================
         # CHECK KEYWORD MATCHES
         # =====================================================
 
-        has_structured = any(
-            keyword in question_lower
-            for keyword in structured_keywords
+        has_structured = contains_any_term(
+            question_lower,
+            structured_keywords,
         )
 
-        has_document = any(
-            keyword in question_lower
-            for keyword in document_keywords
+        has_document = contains_any_term(
+            question_lower,
+            document_keywords,
         )
 
-        has_hybrid = any(
-            keyword in question_lower
-            for keyword in hybrid_keywords
+        has_hybrid = contains_any_term(
+            question_lower,
+            hybrid_keywords,
         )
 
         # =====================================================

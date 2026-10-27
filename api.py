@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from run import initialize_acot, ask_acot, stream_acot, _slim_stream_response
 from app.llm.client import LLMQueueTimeoutError
+from app.listings.tools import ToolInputError, clean_profile
 from app.logging_utils import (
     install_stdout_logger,
     set_request_tag,
@@ -113,6 +114,19 @@ app.add_middleware(
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1)
     session_id: str = Field(default="default", min_length=1)
+    # Optional, from the app: what is known about the user, for personalised answers. For example
+    # {"budget_max_aed": 1500000, "goal": "invest", "preferred_areas": ["JVC"], "family_size": 4}.
+    profile: dict | None = None
+
+
+def _apply_profile(components, profile):
+    """Merge an app-supplied user profile into the session. Invalid values are ignored, never fatal."""
+    if not profile:
+        return
+    try:
+        components.setdefault("profile", {}).update(clean_profile(profile))
+    except ToolInputError:
+        pass
 
 
 # ============================================================
@@ -479,6 +493,7 @@ async def ask_endpoint(request: AskRequest):
         components = get_session_components(
             request.session_id
         )
+        _apply_profile(components, request.profile)
 
         # ----------------------------------------------------
         # Run existing ACOT pipeline
@@ -581,6 +596,7 @@ async def ask_stream_endpoint(request: AskRequest):
             components = get_session_components(
                 request.session_id
             )
+            _apply_profile(components, request.profile)
 
             chat_tokens = 0
 
