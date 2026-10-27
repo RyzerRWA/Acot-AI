@@ -9,10 +9,31 @@ set -euo pipefail
 : "${IMAGE:?IMAGE is required}"
 : "${HEALTH_PATH:?HEALTH_PATH is required}"
 
-PROBE_FAILURE_THRESHOLD="${PROBE_FAILURE_THRESHOLD:-12}"
-PROBE_PERIOD_SECONDS="${PROBE_PERIOD_SECONDS:-15}"
-PROBE_TIMEOUT_SECONDS="${PROBE_TIMEOUT_SECONDS:-30}"
+PROBE_FAILURE_THRESHOLD="${PROBE_FAILURE_THRESHOLD:-24}"
+PROBE_PERIOD_SECONDS="${PROBE_PERIOD_SECONDS:-10}"
+PROBE_TIMEOUT_SECONDS="${PROBE_TIMEOUT_SECONDS:-5}"
 ATTEMPTS="${ATTEMPTS:-12}"
+
+# Cloud Run requires timeoutSeconds < periodSeconds. A startup probe's
+# failureThreshold * periodSeconds also cannot exceed 240 seconds.
+if [ "$PROBE_PERIOD_SECONDS" -gt 240 ]; then
+  PROBE_PERIOD_SECONDS=240
+fi
+if [ "$PROBE_PERIOD_SECONDS" -lt 2 ]; then
+  PROBE_PERIOD_SECONDS=2
+fi
+if [ "$PROBE_TIMEOUT_SECONDS" -ge "$PROBE_PERIOD_SECONDS" ]; then
+  PROBE_TIMEOUT_SECONDS=$((PROBE_PERIOD_SECONDS - 1))
+fi
+if [ "$PROBE_TIMEOUT_SECONDS" -lt 1 ]; then
+  PROBE_TIMEOUT_SECONDS=1
+fi
+max_failures=$((240 / PROBE_PERIOD_SECONDS))
+if [ "$PROBE_FAILURE_THRESHOLD" -gt "$max_failures" ]; then
+  echo "Startup probe window cannot exceed 240s. Lowering failure threshold from ${PROBE_FAILURE_THRESHOLD} to ${max_failures}."
+  PROBE_FAILURE_THRESHOLD="$max_failures"
+fi
+echo "Startup probe: timeout=${PROBE_TIMEOUT_SECONDS}s period=${PROBE_PERIOD_SECONDS}s failures=${PROBE_FAILURE_THRESHOLD}"
 
 echo "Image: ${IMAGE}"
 echo "Service: ${SERVICE} (${REGION})"
@@ -84,8 +105,16 @@ deploy_args=(
   --image "$IMAGE"
   --region "$REGION"
   --platform managed
-  --no-traffic
-  --tag candidate
+)
+
+# A brand-new service cannot be created with --no-traffic.
+if [ "$SERVICE_EXISTS" -eq 0 ]; then
+  echo "Creating the first revision with traffic."
+else
+  deploy_args+=(--no-traffic --tag candidate)
+fi
+
+deploy_args+=(
   --startup-probe "httpGet.path=${HEALTH_PATH},initialDelaySeconds=0,timeoutSeconds=${PROBE_TIMEOUT_SECONDS},periodSeconds=${PROBE_PERIOD_SECONDS},failureThreshold=${PROBE_FAILURE_THRESHOLD}"
   --quiet
 )
@@ -144,11 +173,18 @@ if [ "$deploy_status" -ne 0 ]; then
 fi
 
 NEW_REV="$(python3 /tmp/cr_status.py latest "$SERVICE" "$REGION")"
-echo "Created revision ${NEW_REV} with 0% traffic."
+if [ "$SERVICE_EXISTS" -eq 0 ]; then
+  echo "Created the first revision ${NEW_REV} with traffic."
+else
+  echo "Created revision ${NEW_REV} with 0% traffic."
+fi
 
 URLS="$(python3 /tmp/cr_status.py urls "$SERVICE" "$REGION")"
 SERVICE_URL="$(printf '%s\n' "$URLS" | sed -n '1p')"
 CANDIDATE_URL="$(printf '%s\n' "$URLS" | sed -n '2p')"
+if [ "$SERVICE_EXISTS" -eq 0 ]; then
+  CANDIDATE_URL="$SERVICE_URL"
+fi
 
 if [ -z "$CANDIDATE_URL" ]; then
   echo "Could not resolve a candidate URL for ${NEW_REV}."

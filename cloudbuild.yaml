@@ -20,8 +20,11 @@ substitutions:
   _HEALTH_PATH: /
   _MEMORY: 2Gi
   _CPU: "1"
+  # Startup probe: timeout must be less than period, and
+  # failureThreshold * periodSeconds cannot exceed 240.
+  _PROBE_TIMEOUT_SECONDS: "5"
   _PROBE_FAILURE_THRESHOLD: "24"
-  _PROBE_PERIOD_SECONDS: "15"
+  _PROBE_PERIOD_SECONDS: "10"
   _ATTEMPTS: "20"
 
 steps:
@@ -30,8 +33,8 @@ steps:
       - DOCKER_BUILDKIT=1
     args:
       - build
-      - -t
-      - ${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}/${_SERVICE}:$COMMIT_SHA
+      - --file=Docker/Dockerfile
+      - --tag=${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}/${_SERVICE}:$COMMIT_SHA
       - .
 
   - name: gcr.io/cloud-builders/docker
@@ -50,6 +53,7 @@ steps:
       - HEALTH_PATH=${_HEALTH_PATH}
       - MEMORY=${_MEMORY}
       - CPU=${_CPU}
+      - PROBE_TIMEOUT_SECONDS=${_PROBE_TIMEOUT_SECONDS}
       - PROBE_FAILURE_THRESHOLD=${_PROBE_FAILURE_THRESHOLD}
       - PROBE_PERIOD_SECONDS=${_PROBE_PERIOD_SECONDS}
       - ATTEMPTS=${_ATTEMPTS}

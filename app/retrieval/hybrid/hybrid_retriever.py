@@ -1245,6 +1245,12 @@ class HybridRetriever:
             )
         )
 
+        # "Best communities for rental yield" names communities, but the
+        # yield evidence lives on the project rows loaded with them.
+        asks_yield = bool(
+            re.search(r"\b(?:yield|roi|investment|investing|invest)\b", q)
+        )
+
         scopes: List[str] = []
 
         if asks_communities:
@@ -1262,7 +1268,7 @@ class HybridRetriever:
         if asks_properties and not scopes:
             scopes.append("projects")
 
-        if asks_project_facts and "projects" not in scopes:
+        if (asks_project_facts or asks_yield) and "projects" not in scopes:
             scopes.append("projects")
 
         if scopes:
@@ -1289,6 +1295,61 @@ class HybridRetriever:
             return mapping.get(entity_type)
 
         return None
+
+    @staticmethod
+    def _asks_for_catalog(question: str) -> bool:
+        """True when the question asks for a set of records and no place."""
+
+        return bool(
+            re.search(
+                r"\b(?:communities|community|projects|project|properties|"
+                r"property|areas|districts|neighbourhoods|neighborhoods)\b",
+                question or "",
+                flags=re.IGNORECASE,
+            )
+        )
+
+    @staticmethod
+    def _prefer_matching_communities(
+        communities: List[Dict[str, Any]],
+        question: str,
+    ) -> List[Dict[str, Any]]:
+        """Put communities whose text matches the question ahead of the rest.
+
+        A question such as "which communities suit families?" has no place
+        name, so the city catalog is large. The answer only sees the first
+        slice, so family-related rows have to come first.
+        """
+
+        rows = [row for row in communities or [] if isinstance(row, dict)]
+        if not rows:
+            return []
+
+        stop = {
+            "which", "what", "communities", "community", "projects", "project",
+            "suit", "suits", "best", "with", "from", "that", "this", "have",
+            "does", "for", "the", "and", "are", "dubai",
+        }
+        tokens = []
+        for token in re.findall(r"[a-z]+", (question or "").lower()):
+            if len(token) < 4 or token in stop:
+                continue
+            stem = token[:-3] if token.endswith("ies") else token.rstrip("s")
+            if len(stem) >= 4:
+                tokens.append(stem)
+        if not tokens:
+            return rows[:12]
+
+        def score(row: Dict[str, Any]) -> int:
+            text = " ".join(
+                str(row.get(field) or "")
+                for field in ("name", "knowledge_text", "description")
+            ).lower()
+            return sum(1 for token in tokens if token in text)
+
+        ranked = sorted(rows, key=score, reverse=True)
+        matched = [row for row in ranked if score(row) > 0]
+        return (matched or ranked)[:12]
 
     @staticmethod
     def _apply_data_scope(
@@ -2107,7 +2168,16 @@ class HybridRetriever:
                     except Exception as exc:
                         print("Handover-year retrieval error:", exc)
                         result = self._empty_structured_result()
-                elif intent == "investment":
+                elif intent in {"investment", "ranking"} or (
+                    query_plan is not None
+                    and (
+                        getattr(query_plan, "needs_ranking", False)
+                        or getattr(query_plan, "needs_analytics", False)
+                    )
+                ) or self._asks_for_catalog(question):
+                    # No place was named, but the user asked for communities
+                    # or projects. Load the Dubai catalog instead of returning
+                    # an empty result.
                     result = self._retrieve_by_city("Dubai")
                 else:
                     result = (
@@ -2163,6 +2233,10 @@ class HybridRetriever:
                 result,
                 question,
                 query_plan=query_plan,
+            )
+            result["communities"] = self._prefer_matching_communities(
+                result.get("communities") or [],
+                question,
             )
 
             return result

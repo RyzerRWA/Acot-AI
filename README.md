@@ -6,6 +6,28 @@
 
 ---
 
+## 🏘️ Rental Listings Agent
+
+ACOT also answers **rental** questions from the scraped listings in PostgreSQL (`public.listings`), alongside the
+off-plan project pipeline above. Questions that clearly mention rent (rent, monthly, a year, furnished, listings...)
+go to the listings agent; questions about buying, off-plan, developers or handover keep using the existing pipeline.
+
+- `app/listings/router.py`: keyword router (free and predictable). "Should I buy or rent?" stays with the main pipeline.
+- `app/listings/tools.py`: 5 read-only database tools (find_areas, search_listings, area_stats, get_listing, dataset_info).
+  The model never writes SQL; every query is parameterised and every number comes from the database.
+- `app/listings/agent.py`: the model picks tools, the tools query PostgreSQL, the model explains the result. Listing cards
+  are drawn by the app from `[[id]]` tags; any URL the model writes is stripped.
+- Answers use the normal response shape (`data.listings` holds the cards) and the normal SSE stream.
+
+Checks:
+```
+python -m unittest tests.test_listings_agent        # free: validation, link stripping, routing
+python scripts/eval_listings_agent.py               # live: 17 questions vs ground truth from the database (a few cents)
+```
+Needs `DATABASE_URL`, `AICREDITS_API_KEY` (and optionally `AICREDITS_MODEL`, `AICREDITS_FALLBACK_MODELS`, `PHOTOS_BASE_URL`).
+
+---
+
 ## 📌 Table of Contents
 
 - [Overview](#-overview)
