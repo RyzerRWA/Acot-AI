@@ -1,0 +1,107 @@
+# Staging CI/CD: build → Artifact Registry → pull & restart on VM
+#
+# Variables: ARTIFACT_REGISTRY_STAGING, APP_STAGING_ENV, VM_DEPLOY_PATH (optional)
+# Secrets:   GCP_SA_KEY, VM_HOST, STAGING_VM_USER, STAGING_VM_SSH_PRIVATE_KEY
+
+name: Deploy Staging
+
+on:
+  push:
+    branches: staging
+  workflow_dispatch:
+
+concurrency:
+  group: staging-acot-ai
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Require staging config
+        env:
+          ARTIFACT_REGISTRY_STAGING: ${{ vars.ARTIFACT_REGISTRY_STAGING }}
+          APP_STAGING_ENV: ${{ vars.APP_STAGING_ENV }}
+        run: |
+          test -n "$ARTIFACT_REGISTRY_STAGING" || { echo "Missing var ARTIFACT_REGISTRY_STAGING"; exit 1; }
+          test -n "$APP_STAGING_ENV" || { echo "Missing var APP_STAGING_ENV"; exit 1; }
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          token_format: access_token
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        env:
+          ARTIFACT_REGISTRY_STAGING: ${{ vars.ARTIFACT_REGISTRY_STAGING }}
+        run: |
+          REGISTRY_HOST="${ARTIFACT_REGISTRY_STAGING%%/*}"
+          gcloud auth configure-docker "$REGISTRY_HOST" --quiet
+          echo "REGISTRY_HOST=$REGISTRY_HOST" >> "$GITHUB_ENV"
+
+      - name: Build and push image
+        env:
+          ARTIFACT_REGISTRY_STAGING: ${{ vars.ARTIFACT_REGISTRY_STAGING }}
+        run: |
+          IMAGE="${ARTIFACT_REGISTRY_STAGING}"
+          TAG_SHA="${IMAGE}:${GITHUB_SHA}"
+          TAG_STAGING="${IMAGE}:staging"
+          docker build -f Docker/Dockerfile -t "$TAG_SHA" -t "$TAG_STAGING" .
+          docker push "$TAG_SHA"
+          docker push "$TAG_STAGING"
+          echo "IMAGE_REF=$TAG_SHA" >> "$GITHUB_ENV"
+
+      - name: Write staging env from GitHub variable
+        env:
+          APP_STAGING_ENV: ${{ vars.APP_STAGING_ENV }}
+        run: |
+          mkdir -p deploy-out/env
+          printf '%s\n' "$APP_STAGING_ENV" > deploy-out/env/acot-ai.env
+
+      - name: Copy env to VM (from APP_STAGING_ENV, not repo .env)
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.STAGING_VM_HOST }}
+          username: ${{ secrets.STAGING_VM_USER }}
+          key: ${{ secrets.STAGING_VM_SSH_PRIVATE_KEY }}
+          source: deploy-out/env/acot-ai.env
+          target: ${{ vars.VM_DEPLOY_PATH || '/home/ubuntu/acot' }}/env/
+          strip_components: 2
+
+      - name: Pull image and recreate container
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          IMAGE_REF: ${{ env.IMAGE_REF }}
+          REGISTRY_HOST: ${{ env.REGISTRY_HOST }}
+          ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+          DEPLOY_PATH: ${{ vars.VM_DEPLOY_PATH || '/home/ubuntu/acot' }}
+        with:
+          host: ${{ secrets.STAGING_VM_HOST }}
+          username: ${{ secrets.STAGING_VM_USER }}
+          key: ${{ secrets.STAGING_VM_SSH_PRIVATE_KEY }}
+          envs: IMAGE_REF,REGISTRY_HOST,ACCESS_TOKEN,DEPLOY_PATH
+          script_stop: true
+          script: |
+            set -euo pipefail
+            echo "$ACCESS_TOKEN" | docker login -u oauth2accesstoken --password-stdin "$REGISTRY_HOST"
+            cd "$DEPLOY_PATH"
+            mkdir -p env
+            docker pull "$IMAGE_REF"
+            touch .env.images
+            grep -v '^ACOT_AI_IMAGE=' .env.images > .env.images.tmp || true
+            echo "ACOT_AI_IMAGE=$IMAGE_REF" >> .env.images.tmp
+            mv .env.images.tmp .env.images
+            docker compose --env-file .env.images up -d --no-deps --force-recreate acot-ai
+            docker image prune -f
+            docker logout "$REGISTRY_HOST" || true
