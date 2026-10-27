@@ -25,7 +25,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Require staging config
-        env:ARTIFACT_REGISTRY_STAGING
+        env:
           ARTIFACT_REGISTRY_STAGING: ${{ vars.ARTIFACT_REGISTRY_STAGING }}
           APP_STAGING_ENV: ${{ vars.APP_STAGING_ENV }}
         run: |
