@@ -97,11 +97,35 @@ jobs:
             echo "$ACCESS_TOKEN" | docker login -u oauth2accesstoken --password-stdin "$REGISTRY_HOST"
             cd "$DEPLOY_PATH"
             mkdir -p env
+
+            echo "=== Disk before cleanup ==="
+            df -h / /var/lib/docker 2>/dev/null || df -h /
+            docker system df || true
+
+            # Stop acot-ai first so its image can be deleted and free room for the new pull.
+            # (CUDA layers are large; keeping old+new images at once often fills the disk.)
+            if [ -f .env.images ]; then
+              docker compose --env-file .env.images stop acot-ai || true
+              docker compose --env-file .env.images rm -f acot-ai || true
+            fi
+
+            IMAGE_REPO="${IMAGE_REF%%:*}"
+            docker images "$IMAGE_REPO" -q | sort -u | xargs -r docker rmi -f 2>/dev/null || true
+            docker container prune -f || true
+            docker image prune -af || true
+            docker builder prune -af || true
+            docker system prune -af || true
+
+            echo "=== Disk after cleanup ==="
+            df -h / /var/lib/docker 2>/dev/null || df -h /
+            docker system df || true
+
             docker pull "$IMAGE_REF"
             touch .env.images
             grep -v '^ACOT_AI_IMAGE=' .env.images > .env.images.tmp || true
             echo "ACOT_AI_IMAGE=$IMAGE_REF" >> .env.images.tmp
             mv .env.images.tmp .env.images
             docker compose --env-file .env.images up -d --no-deps --force-recreate acot-ai
-            docker image prune -f
+
+            docker image prune -af || true
             docker logout "$REGISTRY_HOST" || true
