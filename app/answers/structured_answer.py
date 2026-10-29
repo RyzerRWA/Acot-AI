@@ -540,17 +540,9 @@ def _score_snapshots(left, right):
             ),
         ))
 
-    if not checks:
-        left["score"] = 50
-        right["score"] = 50
-        return (
-            f"{left['name']} and {right['name']} both score 50%. "
-            "The records do not show a difference on price, size, bedrooms, or handover."
-        )
-
     left_wins = sum(1 for name, _text in checks if name == left["name"])
     right_wins = len(checks) - left_wins
-    if left_wins == right_wins:
+    if not checks or left_wins == right_wins:
         left_score = right_score = 50
     else:
         left_score = round(40 + 60 * left_wins / len(checks))
@@ -559,16 +551,42 @@ def _score_snapshots(left, right):
     right["score"] = right_score
     winner = left if left_score >= right_score else right
     loser = right if winner is left else left
-    bullets = "\n".join(f"- {text}" for _name, text in checks)
-    if left_score == right_score:
-        intro = f"{left['name']} and {right['name']} both score 50%."
+    table_rows = [f"| Factor | {left['name']} | {right['name']} |", "| --- | --- | --- |"]
+    fields = (
+        ("Price", "price", lambda value: _format_aed(value) or str(value)),
+        ("Size", "size", lambda value: f"{int(value):,} sqft"),
+        ("Bedrooms", "beds", _bedroom_text),
+        ("Handover", "handover", _handover_label),
+    )
+    comparable_fields = 0
+    for label, key, formatter in fields:
+        left_value = left.get(key)
+        right_value = right.get(key)
+        if left_value is None and right_value is None:
+            continue
+        comparable_fields += 1
+        left_text = formatter(left_value) if left_value is not None else "Not recorded"
+        right_text = formatter(right_value) if right_value is not None else "Not recorded"
+        table_rows.append(f"| {label} | {left_text} | {right_text} |")
+    table_rows.append(f"| Score | {left_score}% | {right_score}% |")
+    table = "\n".join(table_rows)
+    if not checks and not comparable_fields:
+        intro = (
+            "I can't recommend one over the other because the records do not "
+            "contain comparable price, size, bedroom, or handover details."
+        )
+    elif left_score == right_score:
+        intro = (
+            f"{left['name']} and {right['name']} both score 50%. "
+            "The available recorded factors do not favor either one."
+        )
     else:
         intro = (
             f"{winner['name']} scores {winner['score']}% and "
             f"{loser['name']} scores {loser['score']}%. "
             f"{winner['name']} is the stronger of the two on these records."
         )
-    return f"{intro}\n{bullets}"
+    return f"{intro}\n\n{table}"
 
 
 def _comparison_card(side):
@@ -665,7 +683,7 @@ def _detect_response_type(
     )
     listings = structured_summary.get("listings") or []
 
-    if structured_summary.get("comparison_view"):
+    if structured_summary.get("comparison"):
         return "comparison"
 
     if question_type == "information" and len(listings) + len(projects or []) == 1:
@@ -680,8 +698,14 @@ def _detect_response_type(
     if listings and question_type == "search":
         return "listing_list"
 
+    # The app only draws cards for project_list, listing_list and comparison, so an
+    # investment answer that has projects must use one of them; the verdict still
+    # shows from data.investment_analysis.
     if question_type == "investment":
-        return "investment_analysis"
+        if listings and not projects:
+            return "listing_list"
+        if not projects:
+            return "investment_analysis"
 
     if any(
         phrase in question_lower
@@ -695,7 +719,7 @@ def _detect_response_type(
     ) and len(projects) >= 2:
         return "project_comparison"
 
-    if question_type == "search" and projects:
+    if question_type in {"search", "investment"} and projects:
         return "project_list"
 
     if sub_communities:
@@ -790,7 +814,7 @@ def build_frontend_response(
             "investment_analysis": _json_safe(
                 investment_analysis
             ),
-            "comparison": structured_summary.get("comparison_view") or [],
+            "comparison": (_build_comparison(structured_summary) or {}).get("sides") or [],
         },
         "meta": {
             "counts": {
@@ -1018,6 +1042,36 @@ def _listing_answer(listings, structured_summary, question=None):
     return "\n".join(lines)
 
 
+_BROWSE_REQUEST = re.compile(
+    r"\b(?:i want|i need|looking for|interested in|show me|give me|list|find|suggest)\b"
+)
+_REQUESTED_COUNT = re.compile(
+    r"\b(?:want|need|show me|give me|list|find|top|any|suggest)\s+(\d{1,2})\b"
+    r"(?!\s*-?\s*(?:bed|bedroom|bedrooms|br|bath|sqft|million|m|k)\b)"
+)
+DEFAULT_BROWSE_COUNT = 10
+
+
+def _limit_browse_projects(question, projects, structured_summary):
+    """A browse like "I want 10 1-bedroom apartments" shows a short list, not every match.
+
+    The order is kept as retrieved, so "the first one" in the next question still means the first one shown
+    (the conversation memory keeps the full list in the same order). The summary is cut in place, so the
+    cards the app draws match the text, and it gains project_total ("I found 165 projects. Here are 10").
+    """
+    if len(projects) <= 1 or not _BROWSE_REQUEST.search(question):
+        return projects, structured_summary, False
+
+    match = _REQUESTED_COUNT.search(question)
+    cap = int(match.group(1)) if match else DEFAULT_BROWSE_COUNT
+    cap = max(1, min(cap, 20))
+
+    if len(projects) > cap:
+        structured_summary["project_total"] = len(projects)
+        projects = projects[:cap]
+        structured_summary["projects"] = projects
+    return projects, structured_summary, True
+
 def _build_fast_structured_answer(
     question,
     structured_summary,
@@ -1124,6 +1178,10 @@ def _build_fast_structured_answer(
     if projects:
         lines = []
 
+        projects, structured_summary, browsing = _limit_browse_projects(
+            q, projects, structured_summary
+        )
+
         wants_bedrooms = any(
             term in q
             for term in ("bedroom", "bedrooms")
@@ -1140,6 +1198,12 @@ def _build_fast_structured_answer(
             term in q
             for term in ("price", "prices", "cost")
         )
+
+        if browsing:
+            # "I want 1-bedroom apartments" names a bedroom FILTER; it is not a question
+            # about the bedroom field, so show the normal list (price, bedrooms, handover).
+            wants_bedrooms = wants_handover = wants_developer = False
+            wants_status = wants_price = False
 
         # Field-specific follow-up answers.
         if len(projects) == 1:
@@ -1360,6 +1424,15 @@ _SMALL_TALK_KINDS = {
     "hey": "greeting",
     "good morning": "greeting",
     "good evening": "greeting",
+    "how are you": "greeting",
+    "how are you doing": "greeting",
+    "how are you today": "greeting",
+    "how's it going": "greeting",
+    "whats up": "greeting",
+    "what's up": "greeting",
+    "good night": "bye",
+    "see you": "bye",
+    "see you later": "bye",
     "good afternoon": "greeting",
     "thanks": "thanks",
     "thank you": "thanks",

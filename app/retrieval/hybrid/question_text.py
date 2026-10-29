@@ -166,7 +166,16 @@ def _correct_domain_typos(text: str) -> str:
     return " ".join(_correct_domain_word(token) for token in text.split())
 
 
+_BEDROOM_WORDS = {"one": "1", "two": "2", "three": "3", "four": "4", "five": "5", "six": "6"}
+
+
 def _normalize_bedrooms(text: str) -> str:
+    # "one bedroom" / "two-bed" -> "1 bedroom" / "2 bed", so filters read it the same way as digits
+    text = re.sub(
+        r"\b(one|two|three|four|five|six)[\s-]*(?=bed)",
+        lambda m: _BEDROOM_WORDS[m.group(1)] + " ",
+        text,
+    )
     text = re.sub(r"\b(\d+)\s*bed\s*rooms?\b", r"\1 bedroom", text)
     text = re.sub(r"\bbed\s+rooms?\b", "bedroom", text)
     return text

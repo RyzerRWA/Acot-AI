@@ -373,6 +373,8 @@ def _project_filters(a: dict) -> dict:
         "bedrooms": _num(a, "bedrooms", 0, 12),
         "handover_year": _num(a, "handover_year", 2000, 2100),
         "property_types": _strings(a, "property_types"),
+        "min_size": _num(a, "min_size_sqft", 0, 1_000_000),
+        "max_size": _num(a, "max_size_sqft", 0, 1_000_000),
     }
     if f["min_price"] is not None and f["max_price"] is not None and f["min_price"] > f["max_price"]:
         raise ToolInputError("min_price_aed cannot exceed max_price_aed.")
@@ -406,6 +408,12 @@ def _project_where(f: dict) -> tuple[str, list]:
     if f.get("bedrooms") is not None:
         parts.append("bedroom_min <= %s AND bedroom_max >= %s")
         params += [f["bedrooms"]] * 2
+    if f.get("min_size") is not None:  # some unit in the project is at least this big
+        parts.append("size_max >= %s")
+        params.append(f["min_size"])
+    if f.get("max_size") is not None:  # some unit is no bigger than this
+        parts.append("size_min > 0 AND size_min <= %s")
+        params.append(f["max_size"])
     if f.get("handover_year") is not None:
         parts.append("extract(year from handover_time at time zone 'UTC') = %s")
         params.append(f["handover_year"])
@@ -455,6 +463,26 @@ def _available_places() -> dict:
     }
 
 
+_known_names: set[str] | None = None
+
+
+def mentions_known_name(text: str) -> bool:
+    """True when the text names a community, project, developer or common short form that is in our data."""
+    global _known_names
+    if _known_names is None:
+        try:
+            rows = fetch("select lower(btrim(community)) as n from projects union "
+                         "select lower(btrim(community)) from listings union "
+                         "select lower(btrim(developer_name)) from projects union "
+                         "select lower(btrim(name)) from projects")
+        except Exception:
+            return False  # no database: do not force anything
+        _known_names = {r["n"] for r in rows if r.get("n") and len(r["n"]) >= 4}
+        _known_names |= {alias for alias in ALIASES if len(alias) >= 3}
+    lowered = (text or "").lower()
+    return any(re.search(rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])", lowered) for name in _known_names)
+
+
 def search_projects(raw) -> ToolResult:
     a = _obj(raw)
     f = _project_filters(a)
@@ -471,11 +499,60 @@ def search_projects(raw) -> ToolResult:
         "price_note": "Prices are STARTING prices for the project, not prices of a particular unit.",
         "projects": [_project_for_model(r) for r in rows],
     }
+    cards = [_project_card(r) for r in rows]
     if total == 0:
         out["note"] = ("No project matches these filters. Tell the user, and offer to loosen a filter or pick "
-                       "from what exists.")
+                       "from what exists. Unless the user asked to buy, or for sale or off-plan, ALSO call "
+                       "search_listings for the same place, bedrooms and size before you answer, and show the "
+                       "rentals too. Only call a result 'over budget' if the user actually gave a budget.")
+        closest = _closest_projects(f)
+        if closest:
+            out["closest_matches"] = [_project_for_model(r) | _gap(r, f) for r in closest]
+            out["closest_matches_note"] = ("These are the nearest real projects after relaxing: "
+                                           f"{closest[0]['_relaxed']}. Present them as the closest options, "
+                                           "say plainly that they do not fully match, and quote the gap given."
+                                           + ("" if f.get("max_price") else
+                                              " The user gave no budget, so do not say anything is over budget "
+                                              "or compute a gap."))
+            cards += [_project_card({k: v for k, v in r.items() if k != "_relaxed"}) for r in closest]
         out.update(_available_places())
-    return ToolResult(out, [_project_card(r) for r in rows])
+    return ToolResult(out, cards)
+
+
+def _closest_projects(f: dict, limit: int = 3) -> list[dict]:
+    """Nearest real projects when nothing matches: drop one filter at a time, in the order people give way."""
+    attempts = (
+        ("the budget", {"min_price": None, "max_price": None}),
+        ("the size", {"min_size": None, "max_size": None}),
+        ("the bedroom count", {"bedrooms": None}),
+        ("the handover year", {"handover_year": None}),
+        ("the property type", {"property_types": None}),
+        ("the place", {"communities": None}),
+    )
+    loosened, dropped = dict(f), []
+    for label, drop in attempts:
+        if all(f.get(key) is None for key in drop):
+            continue  # that filter was not used, so relaxing it changes nothing
+        loosened.update(drop)  # each step keeps the earlier relaxations, so the match gets looser and looser
+        dropped.append(label)
+        label = " and ".join(dropped)
+        where, params = _project_where(loosened)
+        # with a budget cap, the nearest projects are the cheapest ones; with a floor, the cheapest above it
+        order = "NULLIF(price, 0) ASC NULLS LAST, id" if f.get("max_price") or f.get("min_price") else \
+            PROJECT_SORTS["cheapest"]
+        rows = fetch(f"select {PROJECT_COLUMNS} from projects where {where} and price > 0 "
+                     f"order by {order} limit %s", (*params, limit))
+        if rows:
+            return [{**r, "_relaxed": label} for r in rows]
+    return []
+
+
+def _gap(row: dict, f: dict) -> dict:
+    """How far a near-miss is from the budget, computed here so the model never does the arithmetic."""
+    price, cap = row.get("price"), f.get("max_price")
+    if price and cap and price > cap:
+        return {"above_budget_by_aed": int(price - cap)}
+    return {}
 
 
 def _find_projects(ref: str, limit: int = 6) -> list[dict]:

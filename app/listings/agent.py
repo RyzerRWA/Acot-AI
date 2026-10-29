@@ -16,13 +16,16 @@ from dataclasses import dataclass, field
 from openai import OpenAI
 
 from app.core.config import AICREDITS_API_KEY, AICREDITS_BASE_URL
-from app.listings.prompt import SYSTEM_PROMPT, TOOLS
-from app.listings.tools import ToolInputError, run_tool
+from app.graph.graph import build_agent_graph
+from app.listings.prompt import SYSTEM_PROMPT, TOOLS, tools_for
+from app.listings.tools import ToolInputError, mentions_known_name, run_tool
 
 log = logging.getLogger("acot.listings")
 
 MAX_ROUNDS = 5
 MAX_TOOL_JSON = 9_000  # characters of tool output handed back to the model
+HISTORY_TURNS = 6      # earlier messages sent along with a question
+HISTORY_CHARS = 1_200  # longest earlier message sent in full
 _ID_TAG = re.compile(r"\[\[(\d{1,12})\]\]")
 
 
@@ -57,19 +60,27 @@ class ListingAgent:
             if not AICREDITS_API_KEY:
                 raise ValueError("AICREDITS_API_KEY is not configured.")
             client = OpenAI(base_url=AICREDITS_BASE_URL, api_key=AICREDITS_API_KEY, timeout=45.0)
+            if os.getenv("LANGSMITH_TRACING", "").strip().lower() in ("1", "true", "yes", "on") \
+                    and os.getenv("LANGSMITH_API_KEY"):
+                # Optional: every model call, tool call and graph step shows up in LangSmith with timing and tokens.
+                try:
+                    from langsmith.wrappers import wrap_openai
+                    client = wrap_openai(client)
+                except Exception as exc:
+                    log.warning("LangSmith tracing is not available: %s", exc)
         self.client = client
         primary = os.getenv("AICREDITS_MODEL", "openai/gpt-4o-mini")
         fallbacks = [m.strip() for m in os.getenv("AICREDITS_FALLBACK_MODELS", "").split(",") if m.strip()]
         self.models = [primary, *fallbacks]
 
     # one model call, trying the fallback models if the first one fails
-    def _chat(self, messages):
+    def _chat(self, messages, tools=None):
         last = "no model answered"
         for model in self.models:
             try:
                 response = self.client.chat.completions.create(
-                    model=model, messages=messages, tools=TOOLS, tool_choice="auto",
-                    temperature=0.2, max_tokens=900)
+                    model=model, messages=messages, tools=tools or TOOLS, tool_choice="auto",
+                    temperature=0.2, max_tokens=600)
                 return model, response
             except Exception as exc:  # network, rate limit, provider error
                 last = f"{model}: {exc}"
@@ -92,50 +103,24 @@ class ListingAgent:
             messages.append({"role": "system", "content":
                              f'The user is looking at listing {listing_id}. "this one" or "is this fair" means that '
                              "listing: call get_listing with this id."})
-        for turn in (history or [])[-8:]:
+        for turn in (history or [])[-HISTORY_TURNS:]:
             if turn.get("role") in ("user", "assistant") and turn.get("content"):
-                messages.append({"role": turn["role"], "content": str(turn["content"])[:2000]})
+                text = str(turn["content"])
+                if len(text) > HISTORY_CHARS:
+                    # keep the start and the end: the end carries the "[internal note" with the ids on screen
+                    text = text[:HISTORY_CHARS * 2 // 3] + " ... " + text[-HISTORY_CHARS // 3:]
+                messages.append({"role": turn["role"], "content": text})
         messages.append({"role": "user", "content": question})
 
-        seen: dict[str, dict] = {}   # every listing a tool actually returned this turn
-        used: list[dict] = []
-        tokens, model = 0, ""
-
-        for _ in range(MAX_ROUNDS):
-            model, response = self._chat(messages)
-            tokens += getattr(response.usage, "total_tokens", 0) or 0
-            message = response.choices[0].message
-
-            if not message.tool_calls:
-                return self._finish(message.content or "", seen, used, model, tokens, started)
-
-            messages.append({
-                "role": "assistant", "content": message.content,
-                "tool_calls": [{"id": c.id, "type": "function",
-                                "function": {"name": c.function.name, "arguments": c.function.arguments}}
-                               for c in message.tool_calls],
-            })
-            for call in message.tool_calls:
-                try:
-                    result = run_tool(call.function.name, json.loads(call.function.arguments or "{}"),
-                                      pgvector=self.pgvector, profile=profile)
-                    output = result.output
-                    used.append({"name": call.function.name, "ok": True})
-                    for card in result.cards:
-                        seen[card["listing_id"]] = card
-                except (ToolInputError, json.JSONDecodeError) as exc:
-                    # bad arguments go back to the model so it can correct itself
-                    used.append({"name": call.function.name, "ok": False})
-                    output = {"error": str(exc)}
-                except Exception:
-                    log.exception("tool %s failed", call.function.name)
-                    used.append({"name": call.function.name, "ok": False})
-                    output = {"error": "That lookup failed."}
-                messages.append({"role": "tool", "tool_call_id": call.id,
-                                 "content": json.dumps(output, default=str)[:MAX_TOOL_JSON]})
-
-        return self._finish("I couldn't pin that down. Could you rephrase it or narrow it to an area or a budget?",
-                            seen, used, model, tokens, started)
+        tools = tools_for(question)
+        graph = build_agent_graph(
+            lambda msgs: self._chat(msgs, tools),
+            lambda name, args: run_tool(name, args, pgvector=self.pgvector, profile=profile),
+            ToolInputError, max_rounds=MAX_ROUNDS, max_tool_json=MAX_TOOL_JSON, log=log,
+            needs_grounding=mentions_known_name)
+        state = graph.invoke({"messages": messages, "seen": {}, "used": [], "tokens": 0, "rounds": 0})
+        return self._finish(state.get("text", ""), state.get("seen", {}), state.get("used", []),
+                            state.get("model", ""), state.get("tokens", 0), started)
 
     @staticmethod
     def _finish(text, seen, used, model, tokens, started) -> AgentResult:

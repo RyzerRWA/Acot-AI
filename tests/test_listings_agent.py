@@ -84,6 +84,12 @@ class ProjectToolTests(unittest.TestCase):
         self.assertIn("price > 0", where)
         self.assertEqual(params, [1_500_000])
 
+    def test_project_size_filter(self):
+        from app.listings.tools import _project_filters, _project_where
+        where, params = _project_where(_project_filters({"min_size_sqft": 1000}))
+        self.assertIn("size_max >= %s", where)
+        self.assertEqual(params, [1000])
+
     def test_bad_project_arguments_are_rejected(self):
         from app.listings.tools import search_projects, compare_projects, get_project
         for tool, arguments in ((search_projects, {"sort": "x; drop table projects"}),
@@ -129,6 +135,196 @@ class ProjectToolTests(unittest.TestCase):
         self.assertEqual(out.count("Samana Waves"), 1)
         self.assertEqual(out.count("Azizi Ruby"), 1)
         self.assertIn("AED 483,277", out)
+
+
+class GraphTests(unittest.TestCase):
+    """The LangGraph agent, driven by a scripted model and a fake tool: no database, no credits."""
+
+    @staticmethod
+    def _graph(script, max_rounds=5):
+        from types import SimpleNamespace as NS
+        from app.graph.graph import build_agent_graph
+        calls = {"chat": 0}
+
+        def chat(messages):
+            reply = script[min(calls["chat"], len(script) - 1)]
+            calls["chat"] += 1
+            if isinstance(reply, str):
+                message = NS(content=reply, tool_calls=None)
+            else:
+                message = NS(content=None, tool_calls=[NS(id="c1", function=NS(name=reply[0], arguments=reply[1]))])
+            return "fake", NS(usage=NS(total_tokens=10), choices=[NS(message=message)])
+
+        def run(name, args):
+            return NS(output={"price": 21132340}, cards=[{"listing_id": "1", "kind": "project", "row": {"name": "Sky"}}])
+
+        graph = build_agent_graph(chat, run, ToolInputError, max_rounds=max_rounds)
+        start = {"messages": [{"role": "system", "content": "rules"}, {"role": "user", "content": "price of Sky?"}],
+                 "seen": {}, "used": [], "tokens": 0, "rounds": 0}
+        return graph.invoke(start), calls
+
+    def test_tool_then_answer(self):
+        state, calls = self._graph([("get_project", "{}"), "From AED 21,132,340. [[1]]"])
+        self.assertEqual(calls["chat"], 2)
+        self.assertEqual(state["used"], [{"name": "get_project", "ok": True}])
+        self.assertIn("1", state["seen"])
+        self.assertEqual(state["tokens"], 20)
+
+    def test_a_figure_no_tool_returned_is_sent_back_once(self):
+        state, calls = self._graph([("get_project", "{}"), "It costs AED 19,500,000.", "It costs AED 21,132,340."])
+        self.assertEqual(calls["chat"], 3)
+        self.assertEqual(state["text"], "It costs AED 21,132,340.")
+
+    def test_only_one_retry_even_if_the_model_repeats_itself(self):
+        state, calls = self._graph([("get_project", "{}"), "AED 19,500,000."])
+        self.assertEqual(calls["chat"], 3)
+        self.assertEqual(state["text"], "AED 19,500,000.")
+
+    def test_figures_from_the_question_years_and_small_numbers_are_not_flagged(self):
+        from app.graph.graph import unsupported_numbers
+        messages = [{"role": "system", "content": "AED 90,000 example"},
+                    {"role": "user", "content": "under 1.5 million please"}]
+        self.assertEqual(unsupported_numbers("Under AED 1,500,000, handover 2028, 3 bedrooms, 1.5 million.", messages), [])
+        self.assertEqual(unsupported_numbers("AED 90,000", messages), [90000.0])
+
+    def test_a_question_about_a_known_place_answered_from_memory_is_sent_back_for_data(self):
+        from types import SimpleNamespace as NS
+        from app.graph.graph import build_agent_graph
+        replies = ["Dubai Marina is a vibrant waterfront community.", ("market_stats", "{}"), "It has 1 project. [[1]]"]
+        seen_calls = {"n": 0}
+
+        def chat(messages):
+            reply = replies[seen_calls["n"]]
+            seen_calls["n"] += 1
+            message = NS(content=reply, tool_calls=None) if isinstance(reply, str) else NS(
+                content=None, tool_calls=[NS(id="c", function=NS(name=reply[0], arguments=reply[1]))])
+            return "fake", NS(usage=NS(total_tokens=1), choices=[NS(message=message)])
+
+        graph = build_agent_graph(chat, lambda n, a: NS(output={"projects": 1}, cards=[]), ToolInputError,
+                                  needs_grounding=lambda q: "marina" in q.lower())
+        state = graph.invoke({"messages": [{"role": "system", "content": "rules"},
+                                           {"role": "user", "content": "What is Dubai Marina?"}],
+                              "seen": {}, "used": [], "tokens": 0, "rounds": 0})
+        self.assertEqual(seen_calls["n"], 3)
+        self.assertEqual(state["used"], [{"name": "market_stats", "ok": True}])
+        self.assertIn("1 project", state["text"])
+
+    def test_general_guidance_or_unrelated_questions_are_not_forced_to_use_a_tool(self):
+        state, calls = self._graph(["General guidance: escrow protects buyers."])
+        self.assertEqual(calls["chat"], 1)
+
+    def test_doubled_names_after_a_tag_are_collapsed(self):
+        from run import _collapse_doubled_names
+        text = 'Samana Waves "Samana Waves" from AED 483,277, and Azizi Ruby Azizi Ruby from AED 618,000.'
+        self.assertEqual(_collapse_doubled_names(text, {"Samana Waves", "Azizi Ruby"}),
+                         "Samana Waves from AED 483,277, and Azizi Ruby from AED 618,000.")
+
+    def test_endless_tool_calls_stop_at_the_round_limit(self):
+        state, calls = self._graph([("get_project", "{}")], max_rounds=3)
+        self.assertEqual(calls["chat"], 3)
+        self.assertIn("couldn't pin that down", state["text"])
+
+
+class QuestionUnderstandingTests(unittest.TestCase):
+    """Regressions: "I want 10 1-bedroom apartments" was read as a reference to projects number 10 and 1."""
+
+    @classmethod
+    def setUpClass(cls):
+        from app.memory.conversation_memory import ConversationMemory
+        cls.memory = ConversationMemory(llm_client=None)
+        cls.memory.active_candidates = [{"name": f"Project {i}"} for i in range(1, 21)]
+
+    def test_quantities_are_not_references_to_earlier_results(self):
+        m = self.memory
+        self.assertIsNone(m._extract_numeric_pair("I want 10 1-bedroom apartments?"))
+        self.assertIsNone(m._extract_numeric_pair("show 3 and 4 bedroom villas"))
+        self.assertEqual(m._extract_numeric_pair("compare 1 and 2"), [1, 2])
+        self.assertFalse(m._looks_like_follow_up("I want 10 1-bedroom apartments?"))
+        self.assertFalse(m._looks_like_follow_up("one bedroom apartments under 2 million"))
+        self.assertTrue(m._looks_like_follow_up("compare 1 and 2"))
+        self.assertTrue(m._looks_like_follow_up("what is their price"))
+
+    def test_a_single_ordinal_is_resolved_without_the_model(self):
+        m = self.memory
+        self.assertEqual(m._rewrite_candidate_reference("what is the price of the first one"),
+                         'what is the price of "Project 1"')
+        self.assertEqual(m._rewrite_candidate_reference("tell me about the third"), 'tell me about "Project 3"')
+        self.assertIsNone(m._rewrite_candidate_reference("is the first time buyer discount available"))
+
+    def test_number_words_for_bedrooms_read_like_digits(self):
+        from app.retrieval.hybrid.question_text import prepare_user_question
+        from app.retrieval.hybrid.query_planner import QueryPlanner
+        text = prepare_user_question("I want 10 one-bedroom apartments.")
+        self.assertEqual(QueryPlanner._extract_filters(text), {"bedrooms": 1, "property_types": ["apartment"]})
+
+    def test_wanting_a_kind_of_property_is_a_search_not_a_field_lookup(self):
+        from app.retrieval.hybrid.query_planner import QueryPlanner
+        planner = QueryPlanner(llm_client=None, use_llm=False)
+        for question in ("I want 1-bedroom apartments?", "looking for 3 bedroom villas", "1 bedroom apartments"):
+            self.assertEqual(planner._rule_plan(question).intent, "search", question)
+        self.assertEqual(planner._rule_plan("what is the handover of Azizi Ruby").intent, "information")
+
+    def test_a_browse_shows_the_requested_number_of_projects(self):
+        from app.answers.structured_answer import _limit_browse_projects
+        projects = [{"name": f"P{i}"} for i in range(50)]
+        summary = {"projects": projects}
+        shown, summary, browsing = _limit_browse_projects("i want 10 1-bedroom apartments.", projects, summary)
+        self.assertTrue(browsing)
+        self.assertEqual((len(shown), len(summary["projects"]), summary["project_total"]), (10, 10, 50))
+        shown, _, _ = _limit_browse_projects("i want 1-bedroom apartments", list(projects), {"projects": projects})
+        self.assertEqual(len(shown), 10)                       # no count asked: a short default list
+        _, _, browsing = _limit_browse_projects("what are the bedrooms of these", projects, {})
+        self.assertFalse(browsing)
+
+
+class SessionStoreTests(unittest.TestCase):
+    """Saved chat memory, against a fake in-memory database (nothing is written to the real one)."""
+
+    def setUp(self):
+        import json, os
+        from unittest import mock
+        from app.listings import session_store
+        self.store, self.rows = session_store, {}
+        session_store._ready = False
+
+        def execute(sql, params=()):
+            if sql.startswith("insert"):
+                self.rows[params[0]] = {"history": json.loads(params[1]), "profile": json.loads(params[2])}
+            elif sql.startswith("delete"):
+                self.rows.pop(params[0], None)
+
+        def fetch(sql, params=()):
+            return [self.rows[params[0]]] if params[0] in self.rows else []
+
+        patches = [mock.patch.object(session_store, "execute", execute), mock.patch.object(session_store, "fetch", fetch),
+                   mock.patch.dict(os.environ, {"ACOT_PERSIST_SESSIONS": "1"})]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_memory_survives_a_restart_and_clear_forgets_it(self):
+        history = [{"role": "user", "content": f"q{i}"} for i in range(20)]
+        self.store.save("s1", history, {"budget_max_aed": 900000})
+        self.assertEqual(len(self.rows["s1"]["history"]), 12)           # only the last turns are kept
+        loaded_history, loaded_profile = self.store.load("s1")
+        self.assertEqual(loaded_history[-1]["content"], "q19")
+        self.assertEqual(loaded_profile, {"budget_max_aed": 900000})
+        self.store.delete("s1")
+        self.assertEqual(self.store.load("s1"), ([], {}))
+
+    def test_it_does_nothing_unless_switched_on(self):
+        import os
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"ACOT_PERSIST_SESSIONS": "0"}):
+            self.store.save("s2", [{"role": "user", "content": "hi"}], {})
+            self.assertNotIn("s2", self.rows)
+            self.assertEqual(self.store.load("s2"), ([], {}))
+
+    def test_a_database_error_never_breaks_the_chat(self):
+        from unittest import mock
+        with mock.patch.object(self.store, "execute", side_effect=RuntimeError("db down")):
+            self.store.save("s3", [], {})                     # must not raise
+            self.assertEqual(self.store.load("s3"), ([], {}))
 
 
 if __name__ == "__main__":

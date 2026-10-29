@@ -136,6 +136,9 @@ class QueryPlanner:
 
     SEARCH_TERMS = (
         "show me","find","list","search","available","options","properties","projects",
+        "i want","i need","i'm looking","im looking","looking for","interested in","suggest",
+        "apartment","apartments","flat","flats","villa","villas","townhouse","townhouses",
+        "studio","studios","penthouse","penthouses","duplex",
     )
 
     # ============================================================
@@ -532,12 +535,68 @@ class QueryPlanner:
 
         return False
 
+    @staticmethod
+    def _compact_conversation_history(
+        history: Any,
+        max_turns: int = 4,
+    ) -> Dict[str, Any]:
+        """
+        Build a small view of the conversation for the planner prompt.
+
+        The live context dict (which still flows to the retrievers and
+        memory unchanged) carries full previous answers and complete
+        candidate rows with descriptions, knowledge text and URLs.
+        The planner only classifies intent and sources, so serializing
+        that text into the prompt would only burn input tokens.
+        """
+        if not isinstance(history, dict):
+            return {}
+
+        candidates = []
+        for item in (history.get("active_candidates") or []):
+            if isinstance(item, dict) and item.get("name"):
+                candidates.append(
+                    {
+                        "name": item.get("name"),
+                        "entity_type": (
+                            item.get("entity_type")
+                            or "project"
+                        ),
+                    }
+                )
+
+        turns = []
+        for turn in (history.get("recent_turns") or [])[-max_turns:]:
+            if not isinstance(turn, dict):
+                continue
+
+            compact_turn = {
+                field: turn.get(field)
+                for field in (
+                    "user_question",
+                    "standalone_question",
+                    "question_type",
+                )
+                if turn.get(field)
+            }
+
+            if compact_turn:
+                turns.append(compact_turn)
+
+        return {
+            "active_entities": history.get("active_entities") or {},
+            "active_candidates": candidates,
+            "recent_turns": turns,
+        }
+
     async def _llm_plan(
         self,
         question: str,
         conversation_context: Optional[Dict[str, Any]] = None,
     ) -> Optional[QueryPlan]:
-        history = conversation_context or {}
+        history = self._compact_conversation_history(
+            conversation_context
+        )
 
         prompt = f"""
 You are the query-understanding layer of ACOT, an AI-powered Dubai real-estate intelligence system.
@@ -744,12 +803,29 @@ Rules:
     BROWSE_TERMS = (
         "show me","list",
         "find","search",
+        "i want","i need","i'm looking","im looking","looking for","interested in","suggest",
+    )
+
+    # "I want 1-bedroom apartments" or "2 bedroom flats in JVC" name a kind of property:
+    # that is a search, even though "bedroom" is also a stored field.
+    PROPERTY_KIND_TERMS = (
+        "apartment","apartments","flat","flats","villa","villas","townhouse","townhouses",
+        "studio","studios","penthouse","penthouses","duplex",
+    )
+    FIELD_QUESTION_TERMS = (
+        "what is","what's","whats","what are","how much","how many","which","when",
     )
 
     def _is_attribute_question(self, text: str) -> bool:
         """Stored-field questions are information, unless the user is browsing."""
 
         if self._contains_any(text, self.BROWSE_TERMS):
+            return False
+
+        if (
+            self._contains_any(text, self.PROPERTY_KIND_TERMS)
+            and not self._contains_any(text, self.FIELD_QUESTION_TERMS)
+        ):
             return False
 
         return self._contains_any(text, self.ATTRIBUTE_TERMS)
