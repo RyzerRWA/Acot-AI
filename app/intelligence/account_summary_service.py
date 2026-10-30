@@ -25,7 +25,9 @@ SCORE_LIMITS = {
 # CACHE
 # ============================================================
 
-CACHE_TTL_SECONDS = 15 * 60
+# The key already changes whenever the user asks a new question or changes plan, so a long
+# lifetime only avoids paying for the same summary again.
+CACHE_TTL_SECONDS = 6 * 60 * 60
 CACHE_MAX_ENTRIES = 200
 
 _cache: dict[str, tuple[float, dict]] = {}

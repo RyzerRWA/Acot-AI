@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -14,6 +15,8 @@ from pydantic import BaseModel, Field
 
 from run import initialize_acot, ask_acot, stream_acot, _slim_stream_response
 from app.llm.client import LLMQueueTimeoutError
+from app.listings import session_store
+from app.listings.tools import ToolInputError, clean_profile
 from app.logging_utils import (
     install_stdout_logger,
     set_request_tag,
@@ -113,6 +116,29 @@ app.add_middleware(
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1)
     session_id: str = Field(default="default", min_length=1)
+    # Optional, from the app: what is known about the user, for personalised answers. For example
+    # {"budget_max_aed": 1500000, "goal": "invest", "preferred_areas": ["JVC"], "family_size": 4}.
+    profile: dict | None = None
+    # Optional, from the backend: the signed-in user's name, so greetings can say "Hello Priya".
+    user_name: str | None = Field(default=None, max_length=120)
+
+
+def _apply_user_name(components, name):
+    """Keep a short, plain first name for greetings. Anything odd is dropped, never fatal."""
+    first = (name or "").strip().split(" ")[0] if name else ""
+    first = re.sub(r"[^\w'\-.]", "", first, flags=re.UNICODE)[:30]
+    if first:
+        components["user_name"] = first[:1].upper() + first[1:]
+
+
+def _apply_profile(components, profile):
+    """Merge an app-supplied user profile into the session. Invalid values are ignored, never fatal."""
+    if not profile:
+        return
+    try:
+        components.setdefault("profile", {}).update(clean_profile(profile))
+    except ToolInputError:
+        pass
 
 
 # ============================================================
@@ -194,6 +220,7 @@ def get_session_components(session_id: str):
             return components
 
         session_components = dict(base_components)
+        session_components["session_id"] = session_id
 
         session_components["conversation_memory"] = ConversationMemory(
             llm_client=base_components["query_planner"]._llm_client
@@ -212,6 +239,8 @@ def drop_session(session_id: str) -> bool:
 
     with _api_sessions_lock:
         entry = _api_sessions.pop(session_id, None)
+
+    session_store.delete(session_id)  # "clear conversation" also forgets the saved memory
 
     if entry is None:
         return False
@@ -479,6 +508,8 @@ async def ask_endpoint(request: AskRequest):
         components = get_session_components(
             request.session_id
         )
+        _apply_profile(components, request.profile)
+        _apply_user_name(components, request.user_name)
 
         # ----------------------------------------------------
         # Run existing ACOT pipeline
@@ -581,6 +612,8 @@ async def ask_stream_endpoint(request: AskRequest):
             components = get_session_components(
                 request.session_id
             )
+            _apply_profile(components, request.profile)
+            _apply_user_name(components, request.user_name)
 
             chat_tokens = 0
 

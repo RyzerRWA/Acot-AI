@@ -358,6 +358,20 @@ class ConversationMemory:
             if phrase in q_lower:
                 return True
 
+        # Numbers that are quantities, not references to an earlier answer:
+        # "10 1-bedroom apartments", "one bedroom", "under 2 million", "3 villas".
+        # Without this, every such question counted as a follow-up and was sent to
+        # the rewrite model, which could change it ("1-bedroom" -> "one-bedroom").
+        q_lower = re.sub(r"\b(one|two|three|four|five|six)[\s-]+bed", r"1 bed", q_lower)
+        q_lower = re.sub(r"\b(?:want|need|show me|give me|list|find|top|any)\s+\d+\b", " ", q_lower)
+        q_lower = re.sub(
+            r"\b\d+(?:[.,]\d+)?\s*-?\s*(?:bed(?:room)?s?|br|bhk|bath(?:room)?s?|sq\s?ft|aed|"
+            r"million|mn|m|k|%|years?|apartments?|villas?|townhouses?|studios?|flats?|"
+            r"penthouses?|duplex(?:es)?|projects?|properties|options|listings?)\b",
+            " ",
+            q_lower,
+        )
+
         # ---------------------------------------------------------
         # Location/context references.
         #
@@ -503,23 +517,21 @@ class ConversationMemory:
             1, 2
         """
 
-        matches = re.findall(
-            r"\b(\d+)\b",
+        # Only "1 and 2", "1, 2", "1 & 2", "1 vs 2" are references to two items on screen.
+        # "10 1-bedroom apartments", "2 bed 3 bath", "3 villas under 5 million" are not:
+        # there the numbers are counts, bedrooms or prices, and rewriting them into
+        # project names ("Samana South Haven 2") wrecks the question.
+        pair = re.search(
+            r"\b(\d{1,3})\s*(?:,|&|and|vs\.?|versus)\s*(\d{1,3})\b"
+            r"(?!\s*-?\s*(?:bed|bedroom|bedrooms|br|bhk|bath|sqft|sq|aed|million|mn|m|k|%|year|years|floor)\b)",
             question or "",
+            flags=re.IGNORECASE,
         )
 
-        if len(matches) < 2:
+        if not pair:
             return None
 
-        values: List[int] = []
-
-        for match in matches[:2]:
-            try:
-                values.append(int(match))
-            except ValueError:
-                return None
-
-        return values
+        return [int(pair.group(1)), int(pair.group(2))]
 
     def _extract_ordinal_pair(
         self,
@@ -691,6 +703,33 @@ class ConversationMemory:
 
                 if rewritten != original:
                     return rewritten
+
+        # ---------------------------------------------------------
+        # One ordinal: "the first one", "price of the second project".
+        # Resolved here, from the list that was on screen, instead of by
+        # the rewrite model, which turned "the first one" into
+        # "the first 1-bedroom apartment".
+        # ---------------------------------------------------------
+        single = re.search(
+            r"\b(?:the\s+)?(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)"
+            r"(?!\s+(?:time|floor|payment|year|home|buyer|installment|phase|quarter|class|month|handover|bedroom))"
+            r"(?:\s+(?:one|project|property|option|listing|apartment|villa|townhouse))?\b",
+            original,
+            flags=re.IGNORECASE,
+        )
+
+        if single:
+            names = self._resolve_candidate_positions(
+                [self._ordinal_to_number(single.group(1))]
+            )
+
+            if names:
+                rewritten = (
+                    original[: single.start()]
+                    + f'"{names[0]}"'
+                    + original[single.end():]
+                )
+                return rewritten
 
         return None
 

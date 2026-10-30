@@ -25,6 +25,7 @@ Document data:
 """
 
 from app.database.postgres import fetch
+import asyncio
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -620,6 +621,42 @@ class HybridRetriever:
             return self._empty_structured_result()
 
     # ============================================================
+    # DEVELOPER NAMED IN THE QUESTION
+    # ============================================================
+
+    _developer_names: Optional[List[str]] = None
+
+    def _developer_in_question(self, question: str) -> Optional[str]:
+        """A known developer written after by / from / developer (None if there is none)."""
+
+        text = (question or "").lower()
+        if not re.search(r"\b(?:by|from|developer|developed by|built by)\b", text):
+            return None
+
+        if HybridRetriever._developer_names is None:
+            try:
+                rows = fetch(
+                    "select distinct btrim(developer_name) as name "
+                    "from projects where developer_name is not null"
+                )
+                HybridRetriever._developer_names = [
+                    str(row["name"]).lower()
+                    for row in rows
+                    if row.get("name")
+                ]
+            except Exception:
+                return None
+
+        for name in HybridRetriever._developer_names:
+            if re.search(
+                rf"\b(?:by|from|developer|developed by|built by)\s+{re.escape(name)}\b",
+                text,
+            ):
+                return name
+
+        return None
+
+    # ============================================================
     # APPLY PROJECT FILTERS
     # ============================================================
 
@@ -636,6 +673,8 @@ class HybridRetriever:
             return projects
 
         filtered = []
+
+        developer = str(filters.get("developer") or "").strip().lower()
 
         max_price = filters.get(
             "max_price_aed"
@@ -669,6 +708,15 @@ class HybridRetriever:
             max_bedrooms = requested_bedrooms
 
         for project in projects:
+
+            # ----------------------------------------------------
+            # DEVELOPER
+            # ----------------------------------------------------
+
+            if developer and developer not in str(
+                project.get("developer_name") or ""
+            ).lower():
+                continue
 
             # ----------------------------------------------------
             # PRICE
@@ -2174,10 +2222,20 @@ class HybridRetriever:
                         getattr(query_plan, "needs_ranking", False)
                         or getattr(query_plan, "needs_analytics", False)
                     )
-                ) or self._asks_for_catalog(question):
+                ) or self._asks_for_catalog(question) or (
+                    intent in {"search", "general"}
+                    and any(
+                        (filters or {}).get(key) is not None
+                        for key in (
+                            "bedrooms", "min_bedrooms", "max_bedrooms",
+                            "property_types", "max_price_aed", "min_price_aed",
+                        )
+                    )
+                ):
                     # No place was named, but the user asked for communities
-                    # or projects. Load the Dubai catalog instead of returning
-                    # an empty result.
+                    # or projects, or described what they want ("1-bedroom
+                    # apartments", "villas under 5M"). Load the Dubai catalog;
+                    # the filters below narrow it. An empty result would be wrong.
                     result = self._retrieve_by_city("Dubai")
                 else:
                     result = (
@@ -2498,10 +2556,16 @@ class HybridRetriever:
             ):
                 needs_documents = False
 
-            filters = (
+            filters = dict(
                 query_plan.filters
                 or {}
             )
+
+            # "which of these are by Azizi": a developer named after "by/from"
+            # narrows the list, like a price or bedroom filter does.
+            developer_filter = self._developer_in_question(question)
+            if developer_filter:
+                filters["developer"] = developer_filter
 
         else:
 
@@ -2659,21 +2723,29 @@ class HybridRetriever:
             result = self.retrieve_documents(question)
             return result, _elapsed_ms(started)
 
+        # Both retrievers do blocking work (database calls, and the
+        # sentence-transformers encode for documents). Run them on worker
+        # threads and await the result so the event loop stays free to serve
+        # other requests while this one waits.
+        loop = asyncio.get_running_loop()
+
         if needs_structured and needs_documents:
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                structured_future = pool.submit(_run_structured)
-                documents_future = pool.submit(_run_documents)
-                structured_result, structured_ms = structured_future.result()
-                documents, document_ms = documents_future.result()
+            (
+                (structured_result, structured_ms),
+                (documents, document_ms),
+            ) = await asyncio.gather(
+                loop.run_in_executor(None, _run_structured),
+                loop.run_in_executor(None, _run_documents),
+            )
             timing_ms["structured_retrieval"] = structured_ms
             timing_ms["document_retrieval"] = document_ms
         elif needs_structured:
             structured_result, timing_ms["structured_retrieval"] = (
-                _run_structured()
+                await loop.run_in_executor(None, _run_structured)
             )
         elif needs_documents:
             documents, timing_ms["document_retrieval"] = (
-                _run_documents()
+                await loop.run_in_executor(None, _run_documents)
             )
 
         communities = (
