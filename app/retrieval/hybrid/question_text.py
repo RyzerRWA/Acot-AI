@@ -43,6 +43,35 @@ _GROUP_REFERENCE = re.compile(
 )
 
 
+def contains_term(text: str, term: str) -> bool:
+    """True when ``term`` appears as a word, not inside another word.
+
+    A plain ``term in text`` check matches inside unrelated words:
+    ``view`` inside ``review``, ``rent`` inside ``current`` or
+    ``different``, ``law`` inside ``flaw``. Here a term must start at a
+    word start. Short terms (4 letters or fewer) must also end at a word
+    end, allowing a plural or simple verb ending (``views``, ``renting``).
+    Longer terms may carry any ending, so ``recommend`` still matches
+    ``recommendation`` and ``invest`` still matches ``investor``.
+    Digits may touch the term, so ``2bedroom`` still matches ``bedroom``.
+    """
+
+    if not text or not term:
+        return False
+    escaped = re.escape(term)
+    if len(term) <= 4:
+        pattern = rf"(?<![a-z]){escaped}(?:s|es|ed|ing)?(?![a-z])"
+    else:
+        pattern = rf"(?<![a-z]){escaped}"
+    return re.search(pattern, text) is not None
+
+
+def contains_any_term(text: str, terms) -> bool:
+    """True when any of ``terms`` appears in ``text`` as a word."""
+
+    return any(contains_term(text, term) for term in terms)
+
+
 def collapse_stretched_letters(text: str) -> str:
     """Collapse a letter repeated three or more times.
 
@@ -137,7 +166,16 @@ def _correct_domain_typos(text: str) -> str:
     return " ".join(_correct_domain_word(token) for token in text.split())
 
 
+_BEDROOM_WORDS = {"one": "1", "two": "2", "three": "3", "four": "4", "five": "5", "six": "6"}
+
+
 def _normalize_bedrooms(text: str) -> str:
+    # "one bedroom" / "two-bed" -> "1 bedroom" / "2 bed", so filters read it the same way as digits
+    text = re.sub(
+        r"\b(one|two|three|four|five|six)[\s-]*(?=bed)",
+        lambda m: _BEDROOM_WORDS[m.group(1)] + " ",
+        text,
+    )
     text = re.sub(r"\b(\d+)\s*bed\s*rooms?\b", r"\1 bedroom", text)
     text = re.sub(r"\bbed\s+rooms?\b", "bedroom", text)
     return text

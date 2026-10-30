@@ -7,6 +7,7 @@ from app.retrieval.hybrid.question_text import (
     prepare_user_question,
 )
 from run import (
+    _build_comparison,
     _build_fast_structured_answer,
     _classify_small_talk,
     _detect_response_type,
@@ -112,6 +113,14 @@ def test_browse_uses_fast_project_list():
         documents=[],
     )
     assert response["response_type"] == "project_list"
+
+
+def test_investment_answer_with_projects_shows_cards():
+    question = "Find me a good investment property in Business Bay"
+    assert _detect_response_type(question, "investment", _summary()) == "project_list"
+    assert _detect_response_type(
+        question, "investment", _summary(projects=[])
+    ) == "investment_analysis"
 
 
 def test_price_follow_up_is_written_information():
@@ -236,6 +245,81 @@ def test_comparison_skips_fast_path():
     ) == "project_comparison"
 
 
+def test_comparison_answer_always_includes_a_side_by_side_table():
+    question = "Compare Binghatti Etherea and Serenz. Which is best?"
+    summary = {
+        "comparison": True,
+        "comparison_entities": [
+            {
+                "resolved_name": "Binghatti Etherea",
+                "data": {
+                    "projects": [{
+                        "price": 800000,
+                        "bedroom_min": 0,
+                        "bedroom_max": 2,
+                        "size_min": 600,
+                        "size_max": 600,
+                    }],
+                },
+            },
+            {
+                "resolved_name": "Serenz",
+                "data": {
+                    "projects": [{
+                        "price": 800000,
+                        "bedroom_min": 0,
+                        "bedroom_max": 2,
+                        "size_min": 600,
+                        "size_max": 600,
+                    }],
+                },
+            },
+        ],
+    }
+
+    comparison = _build_comparison(summary)
+
+    assert comparison is not None
+    assert "| Factor | Binghatti Etherea | Serenz |" in comparison["answer"]
+    assert "| Price | AED 800,000 | AED 800,000 |" in comparison["answer"]
+    assert "| Size | 600 sqft | 600 sqft |" in comparison["answer"]
+    assert "| Score | 50% | 50% |" in comparison["answer"]
+    assert "do not favor either one" in comparison["answer"]
+
+    response = build_frontend_response(
+        question=question,
+        standalone_question=question,
+        answer=comparison["answer"],
+        question_type="comparison",
+        structured_summary=summary,
+        documents=[],
+    )
+    assert response["response_type"] == "comparison"
+    assert response["answer"] == comparison["answer"]
+
+
+def test_comparison_without_comparable_fields_still_shows_table():
+    summary = {
+        "comparison_entities": [
+            {
+                "resolved_name": "Binghatti Etherea",
+                "data": {"projects": [{"name": "Binghatti Etherea"}]},
+            },
+            {
+                "resolved_name": "Serenz",
+                "data": {"projects": [{"name": "Serenz"}]},
+            },
+        ],
+    }
+
+    comparison = _build_comparison(summary)
+
+    assert comparison is not None
+    assert "| Factor | Binghatti Etherea | Serenz |" in comparison["answer"]
+    assert "| Score | 50% | 50% |" in comparison["answer"]
+    assert "can't recommend one over the other" in comparison["answer"]
+
+
 def test_small_talk_skips_projects():
     cases = {
         "Hi": "greeting",
@@ -257,6 +341,28 @@ def test_small_talk_skips_projects():
         )
         assert response["response_type"] == "general"
         assert response["data"]["projects"] == []
+
+
+def test_greeting_variants_are_small_talk():
+    for text in (
+        "Good morning!", "good morning acot", "Good morning sir", "Morning",
+        "gm", "good mornin", "Good afternoon everyone", "how are you",
+        "Assalamu alaikum", "good morning, how are you",
+    ):
+        assert _classify_small_talk(text) == "greeting", text
+    assert _classify_small_talk("good night") == "bye"
+    for text in (
+        "good projects in Marina", "good morning show me projects",
+        "how much is a 2 bedroom", "morning view apartments",
+    ):
+        assert _classify_small_talk(text) is None, text
+
+
+def test_greeting_uses_the_account_name():
+    assert _small_talk_answer("greeting", "Priya") == (
+        "Hello Priya, I'm ACOT, a Dubai real estate assistant. How can I help you?"
+    )
+    assert _small_talk_answer("greeting").startswith("Hello, I'm ACOT")
 
 
 def test_greeting_plus_search_stays_search():
@@ -419,3 +525,35 @@ def test_search_shape_before_a_single_entity():
         "azizi riviera 49",
         "binghatti aquarise",
     ]
+
+
+def test_two_area_comparison_is_built_without_a_model(monkeypatch):
+    from app.answers import area_comparison as ac
+
+    monkeypatch.setattr(ac, "_names", {
+        "dubai marina": "Dubai Marina", "business bay": "Business Bay",
+        "jumeirah village circle": "Jumeirah Village Circle", "downtown dubai": "Downtown Dubai"})
+    assert ac.parse_area_comparison("Compare Dubai Marina and Business Bay.") == ("Dubai Marina", "Business Bay")
+    assert ac.parse_area_comparison("marina vs jvc") == ("Dubai Marina", "Jumeirah Village Circle")
+    assert ac.parse_area_comparison("what is the difference between Business Bay and Downtown?") == (
+        "Business Bay", "Downtown Dubai")
+    # developers, projects and the same area twice are not area comparisons
+    assert ac.parse_area_comparison("Compare Sobha and Damac") is None
+    assert ac.parse_area_comparison("Compare Dubai Marina and Dubai Marina") is None
+    assert ac.parse_area_comparison("show me projects in Dubai Marina") is None
+
+    def fake_facts(area):
+        big = area == "Business Bay"
+        return {"projects": 15 if big else 1, "min_price": 650000 if big else 21132340,
+                "median_price": 2828000, "beds": [0, 8] if big else [3, 4],
+                "top_year": {"year": 2027, "projects": 8} if big else {"year": 2026, "projects": 1},
+                "listings": 143 if big else 122, "rent_median": 90000 if big else 115000,
+                "rent_range": [75000, 120000], "rent_psf": 124.4}
+
+    monkeypatch.setattr(ac, "_facts", fake_facts)
+    answer = ac.build_area_comparison("Dubai Marina", "Business Bay")
+    assert "| Factor | Dubai Marina | Business Bay |" in answer
+    assert "| Starting prices | from AED 21,132,340 | from AED 650,000 (median AED 2,828,000) |" in answer
+    assert "Business Bay has more projects for sale (15 against 1)" in answer
+    assert "no yield" in answer
+    assert "Summary:" in answer

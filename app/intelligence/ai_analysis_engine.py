@@ -882,6 +882,57 @@ class AIAnalysisEngine:
     # LLM ANALYSIS
     # =========================================================
 
+    # Document chunks are stored up to ~1200 chars. The analysis prompt
+    # keeps that cap (so it sees the same substantive facts the answer
+    # chain sees) but drops stored ids/urls and never overruns the cap,
+    # which otherwise inflated this secondary call's input tokens.
+    MAX_ANALYSIS_DOC_CHARS = 1200
+
+    @classmethod
+    def _slim_documents(
+        cls,
+        documents: List[Any],
+    ) -> List[Dict[str, Any]]:
+        """Keep only the analysis-relevant fields of document cards."""
+
+        slim: List[Dict[str, Any]] = []
+
+        for item in documents or []:
+            if not isinstance(item, dict):
+                continue
+
+            content = str(
+                item.get("content")
+                or ""
+            ).strip()
+
+            if not content:
+                continue
+
+            if len(content) > cls.MAX_ANALYSIS_DOC_CHARS:
+                content = (
+                    content[: cls.MAX_ANALYSIS_DOC_CHARS]
+                    + "..."
+                )
+
+            slim.append(
+                {
+                    "title": (
+                        item.get("document_title")
+                        or item.get("title")
+                    ),
+                    "type": (
+                        item.get("document_type")
+                        or item.get("type")
+                    ),
+                    "publisher": item.get("publisher"),
+                    "similarity": item.get("similarity"),
+                    "content": content,
+                }
+            )
+
+        return slim
+
     async def _generate_llm_analysis(
         self,
         question: str,
@@ -900,7 +951,7 @@ class AIAnalysisEngine:
             default=str,
         )
         documents_json = json.dumps(
-            documents,
+            self._slim_documents(documents),
             separators=(",", ":"),
             ensure_ascii=False,
             default=str,

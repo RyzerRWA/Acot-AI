@@ -15,7 +15,7 @@ from app.subscription.token_usage import (
 
 # Limits concurrent in-flight LLM calls to AICredits. The provider's
 # concurrency cap is ~5, so anything above that risks HTTP 429s.
-_LLM_CONCURRENCY = int(os.getenv("AICREDITS_MAX_CONCURRENCY", "20"))
+_LLM_CONCURRENCY = int(os.getenv("AICREDITS_MAX_CONCURRENCY", "10"))
 _llm_semaphore = asyncio.Semaphore(_LLM_CONCURRENCY)
 
 # How long a request may wait for a free LLM slot before we give
@@ -37,7 +37,6 @@ BILL_CACHE_HITS = os.getenv("ACOT_BILL_CACHE_HITS", "0") not in (
     "False",
     "",
 )
-
 
 class LLMQueueTimeoutError(RuntimeError):
     """No LLM slot freed up within the queue budget."""
@@ -76,7 +75,7 @@ class AICreditsClient:
         self.max_output_tokens = int(
             os.getenv(
                 "AICREDITS_MAX_OUTPUT_TOKENS",
-                "900",
+                "800",
             )
         )
 
