@@ -1,5 +1,8 @@
 """Free checks for the listings agent: no database, no language model.  Run: python -m unittest tests.test_listings_agent"""
+import asyncio
+import os
 import unittest
+from unittest.mock import patch
 
 from app.listings.agent import AgentResult, ListingAgent, strip_links
 from app.listings.router import is_rent_question
@@ -63,6 +66,110 @@ class RouterTests(unittest.TestCase):
         self.assertFalse(is_rent_question("and in JLT?", None))
         self.assertFalse(is_rent_question("What are the handover dates?", "listings"))
         self.assertFalse(is_rent_question("", "listings"))
+
+
+class ListingComparisonRoutingTests(unittest.TestCase):
+    def test_comparison_followups_with_visible_rentals_use_structured_path(self):
+        from app.retrieval.hybrid.listing_turns import (
+            previous_listing_comparison,
+            should_use_structured_listing_comparison,
+        )
+        from app.answers.structured_answer import _build_comparison
+        from app.memory.conversation_memory import ConversationMemory
+
+        question = "Compare the first two rentals and tell me which is best."
+        listings = [
+            {
+                "listing_id": "1",
+                "title": "Rental one",
+                "price_aed": 58_000,
+                "rent_frequency": "yearly",
+                "beds": 2,
+                "size_sqft": 980,
+            },
+            {
+                "listing_id": "2",
+                "title": "Rental two",
+                "price_aed": 60_000,
+                "rent_frequency": "yearly",
+                "beds": 2,
+                "size_sqft": 820,
+            },
+        ]
+        memory = ConversationMemory(llm_client=None)
+        memory.update(
+            user_question="Show rental listings in Al Nahda",
+            standalone_question="Show rental listings in Al Nahda",
+            answer="Here are two rentals.",
+            retrieval_result={
+                "question_type": "search",
+                "structured_data": {
+                    "community": [],
+                    "projects": [],
+                    "sub_communities": [],
+                    "listings": listings,
+                },
+            },
+        )
+        context = memory.context()
+
+        self.assertTrue(should_use_structured_listing_comparison(question, context))
+        from run import _try_agent_turn
+
+        components = {
+            "conversation_memory": memory,
+            "listing_agent": object(),
+        }
+        with patch.dict(os.environ, {"ACOT_USE_AGENT": "1"}):
+            self.assertIsNone(asyncio.run(
+                _try_agent_turn(question, components, {}, 0.0)
+            ))
+
+        compared = previous_listing_comparison(question, context)
+        self.assertIsNotNone(compared)
+        comparison = _build_comparison({
+            "comparison_entities": compared["comparison_entities"],
+        })
+        self.assertEqual(len(comparison["sides"]), 2)
+        self.assertIn("| Factor | Rental one | Rental two |", comparison["answer"])
+
+    def test_rewritten_listing_names_are_not_mistaken_for_area_names(self):
+        from app.retrieval.hybrid.listing_turns import previous_listing_comparison
+
+        original_question = "Compare the first two rentals and tell me which is best."
+        first_title = "PRIME LOCATION=2 BHK WITH 2 BATHS=WITH BALCONY=WITH ALL FACILITIES"
+        second_title = "Spacious 2BHK in Nahda with Balcony, Wardrobes, Free Facilities"
+        context = {
+            "current_user_question": original_question,
+            "active_candidates": [
+                {"entity_type": "listing", "name": first_title, "title": first_title, "price_aed": 58_000},
+                {"entity_type": "listing", "name": second_title, "title": second_title, "price_aed": 60_000},
+            ],
+        }
+        rewritten_question = (
+            f'Compare "{first_title}" and "{second_title}" and tell me which is best.'
+        )
+
+        compared = previous_listing_comparison(rewritten_question, context)
+
+        self.assertIsNotNone(compared)
+        self.assertEqual(
+            [side["resolved_name"] for side in compared["comparison_entities"]],
+            [first_title, second_title],
+        )
+
+    def test_area_comparison_is_not_routed_as_visible_rental_comparison(self):
+        from app.retrieval.hybrid.listing_turns import should_use_structured_listing_comparison
+
+        question = "Compare Dubai Marina and Business Bay."
+        context = {
+            "current_user_question": question,
+            "active_candidates": [
+                {"entity_type": "listing", "name": "Rental one"},
+                {"entity_type": "listing", "name": "Rental two"},
+            ],
+        }
+        self.assertFalse(should_use_structured_listing_comparison(question, context))
 
 
 class ProjectToolTests(unittest.TestCase):

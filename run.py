@@ -19,6 +19,7 @@ from app.listings.router import is_rent_question
 from app.llm.client import LLMQueueTimeoutError
 from app.subscription.token_usage import add_tokens
 from app.listings import session_store
+from app.retrieval.hybrid.listing_turns import should_use_structured_listing_comparison
 
 
 # =========================================================
@@ -785,6 +786,13 @@ async def _try_agent_turn(question, components, timing_ms, ask_started):
     """Answer with the agent, or return None so the standard pipeline answers."""
 
     if not _agent_enabled(components):
+        return None
+
+    conversation_memory = components.get("conversation_memory")
+    if conversation_memory and should_use_structured_listing_comparison(
+        question,
+        conversation_memory.context(),
+    ):
         return None
 
     agent = components["listing_agent"]

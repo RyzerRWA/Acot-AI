@@ -482,6 +482,27 @@ def _score_snapshots(left, right):
 
     checks = []
 
+    def _table_cell(value):
+        return (
+            str(value)
+            .replace("\\", "\\\\")
+            .replace("|", "\\|")
+            .replace("\n", " ")
+        )
+
+    rent_frequency = left.get("frequency")
+    if rent_frequency == right.get("frequency") and rent_frequency:
+        normalized_frequency = str(rent_frequency).strip().lower()
+        frequency_label = (
+            "yearly"
+            if normalized_frequency in {"yearly", "annual", "annually"}
+            else normalized_frequency
+        )
+        price_label = f"{frequency_label.capitalize()} rent"
+    else:
+        price_label = "Price"
+    price_factor = f"lower {price_label.lower()}"
+
     def prefer_high(key, label, formatter):
         left_value = left.get(key)
         right_value = right.get(key)
@@ -491,6 +512,7 @@ def _score_snapshots(left, right):
         other = right if winner is left else left
         checks.append((
             winner["name"],
+            label.lower(),
             (
                 f"**{label.capitalize()}:** {winner['name']} is ahead "
                 f"({formatter(winner[key])} versus {formatter(other[key])})."
@@ -506,14 +528,16 @@ def _score_snapshots(left, right):
         other = right if winner is left else left
         checks.append((
             winner["name"],
+            label.lower(),
             (
                 f"**{label.capitalize()}:** {winner['name']} is ahead "
                 f"({formatter(winner[key])} versus {formatter(other[key])})."
             ),
         ))
 
-    prefer_low("price", "price", lambda value: _format_aed(value) or str(value))
-    prefer_high("size", "size", lambda value: f"{int(value):,} sqft")
+    prefer_low("price", price_factor, lambda value: _format_aed(value) or str(value))
+    prefer_high("size", "more space", lambda value: f"{int(value):,} sqft")
+
     def _bedroom_text(value):
         if value == 0:
             return "Studio"
@@ -521,7 +545,7 @@ def _score_snapshots(left, right):
             return "1 bedroom"
         return f"{value:g} bedrooms"
 
-    prefer_high("beds", "bedrooms", _bedroom_text)
+    prefer_high("beds", "more bedrooms", _bedroom_text)
     left_handover = left.get("handover")
     right_handover = right.get("handover")
     if (
@@ -533,6 +557,7 @@ def _score_snapshots(left, right):
         other = right if winner is left else left
         checks.append((
             winner["name"],
+            "earlier handover",
             (
                 f"**Handover:** {winner['name']} is earlier "
                 f"({_handover_label(winner['handover'])} versus "
@@ -540,7 +565,7 @@ def _score_snapshots(left, right):
             ),
         ))
 
-    left_wins = sum(1 for name, _text in checks if name == left["name"])
+    left_wins = sum(1 for name, _factor, _text in checks if name == left["name"])
     right_wins = len(checks) - left_wins
     if not checks or left_wins == right_wins:
         left_score = right_score = 50
@@ -551,9 +576,12 @@ def _score_snapshots(left, right):
     right["score"] = right_score
     winner = left if left_score >= right_score else right
     loser = right if winner is left else left
-    table_rows = [f"| Factor | {left['name']} | {right['name']} |", "| --- | --- | --- |"]
+    table_rows = [
+        f"| Factor | {_table_cell(left['name'])} | {_table_cell(right['name'])} |",
+        "| --- | --- | --- |",
+    ]
     fields = (
-        ("Price", "price", lambda value: _format_aed(value) or str(value)),
+        (price_label, "price", lambda value: _format_aed(value) or str(value)),
         ("Size", "size", lambda value: f"{int(value):,} sqft"),
         ("Bedrooms", "beds", _bedroom_text),
         ("Handover", "handover", _handover_label),
@@ -586,7 +614,44 @@ def _score_snapshots(left, right):
             f"{loser['name']} scores {loser['score']}%. "
             f"{winner['name']} is the stronger of the two on these records."
         )
-    return f"{intro}\n\n{table}"
+
+    factor_wins = {left["name"]: [], right["name"]: []}
+    for name, factor, _text in checks:
+        factor_wins[name].append(factor)
+
+    if not checks:
+        conclusion = (
+            "Conclusion: The available recorded factors do not distinguish these options."
+        )
+        recommendation = (
+            "Recommendation: There is no data-based reason to prefer one; compare your "
+            "personal priorities and confirm the listing details."
+        )
+    elif left_score == right_score:
+        left_advantages = ", ".join(factor_wins[left["name"]])
+        right_advantages = ", ".join(factor_wins[right["name"]])
+        conclusion = (
+            f"Conclusion: The comparison is split. {left['name']} is stronger on "
+            f"{left_advantages}, while {right['name']} is stronger on {right_advantages}; "
+            "neither is the clear overall winner."
+        )
+        recommendation = (
+            f"Recommendation: Choose {left['name']} if you prioritize "
+            f"{left_advantages}, or {right['name']} if you prioritize "
+            f"{right_advantages}."
+        )
+    else:
+        winning_factors = ", ".join(factor_wins[winner["name"]])
+        conclusion = (
+            f"Conclusion: {winner['name']} leads on the recorded factors "
+            f"({winning_factors})."
+        )
+        recommendation = (
+            f"Recommendation: {winner['name']} is the stronger match based on the "
+            "available data; confirm the listing details before deciding."
+        )
+
+    return f"{intro}\n\n{table}\n\n{conclusion}\n{recommendation}"
 
 
 def _comparison_card(side):
