@@ -363,6 +363,36 @@ def test_rental_comparison_escapes_title_pipes_and_explains_tradeoff():
     assert "Villa | Garden if you prioritize more space." in comparison["answer"]
 
 
+def test_comparison_table_includes_every_selected_listing_in_order():
+    names = ["Rental one", "Rental two", "Rental three"]
+    summary = {
+        "comparison_entities": [
+            {
+                "resolved_name": name,
+                "data": {
+                    "listings": [{
+                        "title": name,
+                        "price_aed": 58_000 + index * 1_000,
+                        "rent_frequency": "yearly",
+                        "beds": 2,
+                        "size_sqft": 800 + index * 50,
+                    }],
+                },
+            }
+            for index, name in enumerate(names)
+        ],
+    }
+
+    comparison = _build_comparison(summary)
+
+    assert comparison is not None
+    assert len(comparison["sides"]) == 3
+    assert [side["name"] for side in comparison["sides"]] == names
+    assert "| Factor | Rental one | Rental two | Rental three |" in comparison["answer"]
+    assert "| Yearly rent | AED 58,000 | AED 59,000 | AED 60,000 |" in comparison["answer"]
+    assert "does not establish an overall best option" in comparison["answer"]
+
+
 def test_small_talk_skips_projects():
     cases = {
         "Hi": "greeting",

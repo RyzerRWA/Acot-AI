@@ -691,6 +691,64 @@ def _comparison_card(side):
     }
 
 
+def _multi_comparison_answer(snapshots):
+    def table_cell(value):
+        return (
+            str(value)
+            .replace("\\", "\\\\")
+            .replace("|", "\\|")
+            .replace("\n", " ")
+        )
+
+    frequencies = {side.get("frequency") for side in snapshots}
+    frequency = next(iter(frequencies)) if len(frequencies) == 1 else None
+    frequency_label = (
+        "yearly"
+        if str(frequency or "").lower() in {"yearly", "annual", "annually"}
+        else frequency
+    )
+    price_label = f"{str(frequency_label).capitalize()} rent" if frequency_label else "Price"
+
+    rows = [
+        "| Factor | " + " | ".join(table_cell(side["name"]) for side in snapshots) + " |",
+        "|" + " --- |" * (len(snapshots) + 1),
+    ]
+    fields = (
+        (price_label, "price", lambda value: _format_aed(value) or str(value)),
+        ("Size", "size", lambda value: f"{int(value):,} sqft"),
+        (
+            "Bedrooms",
+            "beds",
+            lambda value: (
+                "Studio"
+                if value == 0
+                else f"{value:g} bedroom" if value == 1 else f"{value:g} bedrooms"
+            ),
+        ),
+        ("Handover", "handover", _handover_label),
+    )
+    for label, key, formatter in fields:
+        if not any(side.get(key) is not None for side in snapshots):
+            continue
+        values = [
+            formatter(side[key]) if side.get(key) is not None else "Not recorded"
+            for side in snapshots
+        ]
+        rows.append(
+            f"| {label} | " + " | ".join(table_cell(value) for value in values) + " |"
+        )
+
+    names = ", ".join(side["name"] for side in snapshots)
+    return (
+        f"Here is a side-by-side comparison of {len(snapshots)} options: "
+        f"{names}.\n\n"
+        + "\n".join(rows)
+        + "\n\nRecommendation: The table compares the recorded details; the data "
+        "does not establish an overall best option. Choose based on your priorities "
+        "and confirm the listing details."
+    )
+
+
 def _build_comparison(structured_summary):
     entities = [
         entity
@@ -701,7 +759,7 @@ def _build_comparison(structured_summary):
         return None
 
     snapshots = []
-    for entity in entities[:2]:
+    for entity in entities:
         data = entity.get("data") or {}
         records = data.get("listings") or data.get("projects") or []
         records = [record for record in records if isinstance(record, dict)]
@@ -714,7 +772,11 @@ def _build_comparison(structured_summary):
         )
         snapshots.append(_side_snapshot(name, records))
 
-    answer = _score_snapshots(snapshots[0], snapshots[1])
+    answer = (
+        _score_snapshots(snapshots[0], snapshots[1])
+        if len(snapshots) == 2
+        else _multi_comparison_answer(snapshots)
+    )
     return {
         "answer": answer,
         "sides": [_comparison_card(side) for side in snapshots],

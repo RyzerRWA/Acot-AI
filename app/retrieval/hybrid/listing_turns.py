@@ -531,7 +531,7 @@ def previous_listing_comparison(
     question: str,
     conversation_context: Optional[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
-    """Compare two listings already shown, such as "compare 1 and 2"."""
+    """Compare listings already shown, preserving their displayed order."""
 
     candidates = (conversation_context or {}).get("active_candidates") or []
     listings = [
@@ -605,7 +605,7 @@ def previous_listing_comparison(
         return None
 
     sides = []
-    for record in picked[:2]:
+    for record in picked:
         name = str(record.get("name") or record.get("title")).strip()
         sides.append({
             "entity_type": "listing",
@@ -622,9 +622,9 @@ def previous_listing_comparison(
         "communities": [],
         "projects": [],
         "sub_communities": [],
-        "listings": picked[:2],
+        "listings": picked,
         "listing_query": True,
-        "listing_total": 2,
+        "listing_total": len(picked),
         "comparison": True,
         "comparison_entities": sides,
     }
@@ -814,7 +814,7 @@ def pick_listed_rows(listings, texts):
                 else words_to_numbers[span.group(2).lower()]
             )
             if count >= 2 and len(listings) >= 2:
-                return listings[:2]
+                return listings
 
         last_two = re.search(
             r"\blast\s+(?:two|2)\b",
@@ -845,5 +845,5 @@ def pick_listed_rows(listings, texts):
         )
         for text in texts
     ):
-        return listings[:2]
+        return listings
     return []

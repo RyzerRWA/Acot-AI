@@ -47,6 +47,24 @@ class LinkTests(unittest.TestCase):
         self.assertNotIn("999", result.answer)
         self.assertIn("[[111]]", result.answer)
 
+    def test_cards_keep_search_result_order_when_answer_mentions_them_out_of_order(self):
+        seen = {
+            "111": {"listing_id": "111", "title": "First rental"},
+            "222": {"listing_id": "222", "title": "Second rental"},
+            "333": {"listing_id": "333", "title": "Third rental"},
+        }
+
+        result = ListingAgent._finish(
+            "Best value: [[333]]. Also consider [[111]] and [[222]].",
+            seen,
+            [],
+            "m",
+            0,
+            0.0,
+        )
+
+        self.assertEqual([card["listing_id"] for card in result.cards], ["111", "222", "333"])
+
 
 class RouterTests(unittest.TestCase):
     def test_rent_questions_go_to_the_listings_agent(self):
@@ -69,6 +87,38 @@ class RouterTests(unittest.TestCase):
 
 
 class ListingComparisonRoutingTests(unittest.TestCase):
+    def test_comparison_keeps_all_visible_rentals_in_their_original_order(self):
+        from app.retrieval.hybrid.listing_turns import previous_listing_comparison
+
+        listings = [
+            {"listing_id": str(index), "title": f"Rental {index}"}
+            for index in range(1, 4)
+        ]
+        context = {
+            "current_user_question": "Compare the first two rentals and tell me which is best.",
+            "active_candidates": [
+                {
+                    "entity_type": "listing",
+                    "name": listing["title"],
+                    "title": listing["title"],
+                    **listing,
+                }
+                for listing in listings
+            ],
+        }
+
+        compared = previous_listing_comparison(
+            "Compare the first two rentals and tell me which is best.",
+            context,
+        )
+
+        self.assertIsNotNone(compared)
+        self.assertEqual(
+            [listing["listing_id"] for listing in compared["listings"]],
+            ["1", "2", "3"],
+        )
+        self.assertEqual(len(compared["comparison_entities"]), 3)
+
     def test_comparison_followups_with_visible_rentals_use_structured_path(self):
         from app.retrieval.hybrid.listing_turns import (
             previous_listing_comparison,
