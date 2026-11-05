@@ -19,6 +19,7 @@ from app.listings.router import is_rent_question
 from app.llm.client import LLMQueueTimeoutError
 from app.subscription.token_usage import add_tokens
 from app.listings import session_store
+from app.retrieval.hybrid.listing_turns import should_use_structured_listing_comparison
 
 
 # =========================================================
@@ -675,17 +676,17 @@ def _small_talk_answer(kind, name=None):
             "- Pull amenities from their documents"
         )
 
-    if kind =="GoodMorning":
+    if kind in ("GoodMorning", "Good Morning", "Morning"):
         return (
             f"Good morning{who}, How can I help you with Dubai real estate today?"
         )
 
-    if kind =="GoodAfternoon":
+    if kind in ("GoodAfternoon", "Good Afternoon", "Afternoon"):
         return (
             f"Good afternoon{who}, How can I help you with Dubai real estate today?"
         )
 
-    if kind =="GoodEvening":
+    if kind in ("GoodEvening", "Good Evening", "Evening"):
         return (
             f"Good evening{who}, How can I help you with Dubai real estate today?"
         )
@@ -698,7 +699,7 @@ def _small_talk_answer(kind, name=None):
 
     if kind == "bye":
         return (
-            f"Goodbye{who}. I'm here when you want to look at Dubai projects again."
+            f"Goodbye{who}. Have a great day! I'll be here when you want to look at Dubai projects again."
         )
 
     return f"Hello{who}, I'm ACOT, a Dubai real estate assistant. How can I help you?"
@@ -785,6 +786,13 @@ async def _try_agent_turn(question, components, timing_ms, ask_started):
     """Answer with the agent, or return None so the standard pipeline answers."""
 
     if not _agent_enabled(components):
+        return None
+
+    conversation_memory = components.get("conversation_memory")
+    if conversation_memory and should_use_structured_listing_comparison(
+        question,
+        conversation_memory.context(),
+    ):
         return None
 
     agent = components["listing_agent"]

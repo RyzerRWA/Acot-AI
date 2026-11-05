@@ -531,7 +531,7 @@ def previous_listing_comparison(
     question: str,
     conversation_context: Optional[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
-    """Compare two listings already shown, such as "compare 1 and 2"."""
+    """Compare listings already shown, preserving their displayed order."""
 
     candidates = (conversation_context or {}).get("active_candidates") or []
     listings = [
@@ -547,8 +547,26 @@ def previous_listing_comparison(
         return None
     if not any(wants_shown_comparison(text) for text in texts):
         return None
-    if any(names_outside_places(text) for text in texts):
-        return None
+    outside_place_pairs = [
+        comparison_pair(text)
+        for text in texts
+        if names_outside_places(text)
+    ]
+    if outside_place_pairs:
+        shown_names = {
+            re.sub(r"[^a-z0-9]+", " ", str(item.get("name") or item.get("title") or "").lower()).strip()
+            for item in listings
+        }
+        rewritten_listing_comparison = any(
+            pair
+            and all(
+                re.sub(r"[^a-z0-9]+", " ", name.lower()).strip() in shown_names
+                for name in pair
+            )
+            for pair in outside_place_pairs
+        )
+        if not rewritten_listing_comparison:
+            return None
 
     positions = _requested_listing_positions(texts)
     place = _mentioned_rental_place(texts)
@@ -587,7 +605,7 @@ def previous_listing_comparison(
         return None
 
     sides = []
-    for record in picked[:2]:
+    for record in picked:
         name = str(record.get("name") or record.get("title")).strip()
         sides.append({
             "entity_type": "listing",
@@ -604,9 +622,9 @@ def previous_listing_comparison(
         "communities": [],
         "projects": [],
         "sub_communities": [],
-        "listings": picked[:2],
+        "listings": picked,
         "listing_query": True,
-        "listing_total": 2,
+        "listing_total": len(picked),
         "comparison": True,
         "comparison_entities": sides,
     }
@@ -663,6 +681,31 @@ def names_outside_places(text):
     if any(is_list_slot(side) for side in pair):
         return False
     return True
+
+
+def should_use_structured_listing_comparison(
+    question: str,
+    conversation_context: Optional[Dict[str, Any]],
+) -> bool:
+    """Keep comparisons of visible rentals on the structured retrieval path."""
+
+    candidates = (conversation_context or {}).get("active_candidates") or []
+    listings = [
+        item
+        for item in candidates
+        if isinstance(item, dict)
+        and str(item.get("entity_type") or "").lower() == "listing"
+        and (item.get("name") or item.get("title"))
+    ]
+    if len(listings) < 2:
+        return False
+
+    texts = _question_texts(question, conversation_context)
+    return bool(
+        texts
+        and any(wants_shown_comparison(text) for text in texts)
+        and not any(names_outside_places(text) for text in texts)
+    )
 
 
 def is_list_slot(value):
@@ -771,7 +814,7 @@ def pick_listed_rows(listings, texts):
                 else words_to_numbers[span.group(2).lower()]
             )
             if count >= 2 and len(listings) >= 2:
-                return listings[:2]
+                return listings
 
         last_two = re.search(
             r"\blast\s+(?:two|2)\b",
@@ -802,5 +845,5 @@ def pick_listed_rows(listings, texts):
         )
         for text in texts
     ):
-        return listings[:2]
+        return listings
     return []
