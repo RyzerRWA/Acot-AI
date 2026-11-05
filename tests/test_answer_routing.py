@@ -320,6 +320,79 @@ def test_comparison_without_comparable_fields_still_shows_table():
     assert "can't recommend one over the other" in comparison["answer"]
 
 
+def test_rental_comparison_escapes_title_pipes_and_explains_tradeoff():
+    summary = {
+        "comparison_entities": [
+            {
+                "resolved_name": "Villa | Sea View",
+                "data": {
+                    "listings": [{
+                        "title": "Villa | Sea View",
+                        "price_aed": 260000,
+                        "rent_frequency": "yearly",
+                        "beds": 4,
+                        "size_sqft": 2920,
+                    }],
+                },
+            },
+            {
+                "resolved_name": "Villa | Garden",
+                "data": {
+                    "listings": [{
+                        "title": "Villa | Garden",
+                        "price_aed": 269999,
+                        "rent_frequency": "yearly",
+                        "beds": 4,
+                        "size_sqft": 4023,
+                    }],
+                },
+            },
+        ],
+    }
+
+    comparison = _build_comparison(summary)
+
+    assert comparison is not None
+    assert "| Factor | Villa \\| Sea View | Villa \\| Garden |" in comparison["answer"]
+    assert "| Yearly rent | AED 260,000 | AED 269,999 |" in comparison["answer"]
+    assert "| Score | 50% | 50% |" in comparison["answer"]
+    assert "Conclusion: The comparison is split." in comparison["answer"]
+    assert "Recommendation: Choose Villa | Sea View if you prioritize lower yearly rent" in (
+        comparison["answer"]
+    )
+    assert "Villa | Garden if you prioritize more space." in comparison["answer"]
+
+
+def test_comparison_table_includes_every_selected_listing_in_order():
+    names = ["Rental one", "Rental two", "Rental three"]
+    summary = {
+        "comparison_entities": [
+            {
+                "resolved_name": name,
+                "data": {
+                    "listings": [{
+                        "title": name,
+                        "price_aed": 58_000 + index * 1_000,
+                        "rent_frequency": "yearly",
+                        "beds": 2,
+                        "size_sqft": 800 + index * 50,
+                    }],
+                },
+            }
+            for index, name in enumerate(names)
+        ],
+    }
+
+    comparison = _build_comparison(summary)
+
+    assert comparison is not None
+    assert len(comparison["sides"]) == 3
+    assert [side["name"] for side in comparison["sides"]] == names
+    assert "| Factor | Rental one | Rental two | Rental three |" in comparison["answer"]
+    assert "| Yearly rent | AED 58,000 | AED 59,000 | AED 60,000 |" in comparison["answer"]
+    assert "does not establish an overall best option" in comparison["answer"]
+
+
 def test_small_talk_skips_projects():
     cases = {
         "Hi": "greeting",

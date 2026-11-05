@@ -126,6 +126,7 @@ class ListingAgent:
     def _finish(text, seen, used, model, tokens, started) -> AgentResult:
         cleaned = strip_links(text)
         cited = list(dict.fromkeys(_ID_TAG.findall(cleaned)))
+        cited_ids = set(cited)
         # A card is shown for every id the model tagged. If it described a project or listing by name
         # without tagging it, the card is still shown (only items a tool returned, only if named).
         lowered = cleaned.lower()
@@ -134,7 +135,10 @@ class ListingAgent:
             name = str(row.get("name") or card.get("title") or "").strip().lower()
             if key not in cited and len(name) >= 6 and name in lowered:
                 cited.append(key)
-        cards = [seen[i] for i in cited if i in seen][:10]   # only ids a tool really returned
+                cited_ids.add(key)
+        # Preserve the order in which the search tool returned the records,
+        # rather than making card order depend on how the model mentions them.
+        cards = [card for key, card in seen.items() if key in cited_ids][:10]
         answer = _ID_TAG.sub(lambda m: m.group(0) if m.group(1) in seen else "", cleaned).strip()
         ms = int(round((time.perf_counter() - started) * 1000))
         log.info("listings: %s | %s tokens | %sms | %s",
