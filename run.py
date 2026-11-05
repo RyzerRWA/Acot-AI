@@ -17,6 +17,7 @@ load_dotenv()
 from app.listings.agent import ListingAgent, ListingsUnavailable
 from app.listings.router import is_rent_question
 from app.llm.client import LLMQueueTimeoutError
+from app.answers.spoken import start_spoken_reply
 from app.subscription.token_usage import add_tokens
 from app.listings import session_store
 from app.retrieval.hybrid.listing_turns import should_use_structured_listing_comparison
@@ -1507,9 +1508,13 @@ def _slim_stream_response(response):
 
 async def stream_acot(
     question,
-    components
+    components,
+    mode="text",
 ):
     """Yield typed stream events: meta, delta, followups, then done.
+
+    mode="voice" also yields `speech` events (a short spoken reply written in
+    parallel with the chat answer) and one `speech_done` before `done`.
 
     Database answers are split into small pieces so the client can show
     them like a typewriter. Model answers keep the provider's own tokens.
@@ -1532,54 +1537,85 @@ async def stream_acot(
         }
     )
 
-    answer_started = time.perf_counter()
-    if prepared["use_fast"]:
-        answer = prepared["fast_answer"] or ""
-        for piece in _iter_typewriter_pieces(answer):
-            yield (
-                "delta",
-                {"type": "delta", "text": piece}
-            )
-            await asyncio.sleep(0.02)
-    else:
-        parts = []
-
-        async for delta in prepared["rag_chain"].stream_answer(
-            question=prepared["standalone_question"],
-            context=prepared["context"],
-            question_type=prepared["question_type"]
-        ):
-            if not delta:
-                continue
-
-            parts.append(delta)
-            yield (
-                "delta",
-                {"type": "delta", "text": delta}
-            )
-
-        answer = "".join(parts).strip()
-
-        if not answer:
-            raise RuntimeError(
-                "LLM returned an empty answer."
-            )
-
-    followups = _followup_questions(prepared)
-    if followups:
-        yield (
-            "followups",
-            {"type": "followups", "questions": followups}
-        )
-
-    yield (
-        "done",
-        _finalize_acot_turn(
+    speech = (
+        start_spoken_reply(
+            prepared["rag_chain"].llm,
+            question,
             prepared,
-            answer,
-            answer_started,
+            components.get("user_name"),
         )
+        if mode == "voice"
+        else None
     )
+
+    def spoken_so_far():
+        for text in speech.drain() if speech else ():
+            yield ("speech", {"type": "speech", "text": text})
+
+    try:
+        answer_started = time.perf_counter()
+        if prepared["use_fast"]:
+            answer = prepared["fast_answer"] or ""
+            for piece in _iter_typewriter_pieces(answer):
+                yield (
+                    "delta",
+                    {"type": "delta", "text": piece}
+                )
+                for event in spoken_so_far():
+                    yield event
+                await asyncio.sleep(0.02)
+        else:
+            parts = []
+
+            async for delta in prepared["rag_chain"].stream_answer(
+                question=prepared["standalone_question"],
+                context=prepared["context"],
+                question_type=prepared["question_type"]
+            ):
+                if not delta:
+                    continue
+
+                parts.append(delta)
+                yield (
+                    "delta",
+                    {"type": "delta", "text": delta}
+                )
+                for event in spoken_so_far():
+                    yield event
+
+            answer = "".join(parts).strip()
+
+            if not answer:
+                raise RuntimeError(
+                    "LLM returned an empty answer."
+                )
+
+        followups = _followup_questions(prepared)
+        if followups:
+            yield (
+                "followups",
+                {"type": "followups", "questions": followups}
+            )
+
+        if speech:
+            # Finish the spoken reply before `done`, so its tokens are billed with this turn.
+            for event in spoken_so_far():
+                yield event
+            async for text in speech.rest():
+                yield ("speech", {"type": "speech", "text": text})
+            yield ("speech_done", {"type": "speech_done", "ok": speech.ok})
+
+        yield (
+            "done",
+            _finalize_acot_turn(
+                prepared,
+                answer,
+                answer_started,
+            )
+        )
+    finally:
+        if speech:
+            speech.cancel()
 
 
 def _elapsed_ms(started):

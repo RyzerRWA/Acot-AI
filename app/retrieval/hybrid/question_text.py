@@ -21,13 +21,15 @@ _PROJECT_WORDS = (
 
 _LEAD = re.compile(
     r"^(?:please\s+)?"
-    r"(?:show me|show|list|find|tell me about|tell me|give me|"
+    r"(?:show me about|show about|show me|show|list|find|"
+    r"tell me about|tell about|tell me|give me|"
     r"suggest me|suggest|recommend me|recommend|"
     r"i need|i want|can you|can u|could you|what are|what is|what|which)\s+"
 )
 
 _BROWSE_LEAD = re.compile(
-    r"^(?:please\s+)?(?:show me|show|list|find|tell me about|tell me|give me|"
+    r"^(?:please\s+)?(?:show me about|show about|show me|show|list|find|"
+    r"tell me about|tell about|tell me|give me|"
     r"suggest me|suggest|recommend me|recommend)\b"
 )
 
@@ -378,6 +380,61 @@ def normalize_for_match(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+# Spoken questions arrive with hesitations ("So, uh, explain about ..."). Left in,
+# the commas make "so" and "uh" look like a list of project names.
+# "um" but never "umm": Umm Suqeim and Umm Al Quwain are places.
+_HESITATIONS = re.compile(r"\b(?:uh+|um|erm+|hmm+|ahh?)\b,?")
+_LEAD_FILLERS = re.compile(r"^(?:(?:so|okay|ok|well|yeah|yes|and|like|alright|right)\b[\s,]*)+")
+
+
+def _strip_speech_fillers(text: str) -> str:
+    text = _HESITATIONS.sub(" ", text)
+    text = re.sub(r"\s*,\s*(?:,\s*)+", ", ", text)
+    text = re.sub(r"\s+", " ", text).strip(" ,")
+    return _LEAD_FILLERS.sub("", text).strip(" ,")
+
+
+def _collapse_voice_commas(text: str) -> str:
+    """Voice STT often inserts commas between words of a place name.
+
+    "Jumeirah, Village, Circle" and "Business, Bay" become normal place phrases.
+    Real project lists like "Serenz, Azizi Ruby, Samana Waves" keep their commas
+    because at least one part has more than one word.
+    """
+    if "," not in (text or ""):
+        return text
+
+    def join_run(match: re.Match) -> str:
+        return re.sub(r"\s*,\s*", " ", match.group(0))
+
+    # Three or more single-token comma parts: almost always a spoken place name.
+    text = re.sub(
+        r"\b[a-z0-9]+(?:\s*,\s*[a-z0-9]+){2,}\b",
+        join_run,
+        text,
+    )
+    # Two single words with a comma, in a place slot: "in Business, Bay" or
+    # "Business, Bay projects". Not a hard-coded place list.
+    text = re.sub(
+        r"(?<=\b(?:in|at)\s)([a-z0-9]+)\s*,\s*([a-z0-9]+)\b",
+        r"\1 \2",
+        text,
+    )
+    text = re.sub(
+        r"\b([a-z0-9]+)\s*,\s*([a-z0-9]+)(?=\s+projects?\b)",
+        r"\1 \2",
+        text,
+    )
+    return text
+
+
+def _normalize_place_phrase(value: str) -> str:
+    """Strip lead words and speech commas from a place-like phrase."""
+    text = re.sub(r"\s*,\s*", " ", value or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    return re.sub(r"^(?:the|about(?:\s+the)?)\s+", "", text).strip()
+
+
 def prepare_user_question(text: str) -> str:
     """Read a messy or slang question as the plain request."""
 
@@ -393,6 +450,8 @@ def prepare_user_question(text: str) -> str:
     # "hand over projects in 2028" → "handover projects in 2028"
     text = re.sub(r"\bhand[\s-]+over\b", "handover", text)
     text = re.sub(r"\b(?:yo|pls|lemme|wanna)\b", " ", text)
+    text = _strip_speech_fillers(text)
+    text = _collapse_voice_commas(text)
     text = re.sub(r"\bplease\b", " ", text)
     text = re.sub(r"\bgimme\b", "give me", text)
     text = re.sub(r"\bstuff\b", "projects", text)
@@ -584,22 +643,28 @@ def interpret_search(question: str) -> dict:
         body,
     )
     if community:
-        place = _place_only(community.group(1))
+        place = _normalize_place_phrase(_place_only(community.group(1)))
         if place:
             return {"kind": "community", "community": place}
 
     stem_only = re.match(r"^(.+?)\s+projects?$", body)
     if stem_only:
-        stem = _clean_stem(stem_only.group(1))
+        stem = _normalize_place_phrase(_clean_stem(stem_only.group(1)))
         if stem and stem not in {"project", "projects"} and stem not in _GENERIC_WORDS:
             if len(stem.split()) == 1:
                 return {"kind": "developer", "developer": stem}
-            return {
-                "kind": "name_pattern",
-                "stem": stem,
-                "developer": None,
-                "starts_with": False,
-            }
+            # "Name by Developer projects" stays a project pattern. Any other
+            # multi-word "X projects" is treated as a place; retrieval matches
+            # X against the live community catalog, then falls through to
+            # project resolution when it is not a place.
+            if " by " in stem:
+                return {
+                    "kind": "name_pattern",
+                    "stem": stem,
+                    "developer": None,
+                    "starts_with": False,
+                }
+            return {"kind": "community", "community": stem}
 
     mentioned = _mentioned_name(raw)
     # "tell me about Morocco Cluster in International City" is a place,
