@@ -1623,6 +1623,25 @@ class HybridRetriever:
                 starts_with=bool(shape.get("starts_with")),
                 developer_name=shape.get("developer"),
             )
+            if projects:
+                return self._project_result(projects)
+
+            # "Show about X properties" often lands here when X is a community.
+            # Match X against the live place catalog — any community, not a
+            # hard-coded list — before giving up as a missing project pattern.
+            stem = (shape.get("stem") or "").strip()
+            if stem and not shape.get("starts_with") and not shape.get("developer"):
+                closest = self._closest_named_community(stem)
+                if closest:
+                    place_projects = self._filtered_projects(community_name=closest)
+                    if place_projects:
+                        shape["kind"] = "community"
+                        shape["community"] = closest
+                        return self._project_result(place_projects)
+                    shape["kind"] = "community"
+                    shape["community"] = closest
+                    return None
+
             return self._project_result(projects)
 
         if kind == "developer_community":
@@ -2419,9 +2438,15 @@ class HybridRetriever:
 
             try:
 
+                # Pass the names the planner pulled out too. Scoring only the
+                # whole sentence fails for spoken questions with filler words
+                # ("So, uh, explain about Dawn by benatti" -> no match).
                 resolved_entity = (
                     self.entity_resolver.resolve(
-                        question
+                        question,
+                        candidates_from_planner=list(
+                            getattr(query_plan, "entity_candidates", None) or []
+                        ),
                     )
                 )
 

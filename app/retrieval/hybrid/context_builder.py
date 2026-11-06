@@ -15,6 +15,7 @@ Optimization goals:
 - Keep the existing build_context() interface compatible with run.py.
 """
 
+from app.answers.amenities import amenity_labels, strip_amenity_codes
 from datetime import datetime
 
 
@@ -152,7 +153,7 @@ class HybridContextBuilder:
         if not context_parts:
             return "No relevant information was retrieved."
 
-        return "\n\n".join(context_parts)
+        return strip_amenity_codes("\n\n".join(context_parts))
 
     # ============================================================
     # STRUCTURED CONTEXT
@@ -352,8 +353,9 @@ class HybridContextBuilder:
                     project.get("property_types")
                 )
 
+                # Codes like "SP" mean nothing to the model; send names.
                 amenities = self._list_text(
-                    project.get("amenities"),
+                    amenity_labels(project.get("amenities")),
                     max_items=self.MAX_AMENITIES,
                 )
 
