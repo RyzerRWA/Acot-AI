@@ -13,6 +13,10 @@ from run import (
     _detect_response_type,
     _followup_questions,
     _is_fast_structured_question,
+    _format_transactions,
+    _listing_question,
+    _shown_project_followup,
+    _transaction_subject,
     _small_talk_answer,
     build_frontend_response,
 )
@@ -466,6 +470,63 @@ def test_developer_question_resolves_to_the_developer():
     assert match is not None
     assert match["name"] == "Binghatti"
     assert match["count"] == 2
+
+
+def test_transaction_followup_uses_the_project_on_screen():
+    class _Memory:
+        active_candidates = [{
+            "name": "15 Northside",
+            "entity_type": "project",
+            "price": 1072500,
+            "price_kind": "recent_sale",
+        }]
+
+    found = _transaction_subject("show me the recent transcation details", _Memory())
+    assert found and found[0]["name"] == "15 Northside"
+    assert _transaction_subject("Show me projects in Business Bay", _Memory()) is None
+    text = _format_transactions("15 Northside", {
+        "count": 40,
+        "sales": [{"date": "2026-03-12", "price": 1200000, "bedrooms": 1, "size_sqft": 850, "property_type": "Unit"}],
+    })
+    assert "AED 1,200,000" in text
+    assert "starting price" in text
+    assert "15 Northside" in text
+
+
+def test_a_rental_comparison_stays_off_the_project_list():
+    class _Memory:
+        def context(self):
+            return {"active_candidates": []}
+
+    question = "Compare the first two rentals in Dubai Marina and tell me which is best."
+    assert _listing_question(question, _Memory()) is True
+    assert _listing_question("Show me projects in Dubai Marina", _Memory()) is False
+
+
+def test_price_followup_uses_the_projects_already_shown():
+    class _Memory:
+        active_candidates = [
+            {
+                "name": "Altia One",
+                "entity_type": "project",
+                "developer_name": "Yas Developers",
+                "price": 1395448,
+                "bedroom_min": 1,
+                "bedroom_max": 3,
+            }
+        ]
+
+    projects, no_match = _shown_project_followup(
+        "What are their starting prices?", _Memory()
+    )
+    assert no_match is False
+    answer = _build_fast_structured_answer(
+        "What are their starting prices?",
+        {"projects": projects},
+    )
+    assert "AED 1395448" in answer
+    assert "exact match" not in answer.lower()
+    assert _shown_project_followup("Show me projects in Dubai Marina", _Memory()) is None
 
 
 def test_followups_skip_the_question_just_asked():

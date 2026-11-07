@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from app.listings.agent import ListingAgent, ListingsUnavailable
+from app.listings.agent import ListingAgent, ListingsUnavailable, _ID_TAG as _AGENT_TAG
 from app.listings.router import is_rent_question
 from app.llm.client import LLMQueueTimeoutError
 from app.answers.spoken import start_spoken_reply
@@ -60,6 +60,7 @@ from app.retrieval.hybrid.entity_resolver import (
 from app.retrieval.hybrid.question_text import (
     asks_for_listings,
     collapse_stretched_letters,
+    is_group_attribute_question,
     prepare_user_question,
 )
 
@@ -638,6 +639,132 @@ _SMALL_TALK_FILLER = {
 }
 
 
+_TRANSACTION = re.compile(
+    r"\b(?:transactions?|transcations?|trancations?|transctions?|sale history|sales history)\b",
+    re.I,
+)
+
+
+def _transaction_subject(question, conversation_memory):
+    """Projects a transaction follow-up refers to, or None so the agent does not run."""
+    if not _TRANSACTION.search(question or ""):
+        return None
+    items = getattr(conversation_memory, "active_candidates", None) or []
+    projects = [
+        item for item in items
+        if isinstance(item, dict)
+        and str(item.get("entity_type") or "project").lower() == "project"
+        and item.get("name")
+    ]
+    asked = (question or "").lower()
+    named = [project for project in projects if str(project["name"]).lower() in asked]
+    chosen = named or projects
+    return chosen[:8] or None
+
+
+def _format_transactions(name, payload) -> str:
+    sales = payload.get("sales") or []
+    label = name if isinstance(name, str) else "these projects"
+    if not sales:
+        return f"There are no recorded sales for {label} in the transaction data."
+    lines = [f"Latest recorded sale for {label}:"]
+    for sale in sales:
+        parts = []
+        if sale.get("project") and not isinstance(name, str):
+            parts.append(str(sale["project"]))
+        if sale.get("date"):
+            parts.append(str(sale["date"])[:10])
+        if sale.get("price") is not None:
+            parts.append(f"AED {int(sale['price']):,}")
+        beds = sale.get("bedrooms")
+        if beds == 0:
+            parts.append("studio")
+        elif beds is not None:
+            parts.append("1 bedroom" if int(beds) == 1 else f"{int(beds)} bedrooms")
+        if sale.get("size_sqft"):
+            parts.append(f"{int(sale['size_sqft']):,} sqft")
+        lines.append("- " + ", ".join(parts))
+    lines.append("These are recorded sale prices, not a starting price.")
+    return "\n".join(lines)
+
+
+def _transaction_turn(question, conversation_memory):
+    projects = _transaction_subject(question, conversation_memory)
+    if not projects:
+        return None
+    from app.retrieval.propai_catalog import recent_sales
+    names = [project.get("name") for project in projects]
+    payload = recent_sales(names)
+    label = names[0] if len(names) == 1 else "these projects"
+    summary = _empty_structured_summary()
+    summary["projects"] = projects
+    summary["project_total"] = len(projects)
+    return {
+        "question": question,
+        "standalone_question": question,
+        "question_type": "search" if len(projects) > 1 else "information",
+        "structured_summary": summary,
+        "documents": [],
+        "investment_analysis": None,
+        "retrieval_result": {
+            "question_type": "search" if len(projects) > 1 else "information",
+            "structured_data": {"community": [], "projects": projects, "sub_communities": []},
+            "documents": [],
+        },
+        "use_fast": True,
+        "fast_answer": _format_transactions(label if len(names) == 1 else names, payload),
+        "context": None,
+        "small_talk": None,
+    }
+
+
+def _listing_question(question, conversation_memory) -> bool:
+    """Rental questions stay on the listing path. A place name must not turn them into projects."""
+    if asks_for_listings(question):
+        return True
+    context = {}
+    if conversation_memory is not None and hasattr(conversation_memory, "context"):
+        try:
+            context = conversation_memory.context() or {}
+        except Exception:
+            context = {}
+    return bool(should_use_structured_listing_comparison(question, context))
+
+
+def _shown_project_followup(question, conversation_memory):
+    """Projects already on screen for "their starting prices" and the other chip follow-ups.
+
+    Returns (projects, no_match) or None when this is not that kind of question.
+    """
+    if not is_group_attribute_question(question):
+        return None
+    items = getattr(conversation_memory, "active_candidates", None) or []
+    projects = [
+        item for item in items
+        if isinstance(item, dict)
+        and str(item.get("entity_type") or "project").lower() == "project"
+        and item.get("name")
+    ]
+    if not projects:
+        return None
+    bedrooms = re.search(r"\b(\d+)\s*[- ]?\s*bed", question or "", re.I)
+    if not bedrooms:
+        return projects, False
+    wanted = int(bedrooms.group(1))
+    narrowed = []
+    for project in projects:
+        low = project.get("bedroom_min")
+        high = project.get("bedroom_max")
+        if low is None:
+            continue
+        high = low if high is None else high
+        if float(low) <= wanted <= float(high):
+            narrowed.append(project)
+    if narrowed:
+        return narrowed, False
+    return projects, True
+
+
 def _classify_small_talk(question):
     """Return a small-talk kind when the whole message is a greeting or identity question."""
 
@@ -727,9 +854,6 @@ def _empty_structured_summary():
 # The model chooses read-only tools (projects, brochures, rentals) and explains
 # the result. It is switched on with ACOT_USE_AGENT=1. If it is off, or it
 # fails for any reason, the standard pipeline below answers as before.
-
-_AGENT_TAG = re.compile(r"\[\[(\d{1,12})\]\]")
-
 
 def _agent_enabled(components):
     on = os.getenv("ACOT_USE_AGENT", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -1017,6 +1141,16 @@ async def _prepare_acot_turn(
             "ask_started": ask_started,
             "small_talk": None,
         }
+
+    transaction_turn = await asyncio.to_thread(
+        _transaction_turn, question, conversation_memory
+    )
+    if transaction_turn is not None:
+        transaction_turn["timing_ms"] = timing_ms
+        transaction_turn["ask_started"] = ask_started
+        transaction_turn["rag_chain"] = rag_chain
+        transaction_turn["conversation_memory"] = conversation_memory
+        return transaction_turn
 
     agent_turn = await _try_agent_turn(
         question, components, timing_ms, ask_started

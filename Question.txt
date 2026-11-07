@@ -173,3 +173,91 @@ Compare studio apartments for rent in Jumeirah Village Circle (JVC) and Arjan.
 Compare 4 bedroom villas for rent in Dubai Hills Estate and Al Furjan.
 Compare Dubai Marina and Business Bay and tell me which is better to invest.
 
+# 12. New Prop-AI data
+
+# Areas with the most recorded sales
+Show me properties in Dubai Marina.
+Show me projects in Business Bay.
+Show me projects in Downtown Dubai.
+Show me projects in Palm Jumeirah.
+Show me projects in Jumeirah Village Circle.
+Show me projects in Jumeirah Lake Towers.
+Show me projects in Dubai Hills Estate.
+Show me projects in Dubai Creek Harbour.
+Show me projects in Dubai Sports City.
+Show me projects in Dubai Silicon Oasis.
+Show me projects in Dubai Land Residence Complex.
+Show me projects in Jumeirah Beach Residence.
+Show me projects in Dubai Harbour.
+Show me projects in Meydan.
+Show me projects in Arjan.
+
+# Short names
+Show me properties in marina.
+Show me projects in jvc.
+Show me projects in jlt.
+Show me projects in jbr.
+Show me projects in bb.
+Show me projects in downtown.
+Show me projects in palm.
+
+# Named projects that exist in the new data
+Show me 23 Marina.
+Tell me about Binghatti Amber.
+Show me Azizi Riviera 1.
+Tell me about Canal Crown.
+Show me Damac Bay.
+Tell me about Aeternitas Tower.
+Show me Address Residences I Dubai Hills Estate.
+Show me Binghatti Canal.
+Show me Azizi Mina.
+Show me 15 Northside.
+Show me 51@Business Bay.
+
+# Developer
+Show me projects by Azizi Developments.
+Show me projects by Emaar.
+Show me Binghatti projects.
+Show me Sobha projects.
+Show me Damac projects in Dubai Harbour.
+Show me Emaar projects in Downtown Dubai.
+Show me Binghatti projects in Jumeirah Village Circle.
+Show me Deyaar projects in Business Bay.
+
+# Bedrooms and budget, from recent sales
+Show me 2 bedroom properties in Dubai Marina.
+Show me 1 bedroom apartments in Business Bay.
+Show me studio apartments in Jumeirah Village Circle.
+Show me 3 bedroom properties in Downtown Dubai.
+Show me 2 bedroom properties in Palm Jumeirah under 6000000.
+Show me properties in Business Bay under 2000000.
+Show me properties in Jumeirah Village Circle under 1000000.
+What is the price of 23 Marina?
+What is the starting price of Binghatti Amber?
+What is the price and bedroom range of Damac Bay?
+What is the price and bedroom range of Canal Crown?
+What is the handover date of Aeternitas Tower?
+What is the handover date of Address Residences I Dubai Hills Estate?
+
+# Rent, from recent contracts
+Show me apartments for rent in Dubai Marina.
+Show me 1 bedroom apartments for rent in Dubai Marina.
+Show me 2 bedroom apartments for rent in Business Bay.
+Show me studio apartments for rent in Jumeirah Village Circle.
+Show me 1 bedroom apartments for rent in Downtown Dubai.
+Show me 2 bedroom apartments for rent in Palm Jumeirah.
+Show me 3 bedroom apartments for rent in Dubai Marina.
+What is the yearly rent for a 1 bedroom in Business Bay?
+What is the yearly rent for a 2 bedroom in Dubai Marina?
+What is the yearly rent for a studio in Jumeirah Village Circle?
+
+# Compare areas
+Compare Dubai Marina and Business Bay.
+Compare Downtown Dubai and Palm Jumeirah.
+Compare Jumeirah Village Circle and Business Bay.
+Compare 1 bedroom apartments for rent in Dubai Marina and Business Bay.
+Compare 2 bedroom apartments for sale in Downtown Dubai and Dubai Marina.
+Compare Binghatti Amber and Azizi Riviera 1.
+Compare Damac Bay and Canal Crown.
+Compare 23 Marina and Aeternitas Tower.
+

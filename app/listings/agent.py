@@ -26,7 +26,7 @@ MAX_ROUNDS = 5
 MAX_TOOL_JSON = 9_000  # characters of tool output handed back to the model
 HISTORY_TURNS = 6      # earlier messages sent along with a question
 HISTORY_CHARS = 1_200  # longest earlier message sent in full
-_ID_TAG = re.compile(r"\[\[(\d{1,12})\]\]")
+_ID_TAG = re.compile(r"\[\[(P\d{12}|\d{1,12})\]\]")
 
 
 class ListingsUnavailable(RuntimeError):
