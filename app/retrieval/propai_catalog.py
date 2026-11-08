@@ -116,34 +116,61 @@ def _handover(value):
 
 
 def _projects_for(place: dict, limit: int = 8) -> list[dict]:
-    names = [place.get("label"), place.get("area"), place.get("master")]
+    # A master place must not use its parent area, or Marina rows appear under JBR.
+    level = str(place.get("level") or "").lower()
+    if level == "master":
+        names = [place.get("label"), place.get("master")]
+    elif level == "area":
+        names = [place.get("label"), place.get("area")]
+    else:
+        names = [place.get("label"), place.get("master"), place.get("area")]
     names = [name for name in names if name]
     if not names:
         return []
+    keys = list(dict.fromkeys(n.upper() for n in names))
+    norms = list(dict.fromkeys(re.sub(r"[^A-Z0-9]+", "", key) for key in keys if re.sub(r"[^A-Z0-9]+", "", key)))
+    if level == "area":
+        clause = (
+            "upper(payload->>'area_name_prop-ai') = any(%s) "
+            "or upper(payload->>'area_name_label') = any(%s)"
+        )
+        clause_args = (keys, keys)
+    else:
+        # JBR is stored as both "JUMEIRAH BEACH RESIDENCE - JBR" and "Jumeirah Beach Residence (JBR)".
+        clause = (
+            "upper(payload->>'master_project_en') = any(%s) "
+            "or upper(payload->>'master_project_prop-ai') = any(%s) "
+            "or upper(payload->>'development_name_prop-ai') = any(%s) "
+            "or regexp_replace(upper(coalesce(payload->>'master_project_en', '')), '[^A-Z0-9]+', '', 'g') = any(%s) "
+            "or regexp_replace(upper(coalesce(payload->>'master_project_prop-ai', '')), '[^A-Z0-9]+', '', 'g') = any(%s)"
+        )
+        clause_args = (keys, keys, keys, norms, norms)
     rows = fetch(
-        """
-        select row_key,
-               payload->>'project_name_en' as name,
-               payload->>'developer_name' as developer_name,
-               payload->>'master_project_en' as master,
-               payload->>'area_name_label' as area_label,
-               payload->>'offplan_status' as status,
-               payload->>'project_end_date' as handover,
-               left(payload->>'project_description_en', 400) as description,
-               payload->'image_urls' as image_urls
-        from propai_raw
-        where dataset = 'projects'
-          and coalesce(payload->>'project_name_en', '') <> ''
-          and (
-            upper(payload->>'master_project_en') = any(%s)
-            or upper(payload->>'area_name_prop-ai') = any(%s)
-            or upper(payload->>'development_name_prop-ai') = any(%s)
-            or upper(payload->>'area_name_label') = any(%s)
-          )
-        order by payload->>'project_name_en'
+        f"""
+        select row_key, name, developer_name, master, area_label, status, handover, description, image_urls
+        from (
+            select distinct on (upper(payload->>'project_name_en'))
+                   row_key,
+                   payload->>'project_name_en' as name,
+                   payload->>'developer_name' as developer_name,
+                   payload->>'master_project_en' as master,
+                   payload->>'area_name_label' as area_label,
+                   payload->>'offplan_status' as status,
+                   payload->>'project_end_date' as handover,
+                   left(payload->>'project_description_en', 400) as description,
+                   payload->'image_urls' as image_urls
+            from propai_raw
+            where dataset = 'projects'
+              and coalesce(payload->>'project_name_en', '') <> ''
+              and ({clause})
+            order by upper(payload->>'project_name_en'),
+                     (payload->>'developer_name') is not null desc,
+                     payload->>'project_name_en'
+        ) unique_projects
+        order by name
         limit %s
         """,
-        ( [n.upper() for n in names], ) * 4 + (limit,),
+        (*clause_args, limit),
     )
     projects = []
     for row in rows:
@@ -155,6 +182,7 @@ def _projects_for(place: dict, limit: int = 8) -> list[dict]:
             "sub_community": row.get("master"),
             "city": "Dubai",
             "price": None,
+            "price_kind": "recent_sale",
             "bedroom_min": None,
             "bedroom_max": None,
             "status": row.get("status"),
@@ -169,30 +197,38 @@ def _projects_for(place: dict, limit: int = 8) -> list[dict]:
     return projects
 
 
+_SALE_FACTS: dict[str, dict] = {}
+
+
 def _add_sale_facts(projects: list[dict]) -> None:
     names = [str(project["name"]).upper() for project in projects if project.get("name")]
     if not names:
         return
-    try:
-        stats = fetch(
-            """
-            select upper(project_name_prop_ai) as name,
-                   percentile_cont(0.5) within group (order by sale_price) as price,
-                   min(bedrooms) as bedroom_min,
-                   max(bedrooms) as bedroom_max
-            from propai_sales
-            where deleted_at is null and sale_price > 0
-              and instance_date >= current_date - interval '24 months'
-              and upper(project_name_prop_ai) = any(%s)
-            group by 1
-            """,
-            (names,),
-        )
-    except Exception:
-        return
-    by_name = {row["name"]: row for row in stats}
+    missing = [name for name in dict.fromkeys(names) if name not in _SALE_FACTS]
+    if missing:
+        try:
+            stats = fetch(
+                """
+                select upper(project_name_prop_ai) as name,
+                       percentile_cont(0.5) within group (order by sale_price) as price,
+                       min(bedrooms) filter (where bedrooms between 0 and 10) as bedroom_min,
+                       max(bedrooms) filter (where bedrooms between 0 and 10) as bedroom_max
+                from propai_sales
+                where deleted_at is null and sale_price > 0
+                  and instance_date >= current_date - interval '24 months'
+                  and upper(project_name_prop_ai) = any(%s)
+                group by 1
+                """,
+                (missing,),
+            )
+        except Exception:
+            stats = []
+        for row in stats:
+            _SALE_FACTS[str(row["name"])] = row
+        for name in missing:
+            _SALE_FACTS.setdefault(name, {})
     for project in projects:
-        stat = by_name.get(str(project["name"]).upper())
+        stat = _SALE_FACTS.get(str(project["name"]).upper())
         if not stat:
             continue
         if stat.get("price"):
@@ -209,7 +245,17 @@ def lookup(question: str) -> dict | None:
     hits = search_places(phrase, limit=3)
     if not hits or hits[0]["score"] < MIN_SCORE:
         return None
-    projects = _projects_for(hits[0])
+    place = hits[0]
+    level = str(place.get("level") or "").lower()
+    # Use the same project table as the agent. Keep master searches off the parent area
+    # so JBR does not pull every Marsa Dubai / Marina row.
+    communities = [phrase, place.get("label")]
+    if level == "master":
+        communities.append(place.get("master"))
+    elif level == "area":
+        communities.append(place.get("area"))
+    communities = [name for name in communities if name]
+    projects, _ = agent_projects({"communities": communities}, limit=8)
     if not projects:
         return None
     bedrooms = _BEDROOMS.search(question or "")
@@ -223,7 +269,7 @@ def lookup(question: str) -> dict | None:
         if narrowed:
             projects = narrowed
     return {
-        "place": hits[0]["label"],
+        "place": place.get("label"),
         "projects": projects,
         "question_type": "search",
     }
@@ -310,25 +356,41 @@ def agent_projects(filters: dict, limit: int = 8, sort: str = "cheapest") -> tup
         parts.append("extract(year from end_date) = %s")
         params.append(int(filters["handover_year"]))
     where = " and ".join(parts)
-    order = "name"
-    if name:
-        order = "lower(name) = lower(%s) desc, length(name), name"
-        params = [*params, name]
-    count = fetch(f"select count(*)::int as n from propai_projects where {where}", tuple(params[: -1] if name else params))
-    total = count[0]["n"] if count else 0
-    if total == 0:
-        return [], 0
+    ranked = (
+        "lower(name) = lower(%s) desc, length(name), name"
+        if name else
+        "name"
+    )
+    # Cap candidates before sale stats; ranking still uses the same pool size as before.
+    fetch_limit = 200
+    query_params = [*params, name] if name else list(params)
     rows = fetch(
         f"""
-        select key, name, developer, area, master_project, offplan_status, end_date,
-               left(description, 400) as description
-        from propai_projects
-        where {where}
-        order by {order}
-        limit 200
+        select key, name, developer, area, master_project, offplan_status, end_date, description
+        from (
+            select distinct on (upper(name))
+                   key, name, developer, area, master_project, offplan_status, end_date,
+                   left(description, 400) as description
+            from propai_projects
+            where {where}
+            order by upper(name), (developer is not null) desc, name
+        ) unique_projects
+        order by {ranked}
+        limit %s
         """,
-        tuple(params),
+        tuple([*query_params, fetch_limit]),
     )
+    if not rows:
+        return [], 0
+    # Skip a second count scan when the page is already the full set.
+    if len(rows) < fetch_limit:
+        total = len(rows)
+    else:
+        count = fetch(
+            f"select count(distinct upper(name))::int as n from propai_projects where {where}",
+            tuple(params),
+        )
+        total = count[0]["n"] if count else len(rows)
     projects = []
     for row in rows:
         projects.append({
@@ -354,7 +416,6 @@ def agent_projects(filters: dict, limit: int = 8, sort: str = "cheapest") -> tup
             "brochure_url": None,
         })
     _add_sale_facts(projects)
-    _attach_photos(projects)
     bedrooms = filters.get("bedrooms")
     if bedrooms is not None:
         wanted = int(bedrooms)
@@ -398,13 +459,15 @@ def agent_projects(filters: dict, limit: int = 8, sort: str = "cheapest") -> tup
         )
     else:
         projects.sort(key=rank)
+    projects = projects[:limit]
+    _attach_photos(projects)
     for project in projects:
         project["id"] = _agent_id(str(project["id"]))
-    return projects[:limit], total
+    return projects, total
 
 
-def recent_sales(name, limit: int = 8) -> dict:
-    """One latest recorded sale per project. One query, no full-table count."""
+def recent_sales(name, limit: int = 8, per_project: int = 5) -> dict:
+    """Recent recorded sales for the named projects. One query, newest first per project."""
     raw = name if isinstance(name, (list, tuple)) else [name]
     projects = []
     for item in raw:
@@ -415,35 +478,47 @@ def recent_sales(name, limit: int = 8) -> dict:
             break
     if not projects:
         return {"count": 0, "sales": []}
+    per = max(1, min(int(per_project or 5), 8))
     rows = fetch(
         """
-        select distinct on (upper(project_name_prop_ai))
-               project_name_prop_ai as project,
-               instance_date as sold_on,
-               sale_price::bigint as price,
-               bedrooms,
-               round(procedure_area_sqft)::int as size_sqft,
-               property_type_en as property_type
-        from propai_sales
-        where deleted_at is null
-          and sale_price > 0
-          and upper(project_name_prop_ai) = any(%s)
-        order by upper(project_name_prop_ai), instance_date desc nulls last
+        select project, sold_on, price, bedrooms, size_sqft, property_type
+        from (
+            select project_name_prop_ai as project,
+                   instance_date as sold_on,
+                   sale_price::bigint as price,
+                   bedrooms,
+                   round(procedure_area_sqft)::int as size_sqft,
+                   property_type_en as property_type,
+                   row_number() over (
+                       partition by upper(project_name_prop_ai)
+                       order by instance_date desc nulls last
+                   ) as rn
+            from propai_sales
+            where deleted_at is null
+              and sale_price > 0
+              and upper(project_name_prop_ai) = any(%s)
+        ) ranked
+        where rn <= %s
         """,
-        (projects,),
+        (projects, per),
     )
-    sales = []
+    by_name = {key: [] for key in projects}
     for row in rows:
         sold = row.get("sold_on")
-        sales.append({
+        key = str(row.get("project") or "").upper()
+        sale = {
             "project": row.get("project"),
             "date": sold.isoformat() if hasattr(sold, "isoformat") else (str(sold)[:10] if sold else None),
             "price": None if row.get("price") is None else int(row["price"]),
             "bedrooms": None if row.get("bedrooms") is None else int(float(row["bedrooms"])),
             "size_sqft": None if row.get("size_sqft") is None else int(row["size_sqft"]),
             "property_type": row.get("property_type"),
-        })
-    sales.sort(key=lambda sale: sale.get("date") or "", reverse=True)
+        }
+        if key in by_name:
+            by_name[key].append(sale)
+    sales = []
+    for key in projects:
+        sales.extend(by_name.get(key) or [])
     return {"count": len(sales), "sales": sales}
 
 

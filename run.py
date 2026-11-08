@@ -662,30 +662,55 @@ def _transaction_subject(question, conversation_memory):
     return chosen[:8] or None
 
 
-def _format_transactions(name, payload) -> str:
+def _sale_line(sale) -> str:
+    parts = []
+    if sale.get("price") is not None:
+        parts.append(f"AED {int(sale['price']):,}")
+    beds = sale.get("bedrooms")
+    if beds == 0:
+        parts.append("studio")
+    elif beds is not None:
+        parts.append("1 bedroom" if int(beds) == 1 else f"{int(beds)} bedrooms")
+    if sale.get("size_sqft"):
+        parts.append(f"{int(sale['size_sqft']):,} sqft")
+    detail = ", ".join(parts)
+    date = str(sale.get("date") or "")[:10]
+    if date:
+        return f"• {date}: {detail}" if detail else f"• {date}"
+    return f"• {detail}"
+
+
+def _format_transactions(name, payload, label=None) -> str:
     sales = payload.get("sales") or []
-    label = name if isinstance(name, str) else "these projects"
+    names = [name] if isinstance(name, str) else list(name or [])
+    intro = label or (names[0] if len(names) == 1 else "these projects")
     if not sales:
-        return f"There are no recorded sales for {label} in the transaction data."
-    lines = [f"Latest recorded sale for {label}:"]
+        return f"There are no recorded sales for {intro} in the transaction data."
+    grouped = {}
     for sale in sales:
-        parts = []
-        if sale.get("project") and not isinstance(name, str):
-            parts.append(str(sale["project"]))
-        if sale.get("date"):
-            parts.append(str(sale["date"])[:10])
-        if sale.get("price") is not None:
-            parts.append(f"AED {int(sale['price']):,}")
-        beds = sale.get("bedrooms")
-        if beds == 0:
-            parts.append("studio")
-        elif beds is not None:
-            parts.append("1 bedroom" if int(beds) == 1 else f"{int(beds)} bedrooms")
-        if sale.get("size_sqft"):
-            parts.append(f"{int(sale['size_sqft']):,} sqft")
-        lines.append("- " + ", ".join(parts))
-    lines.append("These are recorded sale prices, not a starting price.")
-    return "\n".join(lines)
+        key = str(sale.get("project") or "").strip()
+        if not key:
+            continue
+        grouped.setdefault(key.upper(), {"name": key, "sales": []})["sales"].append(sale)
+    order = []
+    for item in names:
+        key = str(item or "").strip().upper()
+        if key and key in grouped and key not in order:
+            order.append(key)
+    for key in grouped:
+        if key not in order:
+            order.append(key)
+    lines = [f"Here are the recent transaction details for {intro}:", ""]
+    for key in order:
+        block = grouped[key]
+        lines.append(block["name"])
+        lines.append("")
+        lines.append("• Recent Transactions:")
+        lines.append("")
+        for sale in block["sales"]:
+            lines.append(_sale_line(sale))
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 def _transaction_turn(question, conversation_memory):
@@ -694,25 +719,41 @@ def _transaction_turn(question, conversation_memory):
         return None
     from app.retrieval.propai_catalog import recent_sales
     names = [project.get("name") for project in projects]
+    communities = {
+        str(project.get("community") or "").strip()
+        for project in projects
+        if project.get("community")
+    }
+    developers = {
+        str(project.get("developer_name") or project.get("developer") or "").strip()
+        for project in projects
+        if project.get("developer_name") or project.get("developer")
+    }
+    if len(names) == 1:
+        intro = names[0]
+    elif len(developers) == 1 and len(communities) == 1:
+        intro = f"the {next(iter(developers))} projects in {next(iter(communities))}"
+    elif len(communities) == 1:
+        intro = f"the projects in {next(iter(communities))}"
+    else:
+        intro = "these projects"
     payload = recent_sales(names)
-    label = names[0] if len(names) == 1 else "these projects"
+    # Text only: do not attach project rows, or the app draws property cards under the sales list.
     summary = _empty_structured_summary()
-    summary["projects"] = projects
-    summary["project_total"] = len(projects)
     return {
         "question": question,
         "standalone_question": question,
-        "question_type": "search" if len(projects) > 1 else "information",
+        "question_type": "general",
         "structured_summary": summary,
         "documents": [],
         "investment_analysis": None,
         "retrieval_result": {
-            "question_type": "search" if len(projects) > 1 else "information",
-            "structured_data": {"community": [], "projects": projects, "sub_communities": []},
+            "question_type": "general",
+            "structured_data": {"community": [], "projects": [], "sub_communities": []},
             "documents": [],
         },
         "use_fast": True,
-        "fast_answer": _format_transactions(label if len(names) == 1 else names, payload),
+        "fast_answer": _format_transactions(names, payload, label=intro),
         "context": None,
         "small_talk": None,
     }
@@ -1152,6 +1193,42 @@ async def _prepare_acot_turn(
         transaction_turn["conversation_memory"] = conversation_memory
         return transaction_turn
 
+    shown_followup = _shown_project_followup(question, conversation_memory)
+    if shown_followup is not None:
+        projects, no_match = shown_followup
+        summary = _empty_structured_summary()
+        if no_match:
+            summary["filter_no_match"] = True
+            summary["filter_evidence_projects"] = projects
+        else:
+            summary["projects"] = projects
+            summary["project_total"] = len(projects)
+        return {
+            "question": question,
+            "standalone_question": question,
+            "question_type": "search",
+            "structured_summary": summary,
+            "documents": [],
+            "investment_analysis": None,
+            "retrieval_result": {
+                "question_type": "search",
+                "structured_data": {
+                    "community": [],
+                    "projects": [] if no_match else projects,
+                    "sub_communities": [],
+                },
+                "documents": [],
+            },
+            "rag_chain": rag_chain,
+            "conversation_memory": conversation_memory,
+            "use_fast": True,
+            "fast_answer": _build_fast_structured_answer(question, summary),
+            "context": None,
+            "timing_ms": timing_ms,
+            "ask_started": ask_started,
+            "small_talk": None,
+        }
+
     agent_turn = await _try_agent_turn(
         question, components, timing_ms, ask_started
     )
@@ -1420,7 +1497,10 @@ def _stream_sources(prepared):
     return sources
 
 
+_TRANSACTION_FOLLOWUP = "Show me the recent transaction details"
+
 _PROJECT_FOLLOWUPS = (
+    ("transactions", _TRANSACTION_FOLLOWUP),
     ("price", "What are their starting prices?"),
     ("bedroom", "Which of these have 2-bedroom options?"),
     ("handover", "What are their handover dates?"),
@@ -1454,6 +1534,8 @@ def _question_topics(text):
         topics.add("amenities")
     if any(term in question for term in ("size", "sqft", "square foot")):
         topics.add("size")
+    if any(term in question for term in ("transaction", "transactions", "transcation", "sale history")):
+        topics.add("transactions")
     return topics
 
 
@@ -1468,7 +1550,7 @@ def _questions_already_asked(prepared):
     return asked
 
 
-def _unused_followups(prepared, chips):
+def _unused_followups(prepared, chips, pinned=None):
     asked = _questions_already_asked(prepared)
     asked_text = {_normalize_chat_text(item) for item in asked if item}
     covered = set()
@@ -1482,6 +1564,11 @@ def _unused_followups(prepared, chips):
         if _question_topics(chip) & covered:
             continue
         unused.append(chip)
+
+    pinned_chip = pinned or None
+    if pinned_chip and _normalize_chat_text(pinned_chip) not in asked_text:
+        unused = [chip for chip in unused if _normalize_chat_text(chip) != _normalize_chat_text(pinned_chip)]
+        unused = [pinned_chip, *unused]
     return unused[:3]
 
 
@@ -1562,28 +1649,33 @@ def _followup_questions(prepared):
         return _unused_followups(
             prepared,
             [
+                _TRANSACTION_FOLLOWUP,
                 f"What is the starting price of {name}?",
                 f"What is the handover date of {name}?",
                 f"Who is the developer of {name}?",
                 f"What amenities does {name} offer?",
                 f"What is the bedroom range of {name}?",
             ],
+            pinned=_TRANSACTION_FOLLOWUP,
         )
 
     if len(projects) >= 2:
         return _unused_followups(
             prepared,
             [chip for _, chip in _PROJECT_FOLLOWUPS],
+            pinned=_TRANSACTION_FOLLOWUP,
         )
 
     if place and re.search(r"\bprojects?\b", question, flags=re.I):
         return _unused_followups(
             prepared,
             [
+                _TRANSACTION_FOLLOWUP,
                 f"What are the starting prices of projects in {place}?",
                 f"What are the handover dates of projects in {place}?",
                 f"Compare the first and second projects in {place}.",
             ],
+            pinned=_TRANSACTION_FOLLOWUP,
         )
 
     return []

@@ -484,13 +484,22 @@ def test_transaction_followup_uses_the_project_on_screen():
     found = _transaction_subject("show me the recent transcation details", _Memory())
     assert found and found[0]["name"] == "15 Northside"
     assert _transaction_subject("Show me projects in Business Bay", _Memory()) is None
-    text = _format_transactions("15 Northside", {
-        "count": 40,
-        "sales": [{"date": "2026-03-12", "price": 1200000, "bedrooms": 1, "size_sqft": 850, "property_type": "Unit"}],
-    })
-    assert "AED 1,200,000" in text
-    assert "starting price" in text
-    assert "15 Northside" in text
+    text = _format_transactions(
+        ["Mayfair Tower", "Mayfair Residency"],
+        {
+            "sales": [
+                {"project": "Mayfair Tower", "date": "2026-10-19", "price": 1000000, "bedrooms": 1, "size_sqft": 807},
+                {"project": "Mayfair Tower", "date": "2026-08-19", "price": 1100000, "bedrooms": 1, "size_sqft": 807},
+                {"project": "Mayfair Residency", "date": "2026-09-03", "price": 400000, "bedrooms": 1, "size_sqft": 298},
+            ],
+        },
+        label="the Deyaar projects in Business Bay",
+    )
+    assert "Here are the recent transaction details for the Deyaar projects in Business Bay:" in text
+    assert "Mayfair Tower" in text
+    assert "• Recent Transactions:" in text
+    assert "• 2026-10-19: AED 1,000,000, 1 bedroom, 807 sqft" in text
+    assert text.index("Mayfair Tower") < text.index("Mayfair Residency")
 
 
 def test_a_rental_comparison_stays_off_the_project_list():
