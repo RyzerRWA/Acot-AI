@@ -207,6 +207,38 @@ def _for_model(card: dict) -> dict:
 
 # ---------------------------------------------------------------- the tools
 
+def _new_places(patterns: list[str]) -> list[dict]:
+    try:
+        return fetch(
+            "select label, level, sales_count from propai_places "
+            "where level in ('area', 'master') and label ilike any(%s::text[]) "
+            "order by sales_count desc nulls last limit 8",
+            (patterns,),
+        )
+    except Exception:
+        return []
+
+
+def _recorded_rents(filters: dict) -> dict | None:
+    if not filters.get("areas"):
+        return None
+    try:
+        from app.retrieval.propai_catalog import rent_summary
+        return rent_summary(filters.get("areas"), filters.get("beds_min"), filters.get("beds_max"))
+    except Exception as exc:
+        print(f"Prop-AI rent summary unavailable: {exc}")
+        return None
+
+
+def _new_projects(filters: dict, limit: int, sort: str) -> tuple[list[dict], int]:
+    try:
+        from app.retrieval.propai_catalog import agent_projects
+        return agent_projects(filters, limit=limit, sort=sort)
+    except Exception as exc:
+        print(f"Prop-AI project search unavailable: {exc}")
+        return [], 0
+
+
 def find_areas(raw) -> ToolResult:
     a = _obj(raw)
     text = str(a.get("text") or "").strip()[:80]
@@ -223,15 +255,26 @@ def find_areas(raw) -> ToolResult:
                       "order by listings desc limit 10", (patterns,))
     total = fetch("select count(*)::int as total from listings where community ILIKE ANY(%s::text[]) "
                   "or sub_community ILIKE ANY(%s::text[]) or location ILIKE ANY(%s::text[])", (patterns,) * 3)[0]["total"]
+    places = _new_places(patterns)
     if not (areas or subs or buildings):
+        if places:
+            return ToolResult({
+                "matches": [],
+                "new_places": places,
+                "note": f'No advertised rental listing matching "{text}". The new project data has these places. '
+                        "Call search_projects with the label.",
+            })
         top = fetch("select community, count(*)::int as listings from listings group by community "
                     "order by listings desc limit 15")
         return ToolResult({"matches": [], "note": f'No area or building matching "{text}" in the data.',
                            "most_listed_areas": top})
-    return ToolResult({
+    result = {
         "total_listings_matching": total,  # exact, across ALL matches; the lists show only the top 10
         "communities": areas, "sub_areas": subs, "buildings": buildings,
-    })
+    }
+    if places:
+        result["new_places"] = places
+    return ToolResult(result)
 
 
 def search_listings(raw) -> ToolResult:
@@ -247,6 +290,9 @@ def search_listings(raw) -> ToolResult:
     cards = [_card(r) for r in rows]
     output = {"matching_listings": total, "showing": len(cards), "sorted_by": sort,
               "listings": [_for_model(c) for c in cards]}
+    recorded = _recorded_rents(f)
+    if recorded:
+        output["recorded_rents"] = recorded
     if total == 0 and (f.get("property_types") or f.get("beds_min") is not None or f.get("beds_max") is not None):
         # nothing matched: tell the model what the same place does have, so it can offer a real alternative
         loose_where, loose_params = _where({**f, "property_types": None, "beds_min": None, "beds_max": None})
@@ -446,6 +492,7 @@ def _project_for_model(row: dict) -> dict:
         "property_types": row.get("property_types") or None,
         "status": row.get("project_status") or row.get("status"),
         "has_brochure": bool(row.get("brochure_url")),
+        "price_kind": row.get("price_kind") or "starting",
     }
 
 
@@ -475,6 +522,9 @@ def mentions_known_name(text: str) -> bool:
                          "select lower(btrim(community)) from listings union "
                          "select lower(btrim(developer_name)) from projects union "
                          "select lower(btrim(name)) from projects")
+            extra = fetch("select lower(btrim(label)) as n from propai_places "
+                          "where level in ('area', 'master')")
+            rows = list(rows) + list(extra)
         except Exception:
             return False  # no database: do not force anything
         _known_names = {r["n"] for r in rows if r.get("n") and len(r["n"]) >= 4}
@@ -491,13 +541,31 @@ def search_projects(raw) -> ToolResult:
         raise ToolInputError(f"sort must be one of: {', '.join(PROJECT_SORTS)}.")
     limit = int(round(_num(a, "limit", 1, 10) or 8))
     where, params = _project_where(f)
-    rows = fetch(f"select {PROJECT_COLUMNS} from projects where {where} order by {PROJECT_SORTS[sort]} limit %s",
-                 (*params, limit))
-    total = fetch(f"select count(*)::int as total from projects where {where}", tuple(params))[0]["total"]
+    new_rows, new_total = _new_projects(f, limit, sort)
+    old_rows, old_total = [], 0
+    if len(new_rows) < limit:
+        old_rows = fetch(f"select {PROJECT_COLUMNS} from projects where {where} order by {PROJECT_SORTS[sort]} limit %s",
+                         (*params, limit))
+        old_total = fetch(f"select count(*)::int as total from projects where {where}", tuple(params))[0]["total"]
+    taken = {str(row.get("name") or "").lower() for row in new_rows}
+    extra = [row for row in old_rows if str(row.get("name") or "").lower() not in taken]
+    rows = (new_rows + extra)[:limit]
+    total = new_total + old_total
+    projects_out = []
+    for row in rows:
+        shown = _project_for_model(row)
+        if row.get("sales_count") is not None:
+            shown["sales_count"] = int(row["sales_count"])
+        projects_out.append(shown)
     out = {
         "matching_projects": total, "showing": len(rows), "sorted_by": sort,
-        "price_note": "Prices are STARTING prices for the project, not prices of a particular unit.",
-        "projects": [_project_for_model(r) for r in rows],
+        "price_note": "price_kind recent_sale is the median sale price from the last 24 months in the new data. "
+                      "price_kind starting is a starting price from the older project table, not a unit price.",
+        "projects": projects_out,
+        "browse_note": (
+            "For plain show/list/find project browse questions, list the projects only. "
+            "Do NOT add Acot Recommend unless the user asked which is best, invest, buy, or recommend."
+        ),
     }
     cards = [_project_card(r) for r in rows]
     if total == 0:
@@ -555,18 +623,43 @@ def _gap(row: dict, f: dict) -> dict:
     return {}
 
 
+def _propai_matches(ref: str, limit: int) -> list[dict]:
+    from app.retrieval.propai_catalog import agent_by_id, agent_projects
+    if re.fullmatch(r"P\d{12}", ref):
+        row = agent_by_id(ref)
+        return [row] if row else []
+    rows, _ = agent_projects({"name": ref}, limit=limit)
+    exact = [row for row in rows if str(row.get("name") or "").lower() == ref.lower()]
+    return exact or rows
+
+
 def _find_projects(ref: str, limit: int = 6) -> list[dict]:
     ref = str(ref or "").strip()[:80]
     if not ref:
         return []
+    propai: list[dict] = []
+    try:
+        propai = _propai_matches(ref, limit)
+    except Exception as exc:
+        print(f"Prop-AI project lookup unavailable: {exc}")
+    if re.fullmatch(r"P\d{12}", ref):
+        return propai
+    if len(propai) == 1 and str(propai[0].get("name") or "").lower() == ref.lower():
+        return propai
     if re.fullmatch(r"\d{1,12}", ref):
         return fetch(f"select {PROJECT_COLUMNS} from projects where id = %s", (int(ref),))
     exact = fetch(f"select {PROJECT_COLUMNS} from projects where lower(btrim(name)) = lower(%s) limit 2", (ref,))
-    if len(exact) == 1:
+    if len(exact) == 1 and not propai:
         return exact
     where, params = _project_where({"name": ref})
-    return fetch(f"select {PROJECT_COLUMNS} from projects where {where} order by length(name), id limit %s",
-                 (*params, limit))
+    old = fetch(f"select {PROJECT_COLUMNS} from projects where {where} order by length(name), id limit %s",
+                (*params, limit))
+    if len(old) == 1 and str(old[0].get("name") or "").lower() == ref.lower():
+        return old
+    if not propai:
+        return old
+    taken = {str(row.get("name") or "").lower() for row in propai}
+    return (propai + [row for row in old if str(row.get("name") or "").lower() not in taken])[:limit]
 
 
 def get_project(raw) -> ToolResult:
@@ -590,9 +683,10 @@ def get_project(raw) -> ToolResult:
         "round(100.0 * count(*) filter (where price < %s) / nullif(count(*), 0))::int as pct_cheaper "
         "from projects where community = %s and price > 0", (row["price"] if has_price else 0, row.get("community")))[0]
     description = re.sub(r"\s+", " ", str(row.get("description") or "")).strip()[:1200] or None
+    shown = _project_for_model(row)
     return ToolResult({
         "found": True,
-        "project": _project_for_model(row),
+        "project": shown,
         "developer_marketing_description": description,
         "marketing_note": "The description is developer marketing text: say 'the developer describes it as', "
                           "never state its claims as verified fact.",
@@ -605,6 +699,8 @@ def get_project(raw) -> ToolResult:
 
 
 def compare_projects(raw) -> ToolResult:
+    from app.answers.recommend import rank_projects
+
     a = _obj(raw)
     refs = a.get("projects")
     if not isinstance(refs, list) or not 2 <= len(refs) <= 4:
@@ -618,7 +714,29 @@ def compare_projects(raw) -> ToolResult:
             unclear.append({"asked_for": str(ref)[:80], "candidates": [_project_for_model(r) for r in rows]})
         else:
             found.append(rows[0])
-    out: dict = {"compared": [_project_for_model(r) for r in found]}
+    ranked = rank_projects(found, wanted_beds=_num(a, "bedrooms", 0, 12)) if len(found) >= 2 else None
+    score_by_id = {}
+    if ranked:
+        for item in ranked.get("ranked") or []:
+            row = item.get("row") or {}
+            key = str(row.get("id") or item.get("name") or "")
+            score_by_id[key] = {
+                "score": item.get("score"),
+                "why": item.get("why") or [],
+                "sales_count": item.get("sales_count"),
+            }
+    compared = []
+    for row in found:
+        shown = _project_for_model(row)
+        extra = score_by_id.get(str(row.get("id")), {}) or score_by_id.get(str(row.get("name") or ""), {})
+        if row.get("sales_count") is not None:
+            shown["sales_count"] = int(row["sales_count"])
+        elif extra.get("sales_count") is not None:
+            shown["sales_count"] = int(extra["sales_count"])
+        if extra.get("score") is not None:
+            shown["recommend_score"] = extra["score"]
+        compared.append(shown)
+    out: dict = {"compared": compared}
     if missing:
         out["not_found"] = missing
     if unclear:
@@ -630,14 +748,20 @@ def compare_projects(raw) -> ToolResult:
         out["price_difference"] = {
             "lowest_starting_price": low["name"], "highest_starting_price": high["name"],
             "gap_aed": int(gap), "highest_is_percent_more": round(100 * gap / float(low["price"]), 1),
-            "note": "Starting prices only; not unit prices.",
+            "note": "price_kind recent_sale is a median sale; starting is from the older table.",
         }
     dated = [r for r in found if r.get("handover_time") is not None]
     if len(dated) >= 2:
         first = min(dated, key=lambda r: r["handover_time"])
         out["earliest_handover"] = {"project": first["name"],
                                     "handover": _project_for_model(first)["handover"]}
-    out["not_in_the_data"] = "Rental yield, ROI, resale value and unit-level prices are not in this data."
+    if ranked and ranked.get("recommendation") is not None:
+        out["recommendation"] = ranked["recommendation"]
+        out["recommendation_note"] = (
+            "Answer with a markdown side-by-side table of ONLY these compared projects, "
+            "then end with **Acot Recommend:** and Why (price, size, sales/transactions, rentals). "
+            "Keep the tone positive and clean; do not invent a different winner."
+        )
     return ToolResult(out, [_project_card(r) for r in found])
 
 
@@ -670,11 +794,21 @@ def market_stats(raw) -> ToolResult:
                     "max_starting_price_aed": r["max_price"],
                     "bedrooms_offered": [r["bed_min"], r["bed_max"]], "projects_with_handover_date": r["with_handover"]})
         out.append(row)
-    return ToolResult({
+    result = {
         "grouped_by": group_key, "rows": out, "handover_years": years,
-        "note": "Statistics describe the projects in our database (starting prices), which is a sample of the "
-                "market. There is no rental yield, ROI, transaction or price-growth data.",
-    })
+        "note": "rows are starting prices from the older project table. new_data, when present, is recorded "
+                "sales from the last 24 months and is the price to quote. There is no yield, ROI or price growth.",
+    }
+    if f.get("communities"):
+        try:
+            from app.retrieval.propai_catalog import sale_summary
+            recorded = sale_summary(f["communities"])
+        except Exception as exc:
+            print(f"Prop-AI sale summary unavailable: {exc}")
+            recorded = None
+        if recorded:
+            result["new_data"] = recorded
+    return ToolResult(result)
 
 
 def search_brochures(raw, pgvector=None) -> ToolResult:
