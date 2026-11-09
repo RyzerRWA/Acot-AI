@@ -62,7 +62,8 @@ def test_facts_without_data_say_so():
 
 def test_prompt_matches_language_and_name_rules():
     english = build_spoken_prompt("Show me villas", "- facts", user_name="Charan")
-    assert "Reply in English only" in english
+    assert "Hindi if they asked in Hindi, otherwise English" in english
+    assert "Devanagari" in english  # Hindi replies use Hindi script, so the voice switches to Hindi
     assert "Indian, British, American" in english
     assert "Charan" in english and "at most once" in english
     assert "let me check" in english  # tells the model not to repeat the filler
@@ -72,9 +73,9 @@ def test_prompt_matches_language_and_name_rules():
     assert "never add details that are not in them" in english
     assert "answer only the last thing they asked" in english
 
-    # Arabic input still gets an English-only spoken reply.
+    # Arabic input still gets an English spoken reply.
     mixed = build_spoken_prompt("أرني الفلل في دبي", "- facts")
-    assert "Reply in English only" in mixed
+    assert "Never use Arabic" in mixed
     assert "Arabic" in mixed and "Reply in Arabic" not in mixed
     assert "Do not invent a name" in mixed
 
