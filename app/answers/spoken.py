@@ -87,7 +87,18 @@ def recent_history(prepared):
     return "\n".join(lines)
 
 
-def build_spoken_prompt(question, facts, user_name=None, history="", meaning=""):
+def build_spoken_prompt(question, facts, user_name=None, history="", meaning="", language=None):
+    # The voice-mode language picker decides; without it, Hindi script means Hindi.
+    # Decided here, not by the model, so earlier turns can't pull the reply into another language.
+    hindi = language == "hi" if language else bool(re.search(r"[\u0900-\u097F]", question or ""))
+    language_rule = (
+        "- Reply in Hindi only, even if the user spoke English or another language, or earlier messages were in English. Never use Arabic or any other language.\n"
+        '- Write every Hindi word in Devanagari letters ("आपको", "है", "लगभग"), never in English letters ("aapko", "hai", "lagbhag").\n'
+        '- Talk the way people in India really speak: friendly, everyday Hinglish. Use the common English words people say anyway (price, project, apartment, location, deal, screen) instead of formal Hindi like "मूल्य", "परियोजना" or "उपलब्ध". Use "आप". Keep project, area and developer names in English letters, and say prices like "लगभग 12 लाख दिरहम".'
+        if hindi
+        else "- Reply in English only, even if earlier messages were in Hindi or another language. Never use Arabic, Hindi or any other language.\n"
+        "- The user may speak any variety of English (Indian, British, American, Australian, and so on). Understand their wording and answer in clear, natural English."
+    )
     name_rule = (
         f"- You may use the user's first name ({user_name}) at most once, and only if it feels natural."
         if user_name
@@ -98,14 +109,14 @@ They asked a question by voice. The full detailed answer is already on their scr
 Write what you SAY to them now.
 
 Rules:
-- Reply in the language of the user's question: Hindi if they asked in Hindi, otherwise English. Never use Arabic or any other language.
-- In Hindi, write in Devanagari script and speak simple, everyday Hindi. Keep project, area and developer names in English letters, and say prices like "लगभग 12 लाख दिरहम".
-- The user may speak any variety of English (Indian, British, American, Australian, and so on). Understand their wording and answer in clear, natural English.
+{language_rule}
 - First work out exactly what was asked, and answer only that:
-  - One detail (like the property type, price, handover, bedrooms, amenities, location or developer of a project): answer it first and fully, then add ONE closely related fact the user would likely want next, in 1 to 2 natural sentences. For example: "Azizi Ruby is an apartment project, with studios up to three-bedroom units starting from about 618 thousand dirhams." Not a full overview, and no follow-up question.
-  - A broad question ("show me projects in JVC", "tell me about Dawn by Binghatti"): 2 to 4 short sentences, about 60 words at most.
+  - One detail (like the property type, price, handover, bedrooms, amenities, location or developer of a project): answer it first and fully, then add ONE closely related fact the user would likely want next, in 1 to 2 natural sentences. For example: "It's an apartment project, with studios up to three-bedroom units starting from about 618 thousand dirhams." Not a full overview, and no follow-up question.
+  - A broad question ("show me projects in JVC", "tell me about a project"): 2 to 4 short sentences, about 60 words at most.
 - If the user corrects themselves mid-sentence ("how many... sorry, what is the property type"), answer only the last thing they asked.
-- Sound like a helpful person on a call, not a report.
+- Sound like a friendly person chatting on a call, not a report: warm, relaxed and human.
+  - Use contractions ("it's", "there's", "you'll") and short, easy sentences.
+  - A small natural reaction is welcome when it fits, like "JVC's a great pick for families" or "that's a nice budget for Marina", but only one, and only if the facts support it.
 - Start straight with the answer, like "In Jumeirah Village Circle there are 5 projects…". Do not open with "Sure", "Yes", "Of course", "Absolutely", "Okay" or "Good question", and never say "let me check" or "one moment".
 - For broad questions with results, mention how many there are and 2 or 3 names.
 - Say numbers the way people speak: "about 1.2 million dirhams", "around 7 percent". No sqft lists, IDs, links, markdown, emojis, bullet points or tables.
@@ -127,7 +138,7 @@ What the user means: {meaning}""" if meaning and meaning.strip().lower() != ques
 Facts:
 {facts}
 
-What you say:"""
+What you say{" (in Hindi, written in Devanagari letters)" if hindi else ""}:"""
 
 
 def strip_stock_opener(text):
@@ -135,7 +146,7 @@ def strip_stock_opener(text):
     return stripped[:1].upper() + stripped[1:] if stripped != text else text
 
 
-async def stream_spoken_reply(llm, question, prepared, user_name=None):
+async def stream_spoken_reply(llm, question, prepared, user_name=None, language=None):
     """Yield the spoken reply as the model writes it, minus any "Good question" opener."""
     prompt = build_spoken_prompt(
         question,
@@ -143,6 +154,7 @@ async def stream_spoken_reply(llm, question, prepared, user_name=None):
         user_name,
         history=recent_history(prepared),
         meaning=str(prepared.get("standalone_question") or ""),
+        language=language,
     )
     head = ""
     async for delta in llm.stream(prompt, max_output_tokens=MAX_SPOKEN_TOKENS):
@@ -210,8 +222,9 @@ class SpokenReply:
         self._task.cancel()
 
 
-def start_spoken_reply(llm, question, prepared, user_name=None):
-    # Greetings and small talk already have a short friendly answer; say it as is.
-    if prepared.get("small_talk") and prepared.get("fast_answer"):
+def start_spoken_reply(llm, question, prepared, user_name=None, language=None):
+    # Greetings and small talk already have a short friendly English answer; say it as is,
+    # unless Hindi was picked, then the model says it in Hindi.
+    if prepared.get("small_talk") and prepared.get("fast_answer") and language != "hi":
         return SpokenReply(_fixed(prepared["fast_answer"]))
-    return SpokenReply(stream_spoken_reply(llm, question, prepared, user_name))
+    return SpokenReply(stream_spoken_reply(llm, question, prepared, user_name, language))

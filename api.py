@@ -124,6 +124,8 @@ class AskRequest(BaseModel):
     user_name: str | None = Field(default=None, max_length=120)
     # "voice": also stream a short spoken reply (`speech` events) for voice mode.
     mode: Literal["text", "voice"] = "text"
+    # Voice mode: the language of the spoken reply, whatever the user speaks. None: follow the question.
+    language: Literal["en", "hi"] | None = None
 
 
 def _apply_user_name(components, name):
@@ -624,6 +626,7 @@ async def ask_stream_endpoint(request: AskRequest):
                 question,
                 components,
                 mode=request.mode,
+                language=request.language,
             ):
                 if event_name == "meta" and isinstance(data, dict):
                     data = dict(data)

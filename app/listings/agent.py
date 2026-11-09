@@ -89,8 +89,10 @@ class ListingAgent:
         raise ListingsUnavailable(last)
 
     def answer(self, question: str, history: list[dict] | None = None, listing_id: str | None = None,
-               profile: dict | None = None) -> AgentResult:
-        """profile: what is known about the user. The update_profile tool writes into this same dict."""
+               profile: dict | None = None, on_results=None) -> AgentResult:
+        """profile: what is known about the user. The update_profile tool writes into this same dict.
+        on_results(tool_outputs): called once, from this thread, as soon as a search has returned records
+        and before the model writes its answer, so voice mode can start speaking early."""
         started = time.perf_counter()
         profile = {} if profile is None else profile
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -113,9 +115,26 @@ class ListingAgent:
         messages.append({"role": "user", "content": question})
 
         tools = tools_for(question)
+        found = []
+        pending = [on_results] if on_results else []
+
+        def tool(name, args):
+            result = run_tool(name, args, pgvector=self.pgvector, profile=profile)
+            found.extend(result.cards)
+            return result
+
+        def chat(msgs):
+            # Records came back, so the model is about to write the answer from them: hand them over now.
+            if pending and found:
+                try:
+                    pending.pop()([str(m.get("content") or "") for m in msgs if m.get("role") == "tool"])
+                except Exception:
+                    log.exception("on_results failed")
+            return self._chat(msgs, tools)
+
         graph = build_agent_graph(
-            lambda msgs: self._chat(msgs, tools),
-            lambda name, args: run_tool(name, args, pgvector=self.pgvector, profile=profile),
+            chat,
+            tool,
             ToolInputError, max_rounds=MAX_ROUNDS, max_tool_json=MAX_TOOL_JSON, log=log,
             needs_grounding=mentions_known_name)
         state = graph.invoke({"messages": messages, "seen": {}, "used": [], "tokens": 0, "rounds": 0})
