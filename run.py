@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import os
 import re
 import io
@@ -17,7 +18,7 @@ load_dotenv()
 from app.listings.agent import ListingAgent, ListingsUnavailable, _ID_TAG as _AGENT_TAG
 from app.listings.router import is_rent_question
 from app.llm.client import LLMQueueTimeoutError
-from app.answers.spoken import start_spoken_reply
+from app.answers.spoken import MAX_FACT_CHARS, start_spoken_reply
 from app.subscription.token_usage import add_tokens
 from app.listings import session_store
 from app.retrieval.hybrid.listing_turns import should_use_structured_listing_comparison
@@ -1150,7 +1151,7 @@ async def _try_agent_turn(question, components, timing_ms, ask_started):
     await llm._acquire_slot()
     try:
         result = await asyncio.to_thread(
-            agent.answer, question, list(history), None, profile
+            agent.answer, question, list(history), None, profile, _agent_results_hook.get()
         )
     except LLMQueueTimeoutError:
         raise
@@ -1994,10 +1995,16 @@ def _slim_stream_response(response):
     return slim
 
 
+# Voice mode: set while a turn is being prepared, so the agent can start the spoken reply
+# from its search results instead of waiting for the whole written answer (saves 1-4s).
+_agent_results_hook = contextvars.ContextVar("agent_results_hook", default=None)
+
+
 async def stream_acot(
     question,
     components,
     mode="text",
+    language=None,
 ):
     """Yield typed stream events: meta, delta, followups, then done.
 
@@ -2012,10 +2019,36 @@ async def stream_acot(
     # No stdout redirect: the API installs a logging-backed sys.stdout at
     # startup, so pipeline output is captured without mutating global state
     # per request (which interleaved output across concurrent requests).
-    prepared = await _prepare_acot_turn(
-        question,
-        components
-    )
+    early = {}
+    hook_token = None
+    if mode == "voice":
+        loop = asyncio.get_running_loop()
+
+        def start_early(tool_outputs):
+            facts = "- Search results:\n" + "\n".join(tool_outputs)[:MAX_FACT_CHARS]
+            seed = {"context": facts, "conversation_memory": components.get("conversation_memory")}
+            # Runs in the agent's thread; the reply's task must start on the event loop.
+            loop.call_soon_threadsafe(lambda: early.setdefault("speech", start_spoken_reply(
+                components["rag_chain"].llm, question, seed, components.get("user_name"), language)))
+
+        hook_token = _agent_results_hook.set(start_early)
+    preparing = asyncio.create_task(_prepare_acot_turn(question, components))
+    try:
+        # Send the early spoken reply while the written answer is still being made.
+        while not preparing.done():
+            await asyncio.wait({preparing}, timeout=0.05)
+            for text in early["speech"].drain() if "speech" in early else ():
+                yield ("speech", {"type": "speech", "text": text})
+        prepared = preparing.result()
+    except BaseException:
+        if "speech" in early:
+            early["speech"].cancel()
+        raise
+    finally:
+        if not preparing.done():
+            preparing.cancel()
+        if hook_token is not None:
+            _agent_results_hook.reset(hook_token)
 
     yield (
         "meta",
@@ -2025,12 +2058,13 @@ async def stream_acot(
         }
     )
 
-    speech = (
+    speech = early.get("speech") or (
         start_spoken_reply(
             prepared["rag_chain"].llm,
             question,
             prepared,
             components.get("user_name"),
+            language,
         )
         if mode == "voice"
         else None

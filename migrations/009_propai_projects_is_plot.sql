@@ -1,0 +1,33 @@
+-- One row per Prop-AI project, flattened from the raw /data/projects/basic-details payload (propai_raw, dataset='projects').
+-- image_urls are presigned links that expire after 1 hour, so only the count is exposed here; images need copying to our own storage.
+CREATE OR REPLACE VIEW public.propai_projects AS
+SELECT row_key AS key,
+       payload->>'prop-ai_location_key_project'      AS location_key,
+       payload->>'project_id'                        AS project_id,
+       payload->>'project_number'                    AS project_number,
+       coalesce(payload->>'project_name_label', payload->>'project_name_en') AS name,
+       coalesce(payload->>'area_name_label', payload->>'area_name_en')       AS area,
+       coalesce(payload->>'master_project_label', payload->>'master_project_en') AS master_project,
+       coalesce(payload->>'developer_name_en', payload->>'developer_name')   AS developer,
+       payload->>'developer_group'                   AS developer_group,
+       payload->>'project_usage'                     AS usage,
+       payload->>'status_group'                      AS status_group,
+       payload->>'development_status'                AS development_status,
+       payload->>'offplan_status'                    AS offplan_status,
+       payload->>'delivery_status'                   AS delivery_status,
+       payload->>'data_status'                       AS data_status,
+       nullif(payload->>'percent_completed','')::numeric AS percent_completed,
+       nullif(payload->>'project_start_date','')::timestamp::date      AS start_date,
+       nullif(payload->>'project_end_date','')::timestamp::date        AS end_date,
+       nullif(payload->>'project_completion_date','')::timestamp::date AS completion_date,
+       payload->>'offplan_completion_year'           AS offplan_completion_year,
+       payload->>'propai_estimated_completion'       AS estimated_completion,
+       payload->>'project_description_en'            AS description,
+       nullif(payload->>'latitude_prop_ai','')::float8  AS latitude,
+       nullif(payload->>'longitude_prop_ai','')::float8 AS longitude,
+       payload->>'last_inspection_date'              AS last_inspection_date,
+       payload->>'inspection_report_url'             AS inspection_report_url,
+       jsonb_array_length(coalesce(payload->'image_urls', '[]'::jsonb)) AS image_count,
+       -- individual plot entries (e.g. 'Qpoint Liwan (Plot R093)') are not main projects; lists hide them
+       (coalesce(payload->>'project_name_label', payload->>'project_name_en') ~* '\mplot\M') AS is_plot
+FROM public.propai_raw WHERE dataset = 'projects';
