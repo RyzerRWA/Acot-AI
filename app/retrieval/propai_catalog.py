@@ -466,7 +466,7 @@ def agent_projects(filters: dict, limit: int = 8, sort: str = "cheapest") -> tup
     return projects, total
 
 
-def recent_sales(name, limit: int = 8, per_project: int = 5) -> dict:
+def recent_sales(name, limit: int = 8, per_project: int = 5, offset: int = 0) -> dict:
     """Recent recorded sales for the named projects. One query, newest first per project."""
     raw = name if isinstance(name, (list, tuple)) else [name]
     projects = []
@@ -479,6 +479,7 @@ def recent_sales(name, limit: int = 8, per_project: int = 5) -> dict:
     if not projects:
         return {"count": 0, "sales": []}
     per = max(1, min(int(per_project or 5), 8))
+    start = max(0, int(offset or 0))
     rows = fetch(
         """
         select project, sold_on, price, bedrooms, size_sqft, property_type
@@ -498,9 +499,9 @@ def recent_sales(name, limit: int = 8, per_project: int = 5) -> dict:
               and sale_price > 0
               and upper(project_name_prop_ai) = any(%s)
         ) ranked
-        where rn <= %s
+        where rn > %s and rn <= %s
         """,
-        (projects, per),
+        (projects, start, start + per),
     )
     by_name = {key: [] for key in projects}
     for row in rows:

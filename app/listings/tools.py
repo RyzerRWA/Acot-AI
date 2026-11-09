@@ -551,11 +551,21 @@ def search_projects(raw) -> ToolResult:
     extra = [row for row in old_rows if str(row.get("name") or "").lower() not in taken]
     rows = (new_rows + extra)[:limit]
     total = new_total + old_total
+    projects_out = []
+    for row in rows:
+        shown = _project_for_model(row)
+        if row.get("sales_count") is not None:
+            shown["sales_count"] = int(row["sales_count"])
+        projects_out.append(shown)
     out = {
         "matching_projects": total, "showing": len(rows), "sorted_by": sort,
         "price_note": "price_kind recent_sale is the median sale price from the last 24 months in the new data. "
                       "price_kind starting is a starting price from the older project table, not a unit price.",
-        "projects": [_project_for_model(r) for r in rows],
+        "projects": projects_out,
+        "browse_note": (
+            "For plain show/list/find project browse questions, list the projects only. "
+            "Do NOT add Acot Recommend unless the user asked which is best, invest, buy, or recommend."
+        ),
     }
     cards = [_project_card(r) for r in rows]
     if total == 0:
@@ -689,6 +699,8 @@ def get_project(raw) -> ToolResult:
 
 
 def compare_projects(raw) -> ToolResult:
+    from app.answers.recommend import rank_projects
+
     a = _obj(raw)
     refs = a.get("projects")
     if not isinstance(refs, list) or not 2 <= len(refs) <= 4:
@@ -702,7 +714,29 @@ def compare_projects(raw) -> ToolResult:
             unclear.append({"asked_for": str(ref)[:80], "candidates": [_project_for_model(r) for r in rows]})
         else:
             found.append(rows[0])
-    out: dict = {"compared": [_project_for_model(r) for r in found]}
+    ranked = rank_projects(found, wanted_beds=_num(a, "bedrooms", 0, 12)) if len(found) >= 2 else None
+    score_by_id = {}
+    if ranked:
+        for item in ranked.get("ranked") or []:
+            row = item.get("row") or {}
+            key = str(row.get("id") or item.get("name") or "")
+            score_by_id[key] = {
+                "score": item.get("score"),
+                "why": item.get("why") or [],
+                "sales_count": item.get("sales_count"),
+            }
+    compared = []
+    for row in found:
+        shown = _project_for_model(row)
+        extra = score_by_id.get(str(row.get("id")), {}) or score_by_id.get(str(row.get("name") or ""), {})
+        if row.get("sales_count") is not None:
+            shown["sales_count"] = int(row["sales_count"])
+        elif extra.get("sales_count") is not None:
+            shown["sales_count"] = int(extra["sales_count"])
+        if extra.get("score") is not None:
+            shown["recommend_score"] = extra["score"]
+        compared.append(shown)
+    out: dict = {"compared": compared}
     if missing:
         out["not_found"] = missing
     if unclear:
@@ -714,14 +748,20 @@ def compare_projects(raw) -> ToolResult:
         out["price_difference"] = {
             "lowest_starting_price": low["name"], "highest_starting_price": high["name"],
             "gap_aed": int(gap), "highest_is_percent_more": round(100 * gap / float(low["price"]), 1),
-            "note": "Starting prices only; not unit prices.",
+            "note": "price_kind recent_sale is a median sale; starting is from the older table.",
         }
     dated = [r for r in found if r.get("handover_time") is not None]
     if len(dated) >= 2:
         first = min(dated, key=lambda r: r["handover_time"])
         out["earliest_handover"] = {"project": first["name"],
                                     "handover": _project_for_model(first)["handover"]}
-    out["not_in_the_data"] = "Rental yield, ROI, resale value and unit-level prices are not in this data."
+    if ranked and ranked.get("recommendation") is not None:
+        out["recommendation"] = ranked["recommendation"]
+        out["recommendation_note"] = (
+            "Answer with a markdown side-by-side table of ONLY these compared projects, "
+            "then end with **Acot Recommend:** and Why (price, size, sales/transactions, rentals). "
+            "Keep the tone positive and clean; do not invent a different winner."
+        )
     return ToolResult(out, [_project_card(r) for r in found])
 
 

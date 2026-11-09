@@ -1548,13 +1548,13 @@ Rules:
                     in searchable_question
                 )
 
-        # Comparing "1 and 2" / "1 and 7th" returns only those two rows.
-        # Keep the full rental shortlist so later ordinal asks still work.
+        # Comparing "first two" / ranking a subset returns fewer rows.
+        # Keep the full shortlist so "compare all" / "which of these" still works.
         if (
             previous_candidates
             and candidates
             and len(previous_candidates) > len(candidates)
-            and len(candidates) >= 2
+            and len(candidates) >= 1
         ):
             previous_listings = [
                 item
@@ -1583,6 +1583,34 @@ Rules:
                     self._normalise(self._get_name(item)) in previous_keys
                     for item in new_listings
                 )
+
+            previous_projects = [
+                item
+                for item in previous_candidates
+                if isinstance(item, dict)
+                and self._normalise(item.get("entity_type")) == "project"
+                and self._get_name(item)
+            ]
+            new_projects = [
+                item
+                for item in candidates
+                if isinstance(item, dict)
+                and self._normalise(item.get("entity_type")) == "project"
+                and self._get_name(item)
+            ]
+            if (
+                len(previous_projects) > len(new_projects) >= 1
+                and len(new_projects) == len(candidates)
+            ):
+                previous_keys = {
+                    self._normalise(self._get_name(item))
+                    for item in previous_projects
+                }
+                if all(
+                    self._normalise(self._get_name(item)) in previous_keys
+                    for item in new_projects
+                ):
+                    preserve_previous_project_list = True
 
         if candidates:
             if (
