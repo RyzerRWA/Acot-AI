@@ -13,6 +13,12 @@ from run import (
     _detect_response_type,
     _followup_questions,
     _is_fast_structured_question,
+    _format_transactions,
+    _listing_question,
+    _compare_shown_turn,
+    _shortlist_recommend_turn,
+    _shown_project_followup,
+    _transaction_subject,
     _small_talk_answer,
     build_frontend_response,
 )
@@ -294,6 +300,7 @@ def test_comparison_answer_always_includes_a_side_by_side_table():
     assert "| Size | 600 sqft | 600 sqft |" in comparison["answer"]
     assert "| Score | 50% | 50% |" in comparison["answer"]
     assert "do not favor either one" in comparison["answer"]
+    assert "**Acot Recommend:**" in comparison["answer"]
 
     response = build_frontend_response(
         question=question,
@@ -326,7 +333,9 @@ def test_comparison_without_comparable_fields_still_shows_table():
     assert comparison is not None
     assert "| Factor | Binghatti Etherea | Serenz |" in comparison["answer"]
     assert "| Score | 50% | 50% |" in comparison["answer"]
-    assert "can't recommend one over the other" in comparison["answer"]
+    assert "useful options to review" in comparison["answer"]
+    assert "**Acot Recommend:**" in comparison["answer"]
+    assert "can't recommend" not in comparison["answer"].lower()
 
 
 def test_rental_comparison_escapes_title_pipes_and_explains_tradeoff():
@@ -365,11 +374,10 @@ def test_rental_comparison_escapes_title_pipes_and_explains_tradeoff():
     assert "| Factor | Villa \\| Sea View | Villa \\| Garden |" in comparison["answer"]
     assert "| Yearly rent | AED 260,000 | AED 269,999 |" in comparison["answer"]
     assert "| Score | 50% | 50% |" in comparison["answer"]
-    assert "Conclusion: The comparison is split." in comparison["answer"]
-    assert "Recommendation: Choose Villa | Sea View if you prioritize lower yearly rent" in (
-        comparison["answer"]
-    )
-    assert "Villa | Garden if you prioritize more space." in comparison["answer"]
+    assert "Conclusion: The comparison is balanced." in comparison["answer"]
+    assert "**Acot Recommend:** Villa | Sea View and Villa | Garden" in comparison["answer"]
+    assert "lower yearly rent" in comparison["answer"]
+    assert "more space" in comparison["answer"]
 
 
 def test_comparison_table_includes_every_selected_listing_in_order():
@@ -399,7 +407,7 @@ def test_comparison_table_includes_every_selected_listing_in_order():
     assert [side["name"] for side in comparison["sides"]] == names
     assert "| Factor | Rental one | Rental two | Rental three |" in comparison["answer"]
     assert "| Yearly rent | AED 58,000 | AED 59,000 | AED 60,000 |" in comparison["answer"]
-    assert "does not establish an overall best option" in comparison["answer"]
+    assert "**Acot Recommend:**" in comparison["answer"]
 
 
 def test_small_talk_skips_projects():
@@ -475,6 +483,230 @@ def test_developer_question_resolves_to_the_developer():
     assert match is not None
     assert match["name"] == "Binghatti"
     assert match["count"] == 2
+
+
+def test_transaction_followup_uses_the_project_on_screen():
+    class _Memory:
+        active_candidates = [{
+            "name": "15 Northside",
+            "entity_type": "project",
+            "price": 1072500,
+            "price_kind": "recent_sale",
+        }]
+
+    found = _transaction_subject("show me the recent transcation details", _Memory())
+    assert found and found[0]["name"] == "15 Northside"
+    assert _transaction_subject("Show me projects in Business Bay", _Memory()) is None
+    text = _format_transactions(
+        ["Mayfair Tower", "Mayfair Residency"],
+        {
+            "sales": [
+                {"project": "Mayfair Tower", "date": "2026-10-19", "price": 1000000, "bedrooms": 1, "size_sqft": 807},
+                {"project": "Mayfair Tower", "date": "2026-08-19", "price": 1100000, "bedrooms": 1, "size_sqft": 807},
+                {"project": "Mayfair Residency", "date": "2026-09-03", "price": 400000, "bedrooms": 1, "size_sqft": 298},
+            ],
+        },
+        label="the Deyaar projects in Business Bay",
+    )
+    assert "Here are the recent transaction details for the Deyaar projects in Business Bay:" in text
+    assert "**Mayfair Tower**" in text
+    assert "**• Recent Transactions:**" in text
+    assert "• **2026-10-19**: AED 1,000,000, 1 bedroom, 807 sqft" in text
+    assert text.index("Mayfair Tower") < text.index("Mayfair Residency")
+
+
+def test_shortlist_recommend_uses_projects_on_screen():
+    class _Memory:
+        active_candidates = [
+            {
+                "name": "Cheaper Ready",
+                "entity_type": "project",
+                "price": 1_000_000,
+                "bedroom_min": 1,
+                "bedroom_max": 2,
+                "status": "Ready",
+                "sales_count": 20,
+                "handover_time": "2026-01-01",
+            },
+            {
+                "name": "Pricier Later",
+                "entity_type": "project",
+                "price": 2_500_000,
+                "bedroom_min": 2,
+                "bedroom_max": 3,
+                "status": "On Sale",
+                "sales_count": 2,
+                "handover_time": "2029-01-01",
+            },
+        ]
+
+    turn = _shortlist_recommend_turn("Which of these is best?", _Memory())
+    assert turn is not None
+    assert turn["use_fast"] is True
+    assert "**Acot Recommend:** Cheaper Ready" in turn["fast_answer"]
+    assert "Why this is the strongest match" in turn["fast_answer"]
+    assert _shortlist_recommend_turn(
+        "Which of these have 2 bedroom options?",
+        _Memory(),
+    ) is None
+
+
+def test_compare_first_two_uses_table_and_only_two_projects():
+    class _Memory:
+        active_candidates = [
+            {
+                "name": "Creek Beach - Bayshore",
+                "entity_type": "project",
+                "price": 1_600_000,
+                "size_sqft": 694,
+                "sales_count": 53,
+                "rent_count": 249,
+                "handover_time": "2022-10-01",
+            },
+            {
+                "name": "Creek Beach - Orchid",
+                "entity_type": "project",
+                "price": 1_850_000,
+                "size_sqft": 811,
+                "sales_count": 80,
+                "rent_count": 151,
+                "handover_time": "2025-09-01",
+            },
+            {
+                "name": "Creek Beach - Summer",
+                "entity_type": "project",
+                "price": 1_695_000,
+                "size_sqft": 756,
+                "sales_count": 28,
+                "rent_count": 232,
+                "handover_time": "2023-03-01",
+            },
+            {
+                "name": "Creek Beach - Lotus",
+                "entity_type": "project",
+                "price": 1_700_000,
+                "size_sqft": 742,
+                "sales_count": 33,
+                "rent_count": 185,
+                "handover_time": "2025-09-01",
+            },
+        ]
+
+    turn = _compare_shown_turn(
+        "Compare the first two projects and tell me which is best",
+        _Memory(),
+    )
+    assert turn is not None
+    assert len(turn["structured_summary"]["projects"]) == 2
+    assert turn["structured_summary"]["projects"][0]["name"] == "Creek Beach - Bayshore"
+    assert turn["structured_summary"]["projects"][1]["name"] == "Creek Beach - Orchid"
+    assert "| Factor |" in turn["fast_answer"]
+    assert "**Acot Recommend:**" in turn["fast_answer"]
+    assert "Creek Beach - Summer" not in turn["fast_answer"]
+    assert _shortlist_recommend_turn(
+        "Compare the first two projects and tell me which is best",
+        _Memory(),
+    ) is None
+
+
+def test_compare_all_projects_uses_every_candidate_in_a_table():
+    class _Memory:
+        active_candidates = [
+            {
+                "name": f"Creek Beach - {name}",
+                "entity_type": "project",
+                "price": price,
+                "size_sqft": size,
+                "sales_count": sales,
+                "rent_count": rents,
+                "handover_time": "2023-01-01",
+            }
+            for name, price, size, sales, rents in (
+                ("Bayshore", 1_600_000, 694, 53, 249),
+                ("Orchid", 1_850_000, 811, 80, 151),
+                ("Summer", 1_695_000, 756, 28, 232),
+                ("Lotus", 1_700_000, 742, 33, 185),
+                ("Savanna-Cedar-Mangrove", 2_167_944, 1011, 160, 320),
+            )
+        ]
+
+    turn = _compare_shown_turn(
+        "Compare all projects, which one is best to buy",
+        _Memory(),
+    )
+    assert turn is not None
+    assert len(turn["structured_summary"]["projects"]) == 5
+    assert "| Factor |" in turn["fast_answer"]
+    assert "Creek Beach - Summer" in turn["fast_answer"]
+    assert "Creek Beach - Savanna-Cedar-Mangrove" in turn["fast_answer"]
+    assert "**Acot Recommend:**" in turn["fast_answer"]
+
+
+def test_more_transactions_uses_the_next_page():
+    class _Memory:
+        active_candidates = [
+            {"name": "THE PINNACLE", "entity_type": "project", "community": "JVC"},
+        ]
+        transaction_names = None
+        transaction_offset = 0
+
+    first = _transaction_subject("Show me the recent transaction details", _Memory())
+    assert first and first[0]["name"] == "THE PINNACLE"
+    more_text = _format_transactions(
+        ["THE PINNACLE"],
+        {
+            "sales": [
+                {"project": "THE PINNACLE", "date": "2026-04-01", "price": 900000, "bedrooms": 1, "size_sqft": 700},
+            ],
+        },
+        label="THE PINNACLE",
+        more=True,
+    )
+    assert "Here are more recent transaction details for THE PINNACLE:" in more_text
+    assert "**THE PINNACLE**" in more_text
+    empty_more = _format_transactions(
+        ["THE PINNACLE"],
+        {"sales": []},
+        label="THE PINNACLE",
+        more=True,
+    )
+    assert "no more recorded sales" in empty_more.lower()
+
+
+def test_a_rental_comparison_stays_off_the_project_list():
+    class _Memory:
+        def context(self):
+            return {"active_candidates": []}
+
+    question = "Compare the first two rentals in Dubai Marina and tell me which is best."
+    assert _listing_question(question, _Memory()) is True
+    assert _listing_question("Show me projects in Dubai Marina", _Memory()) is False
+
+
+def test_price_followup_uses_the_projects_already_shown():
+    class _Memory:
+        active_candidates = [
+            {
+                "name": "Altia One",
+                "entity_type": "project",
+                "developer_name": "Yas Developers",
+                "price": 1395448,
+                "bedroom_min": 1,
+                "bedroom_max": 3,
+            }
+        ]
+
+    projects, no_match = _shown_project_followup(
+        "What are their starting prices?", _Memory()
+    )
+    assert no_match is False
+    answer = _build_fast_structured_answer(
+        "What are their starting prices?",
+        {"projects": projects},
+    )
+    assert "AED 1395448" in answer
+    assert "exact match" not in answer.lower()
+    assert _shown_project_followup("Show me projects in Dubai Marina", _Memory()) is None
 
 
 def test_followups_skip_the_question_just_asked():

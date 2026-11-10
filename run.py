@@ -16,8 +16,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from app.listings.agent import ListingAgent, ListingsUnavailable
 from app.listings.tools import _find_projects, top_areas_by_sales
+from app.listings.agent import ListingAgent, ListingsUnavailable, _ID_TAG as _AGENT_TAG
 from app.listings.router import is_rent_question
 from app.llm.client import LLMQueueTimeoutError
 from app.answers.spoken import MAX_FACT_CHARS, start_spoken_reply
@@ -63,6 +63,7 @@ from app.retrieval.hybrid.entity_resolver import (
 from app.retrieval.hybrid.question_text import (
     asks_for_listings,
     collapse_stretched_letters,
+    is_group_attribute_question,
     prepare_user_question,
 )
 
@@ -641,6 +642,344 @@ _SMALL_TALK_FILLER = {
 }
 
 
+_TRANSACTION = re.compile(
+    r"\b(?:transactions?|transcations?|trancations?|transctions?|sale history|sales history)\b",
+    re.I,
+)
+_MORE_TRANSACTIONS = re.compile(
+    r"\b(?:more|another|next|additional|further)\b",
+    re.I,
+)
+_TRANSACTION_PAGE_SIZE = 5
+_MORE_TRANSACTION_FOLLOWUP = "Can you show me more transactions"
+
+
+def _transaction_subject(question, conversation_memory):
+    """Projects a transaction follow-up refers to, or None so the agent does not run."""
+    if not _TRANSACTION.search(question or ""):
+        return None
+    items = getattr(conversation_memory, "active_candidates", None) or []
+    projects = [
+        item for item in items
+        if isinstance(item, dict)
+        and str(item.get("entity_type") or "project").lower() == "project"
+        and item.get("name")
+    ]
+    asked = (question or "").lower()
+    named = [project for project in projects if str(project["name"]).lower() in asked]
+    chosen = named or projects
+    return chosen[:8] or None
+
+
+def _sale_line(sale) -> str:
+    parts = []
+    if sale.get("price") is not None:
+        parts.append(f"AED {int(sale['price']):,}")
+    beds = sale.get("bedrooms")
+    if beds == 0:
+        parts.append("studio")
+    elif beds is not None:
+        parts.append("1 bedroom" if int(beds) == 1 else f"{int(beds)} bedrooms")
+    if sale.get("size_sqft"):
+        parts.append(f"{int(sale['size_sqft']):,} sqft")
+    detail = ", ".join(parts)
+    date = str(sale.get("date") or "")[:10]
+    if date:
+        return f"• **{date}**: {detail}" if detail else f"• **{date}**"
+    return f"• {detail}"
+
+
+def _format_transactions(name, payload, label=None, more=False) -> str:
+    sales = payload.get("sales") or []
+    names = [name] if isinstance(name, str) else list(name or [])
+    intro = label or (names[0] if len(names) == 1 else "these projects")
+    if not sales:
+        if more:
+            return f"There are no more recorded sales for {intro} in the transaction data."
+        return f"There are no recorded sales for {intro} in the transaction data."
+    grouped = {}
+    for sale in sales:
+        key = str(sale.get("project") or "").strip()
+        if not key:
+            continue
+        grouped.setdefault(key.upper(), {"name": key, "sales": []})["sales"].append(sale)
+    order = []
+    for item in names:
+        key = str(item or "").strip().upper()
+        if key and key in grouped and key not in order:
+            order.append(key)
+    for key in grouped:
+        if key not in order:
+            order.append(key)
+    lead = (
+        f"Here are more recent transaction details for {intro}:"
+        if more else
+        f"Here are the recent transaction details for {intro}:"
+    )
+    lines = [lead, ""]
+    for key in order:
+        block = grouped[key]
+        lines.append(f"**{block['name']}**")
+        lines.append("")
+        lines.append("**• Recent Transactions:**")
+        lines.append("")
+        for sale in block["sales"]:
+            lines.append(_sale_line(sale))
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def _transaction_turn(question, conversation_memory):
+    projects = _transaction_subject(question, conversation_memory)
+    if not projects:
+        return None
+    from app.retrieval.propai_catalog import recent_sales
+    names = [project.get("name") for project in projects]
+    communities = {
+        str(project.get("community") or "").strip()
+        for project in projects
+        if project.get("community")
+    }
+    developers = {
+        str(project.get("developer_name") or project.get("developer") or "").strip()
+        for project in projects
+        if project.get("developer_name") or project.get("developer")
+    }
+    if len(names) == 1:
+        intro = names[0]
+    elif len(developers) == 1 and len(communities) == 1:
+        intro = f"the {next(iter(developers))} projects in {next(iter(communities))}"
+    elif len(communities) == 1:
+        intro = f"the projects in {next(iter(communities))}"
+    else:
+        intro = "these projects"
+    fingerprint = "|".join(str(name or "").strip().upper() for name in names if name)
+    more = bool(_MORE_TRANSACTIONS.search(question or ""))
+    prev_fp = getattr(conversation_memory, "transaction_names", None)
+    prev_offset = int(getattr(conversation_memory, "transaction_offset", 0) or 0)
+    offset = prev_offset if more and prev_fp == fingerprint else 0
+    payload = recent_sales(names, per_project=_TRANSACTION_PAGE_SIZE, offset=offset)
+    if conversation_memory is not None:
+        conversation_memory.transaction_names = fingerprint
+        conversation_memory.transaction_offset = (
+            offset + _TRANSACTION_PAGE_SIZE if payload.get("sales") else offset
+        )
+    # Text only: do not attach project rows, or the app draws property cards under the sales list.
+    summary = _empty_structured_summary()
+    summary["transaction_followup"] = True
+    return {
+        "question": question,
+        "standalone_question": question,
+        "question_type": "general",
+        "structured_summary": summary,
+        "documents": [],
+        "investment_analysis": None,
+        "retrieval_result": {
+            "question_type": "general",
+            "structured_data": {"community": [], "projects": [], "sub_communities": []},
+            "documents": [],
+        },
+        "use_fast": True,
+        "fast_answer": _format_transactions(names, payload, label=intro, more=more and offset > 0),
+        "context": None,
+        "small_talk": None,
+    }
+
+
+_SHORTLIST_RECOMMEND = re.compile(
+    r"\b(?:"
+    r"which (?:one |of these |of those )?(?:is|are) (?:the )?best|"
+    r"which of these (?:is|are) better|"
+    r"which (?:of these |ones? |of those )?(?:should|would) i|"
+    r"what should i (?:pick|choose|buy)|"
+    r"which property is best|"
+    r"best (?:property|project) to (?:invest|buy)|"
+    r"recommend (?:one|one of these|the best|among these)|"
+    r"best (?:one|option|pick|project)(?:\s+of these)?|"
+    r"pick (?:one|for me)|"
+    r"which of these (?:do you )?recommend"
+    r")\b",
+    re.I,
+)
+_COMPARE_WORD = re.compile(r"\bcompar(?:e|ison|ing)\b", re.I)
+_COMPARE_ALL = re.compile(r"\b(?:all|every|each)\b", re.I)
+_COMPARE_FIRST_N = re.compile(
+    r"\b(?:first|top)\s+(two|three|four|both|2|3|4)\b|\b(?:both|the two)\b",
+    re.I,
+)
+_COMPARE_N = {"two": 2, "three": 3, "four": 4, "both": 2, "2": 2, "3": 3, "4": 4}
+_COMPARE_ALL_LIMIT = 12
+
+
+def _active_projects(conversation_memory) -> list[dict]:
+    items = getattr(conversation_memory, "active_candidates", None) or []
+    return [
+        item for item in items
+        if isinstance(item, dict)
+        and str(item.get("entity_type") or "project").lower() == "project"
+        and item.get("name")
+    ]
+
+
+def _shown_compare_limit(question: str) -> int | None:
+    """How many on-screen projects a compare follow-up asked for, or None."""
+    text = question or ""
+    if not _COMPARE_WORD.search(text):
+        return None
+    if _COMPARE_ALL.search(text):
+        return _COMPARE_ALL_LIMIT
+    match = _COMPARE_FIRST_N.search(text)
+    if not match:
+        return None
+    token = (match.group(1) or "both").lower()
+    return _COMPARE_N.get(token, 2)
+
+
+def _compare_shown_turn(question, conversation_memory):
+    """Compare N (or all) on-screen projects in a table + Acot Recommend."""
+    limit = _shown_compare_limit(question)
+    if not limit:
+        return None
+    if _TRANSACTION.search(question or ""):
+        return None
+    available = _active_projects(conversation_memory)
+    projects = available[:limit]
+    if len(projects) < 2:
+        return None
+    from app.answers.recommend import format_compare_table, rank_projects, wanted_bedrooms
+
+    ranked = rank_projects(projects, wanted_beds=wanted_bedrooms(question))
+    answer = format_compare_table(projects, ranked)
+    summary = _empty_structured_summary()
+    # Cards show the compared set; memory keeps the fuller shortlist via preserve logic.
+    summary["projects"] = projects
+    summary["project_total"] = len(projects)
+    summary["recommendation"] = ranked.get("recommendation")
+    summary["comparison"] = True
+    return {
+        "question": question,
+        "standalone_question": question,
+        "question_type": "comparison",
+        "structured_summary": summary,
+        "documents": [],
+        "investment_analysis": None,
+        "retrieval_result": {
+            "question_type": "comparison",
+            "structured_data": {
+                "community": [],
+                "projects": projects,
+                "sub_communities": [],
+            },
+            "documents": [],
+        },
+        "use_fast": True,
+        "fast_answer": answer,
+        "context": None,
+        "small_talk": None,
+    }
+
+
+def _shortlist_recommend_turn(question, conversation_memory):
+    """Rank projects already on screen and return Acot Recommend."""
+    if _shown_compare_limit(question):
+        return None
+    if not _SHORTLIST_RECOMMEND.search(question or ""):
+        return None
+    if _TRANSACTION.search(question or ""):
+        return None
+    projects = _active_projects(conversation_memory)
+    if len(projects) < 2:
+        return None
+    from app.answers.recommend import format_shortlist, rank_projects, wanted_bedrooms
+
+    selected = projects[:_COMPARE_ALL_LIMIT]
+    ranked = rank_projects(selected, wanted_beds=wanted_bedrooms(question))
+    # Compare-style "which is best" with many options still gets a table when asked to compare.
+    if _COMPARE_WORD.search(question or ""):
+        from app.answers.recommend import format_compare_table
+        answer = format_compare_table(selected, ranked)
+    else:
+        answer = format_shortlist(ranked, question=question)
+    summary = _empty_structured_summary()
+    by_name = {str(item.get("name") or "").lower(): item for item in selected}
+    ordered = []
+    for item in ranked.get("ranked") or []:
+        row = by_name.get(str(item.get("name") or "").lower())
+        if row and row not in ordered:
+            ordered.append(row)
+    summary["projects"] = ordered
+    summary["project_total"] = len(ordered)
+    summary["recommendation"] = ranked.get("recommendation")
+    return {
+        "question": question,
+        "standalone_question": question,
+        "question_type": "comparison",
+        "structured_summary": summary,
+        "documents": [],
+        "investment_analysis": None,
+        "retrieval_result": {
+            "question_type": "comparison",
+            "structured_data": {
+                "community": [],
+                "projects": summary["projects"],
+                "sub_communities": [],
+            },
+            "documents": [],
+        },
+        "use_fast": True,
+        "fast_answer": answer,
+        "context": None,
+        "small_talk": None,
+    }
+
+
+def _listing_question(question, conversation_memory) -> bool:
+    """Rental questions stay on the listing path. A place name must not turn them into projects."""
+    if asks_for_listings(question):
+        return True
+    context = {}
+    if conversation_memory is not None and hasattr(conversation_memory, "context"):
+        try:
+            context = conversation_memory.context() or {}
+        except Exception:
+            context = {}
+    return bool(should_use_structured_listing_comparison(question, context))
+
+
+def _shown_project_followup(question, conversation_memory):
+    """Projects already on screen for "their starting prices" and the other chip follow-ups.
+
+    Returns (projects, no_match) or None when this is not that kind of question.
+    """
+    if not is_group_attribute_question(question):
+        return None
+    items = getattr(conversation_memory, "active_candidates", None) or []
+    projects = [
+        item for item in items
+        if isinstance(item, dict)
+        and str(item.get("entity_type") or "project").lower() == "project"
+        and item.get("name")
+    ]
+    if not projects:
+        return None
+    bedrooms = re.search(r"\b(\d+)\s*[- ]?\s*bed", question or "", re.I)
+    if not bedrooms:
+        return projects, False
+    wanted = int(bedrooms.group(1))
+    narrowed = []
+    for project in projects:
+        low = project.get("bedroom_min")
+        high = project.get("bedroom_max")
+        if low is None:
+            continue
+        high = low if high is None else high
+        if float(low) <= wanted <= float(high):
+            narrowed.append(project)
+    if narrowed:
+        return narrowed, False
+    return projects, True
+
+
 def _classify_small_talk(question):
     """Return a small-talk kind when the whole message is a greeting or identity question."""
 
@@ -730,9 +1069,6 @@ def _empty_structured_summary():
 # The model chooses read-only tools (projects, brochures, rentals) and explains
 # the result. It is switched on with ACOT_USE_AGENT=1. If it is off, or it
 # fails for any reason, the standard pipeline below answers as before.
-
-_AGENT_TAG = re.compile(r"\[\[(\d{1,12})\]\]")
-
 
 def _agent_enabled(components):
     on = os.getenv("ACOT_USE_AGENT", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -863,6 +1199,28 @@ async def _try_agent_turn(question, components, timing_ms, ask_started):
     answer = re.sub(r"[ \t]{2,}", " ", answer).strip()
 
     used = {tool["name"] for tool in result.tools if tool.get("ok")}
+    # Plain browse/search should not invent an Acot Recommend section.
+    wants_recommend = bool(re.search(
+        r"\b(?:invest|buy|recommend|best|compar(?:e|ison)|which should|suggest)\b",
+        question or "",
+        re.I,
+    ))
+    if (
+        not wants_recommend
+        and "compare_projects" not in used
+        and re.search(r"(?i)\b(?:acot recommend|recommendation)\b", answer)
+    ):
+        answer = re.split(
+            r"(?im)^\s*(?:\*\*)?(?:acot recommend|recommendation)\b.*",
+            answer,
+            maxsplit=1,
+        )[0].rstrip()
+        answer = re.sub(
+            r"(?is)\n+\s*(?:i suggest|i recommend|other strong options include).*$",
+            "",
+            answer,
+        ).rstrip()
+
     if "compare_projects" in used and len(projects) >= 2:
         question_type = "comparison"
     elif len(projects) + len(listings) > 1:
@@ -1079,6 +1437,72 @@ async def _prepare_acot_turn(
             "small_talk": None,
         }
 
+    transaction_turn = await asyncio.to_thread(
+        _transaction_turn, question, conversation_memory
+    )
+    if transaction_turn is not None:
+        transaction_turn["timing_ms"] = timing_ms
+        transaction_turn["ask_started"] = ask_started
+        transaction_turn["rag_chain"] = rag_chain
+        transaction_turn["conversation_memory"] = conversation_memory
+        return transaction_turn
+
+    compare_shown = await asyncio.to_thread(
+        _compare_shown_turn, question, conversation_memory
+    )
+    if compare_shown is not None:
+        compare_shown["timing_ms"] = timing_ms
+        compare_shown["ask_started"] = ask_started
+        compare_shown["rag_chain"] = rag_chain
+        compare_shown["conversation_memory"] = conversation_memory
+        return compare_shown
+
+    shortlist_turn = await asyncio.to_thread(
+        _shortlist_recommend_turn, question, conversation_memory
+    )
+    if shortlist_turn is not None:
+        shortlist_turn["timing_ms"] = timing_ms
+        shortlist_turn["ask_started"] = ask_started
+        shortlist_turn["rag_chain"] = rag_chain
+        shortlist_turn["conversation_memory"] = conversation_memory
+        return shortlist_turn
+
+    shown_followup = _shown_project_followup(question, conversation_memory)
+    if shown_followup is not None:
+        projects, no_match = shown_followup
+        summary = _empty_structured_summary()
+        if no_match:
+            summary["filter_no_match"] = True
+            summary["filter_evidence_projects"] = projects
+        else:
+            summary["projects"] = projects
+            summary["project_total"] = len(projects)
+        return {
+            "question": question,
+            "standalone_question": question,
+            "question_type": "search",
+            "structured_summary": summary,
+            "documents": [],
+            "investment_analysis": None,
+            "retrieval_result": {
+                "question_type": "search",
+                "structured_data": {
+                    "community": [],
+                    "projects": [] if no_match else projects,
+                    "sub_communities": [],
+                },
+                "documents": [],
+            },
+            "rag_chain": rag_chain,
+            "conversation_memory": conversation_memory,
+            "use_fast": True,
+            "fast_answer": _build_fast_structured_answer(question, summary),
+            "context": None,
+            "timing_ms": timing_ms,
+            "ask_started": ask_started,
+            "small_talk": None,
+        }
+
     agent_turn = await _try_agent_turn(
         question, components, timing_ms, ask_started
     )
@@ -1185,6 +1609,29 @@ async def _prepare_acot_turn(
     if comparison_built:
         structured_summary["comparison_view"] = comparison_built["sides"]
 
+    open_recommend = None
+    projects_for_rank = [
+        project for project in (structured_summary.get("projects") or [])
+        if isinstance(project, dict) and project.get("name")
+    ]
+    if question_type == "investment" and len(projects_for_rank) >= 2:
+        from app.answers.recommend import format_shortlist, rank_projects, wanted_bedrooms
+        open_recommend = rank_projects(
+            projects_for_rank,
+            wanted_beds=wanted_bedrooms(standalone_question),
+        )
+        structured_summary["recommendation"] = open_recommend.get("recommendation")
+        if investment_analysis is not None:
+            investment_analysis = dict(investment_analysis)
+            investment_analysis["project_recommendation"] = open_recommend.get("recommendation")
+            investment_analysis["recommendation_text"] = format_shortlist(
+                open_recommend,
+                question=standalone_question,
+                assumptions=(
+                    "Ranked on price, size, sales/transactions and rental activity."
+                ),
+            )
+
     use_fast = _is_fast_structured_question(
         question=standalone_question,
         question_type=question_type,
@@ -1192,6 +1639,8 @@ async def _prepare_acot_turn(
         documents=documents,
     )
     if comparison_built:
+        use_fast = True
+    elif open_recommend is not None:
         use_fast = True
     elif re.search(
         r"\b(?:which of these|which ones|which of those|which of the)\b",
@@ -1214,6 +1663,16 @@ async def _prepare_acot_turn(
 
     if comparison_built:
         fast_answer = comparison_built["answer"]
+        context = None
+    elif open_recommend is not None:
+        from app.answers.recommend import format_shortlist
+        fast_answer = format_shortlist(
+            open_recommend,
+            question=standalone_question,
+            assumptions=(
+                "Ranked on price, size, sales/transactions and rental activity."
+            ),
+        )
         context = None
     elif use_fast:
         fast_answer = _build_fast_structured_answer(
@@ -1347,7 +1806,10 @@ def _stream_sources(prepared):
     return sources
 
 
+_TRANSACTION_FOLLOWUP = "Show me the recent transaction details"
+
 _PROJECT_FOLLOWUPS = (
+    ("transactions", _TRANSACTION_FOLLOWUP),
     ("price", "What are their starting prices?"),
     ("bedroom", "Which of these have 2-bedroom options?"),
     ("handover", "What are their handover dates?"),
@@ -1381,6 +1843,8 @@ def _question_topics(text):
         topics.add("amenities")
     if any(term in question for term in ("size", "sqft", "square foot")):
         topics.add("size")
+    if any(term in question for term in ("transaction", "transactions", "transcation", "sale history")):
+        topics.add("transactions")
     return topics
 
 
@@ -1395,7 +1859,7 @@ def _questions_already_asked(prepared):
     return asked
 
 
-def _unused_followups(prepared, chips):
+def _unused_followups(prepared, chips, pinned=None):
     asked = _questions_already_asked(prepared)
     asked_text = {_normalize_chat_text(item) for item in asked if item}
     covered = set()
@@ -1409,6 +1873,11 @@ def _unused_followups(prepared, chips):
         if _question_topics(chip) & covered:
             continue
         unused.append(chip)
+
+    pinned_chip = pinned or None
+    if pinned_chip and _normalize_chat_text(pinned_chip) not in asked_text:
+        unused = [chip for chip in unused if _normalize_chat_text(chip) != _normalize_chat_text(pinned_chip)]
+        unused = [pinned_chip, *unused]
     return unused[:3]
 
 
@@ -1466,6 +1935,20 @@ def _followup_questions(prepared):
         return _unused_followups(prepared, _STARTER_CHIPS)
 
     summary = prepared.get("structured_summary") or {}
+    if summary.get("transaction_followup") or "transactions" in _question_topics(question):
+        answer = prepared.get("fast_answer") or ""
+        if "Recent Transactions" in answer or summary.get("transaction_followup"):
+            return _unused_followups(
+                prepared,
+                [
+                    _MORE_TRANSACTION_FOLLOWUP,
+                    "What are their starting prices?",
+                    "What are their handover dates?",
+                    "Who is the developer of each of these projects?",
+                ],
+                pinned=_MORE_TRANSACTION_FOLLOWUP,
+            )
+
     projects = [
         project
         for project in (summary.get("projects") or [])
@@ -1489,28 +1972,33 @@ def _followup_questions(prepared):
         return _unused_followups(
             prepared,
             [
+                _TRANSACTION_FOLLOWUP,
                 f"What is the starting price of {name}?",
                 f"What is the handover date of {name}?",
                 f"Who is the developer of {name}?",
                 f"What amenities does {name} offer?",
                 f"What is the bedroom range of {name}?",
             ],
+            pinned=_TRANSACTION_FOLLOWUP,
         )
 
     if len(projects) >= 2:
         return _unused_followups(
             prepared,
             [chip for _, chip in _PROJECT_FOLLOWUPS],
+            pinned=_TRANSACTION_FOLLOWUP,
         )
 
     if place and re.search(r"\bprojects?\b", question, flags=re.I):
         return _unused_followups(
             prepared,
             [
+                _TRANSACTION_FOLLOWUP,
                 f"What are the starting prices of projects in {place}?",
                 f"What are the handover dates of projects in {place}?",
                 f"Compare the first and second projects in {place}.",
             ],
+            pinned=_TRANSACTION_FOLLOWUP,
         )
 
     return []

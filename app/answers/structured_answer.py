@@ -431,8 +431,11 @@ def _side_snapshot(name, records):
     beds = []
     handovers = []
     frequencies = []
+    status_ranks = []
+    sales_counts = []
     photo = None
     link = None
+    status = None
     for record in records:
         price = _record_number(record, "price_aed", "price")
         size = _record_number(record, "size_sqft")
@@ -452,6 +455,7 @@ def _side_snapshot(name, records):
             else:
                 bed = bed_min if bed_min is not None else bed_max
         handover = _handover_stamp(record.get("handover_time"))
+        sale_count = _record_number(record, "sales_count", "recent_sales_count")
         if price is not None:
             prices.append(price)
             frequency = str(record.get("rent_frequency") or "").strip().lower()
@@ -463,6 +467,11 @@ def _side_snapshot(name, records):
             beds.append(bed)
         if handover is not None:
             handovers.append(handover)
+        if sale_count is not None:
+            sales_counts.append(sale_count)
+        record_status = record.get("project_status") or record.get("status")
+        if record_status and status is None:
+            status = record_status
         if photo is None:
             photo = _record_photo(record)
         if link is None:
@@ -477,6 +486,8 @@ def _side_snapshot(name, records):
         "beds": _median(beds),
         "handover": _median(handovers),
         "frequency": shared_frequency,
+        "status": status,
+        "sales_count": _median(sales_counts),
         "photo": photo,
         "link": link,
         "area_facts": records[0].get("area_facts") if len(records) == 1 else None,
@@ -552,6 +563,11 @@ def _score_snapshots(left, right):
         return f"{value:g} bedrooms"
 
     prefer_high("beds", "more bedrooms", _bedroom_text)
+    prefer_high(
+        "sales_count",
+        "more recent sales activity",
+        lambda value: f"{int(value):,} sales",
+    )
     left_handover = left.get("handover")
     right_handover = right.get("handover")
     if (
@@ -570,6 +586,10 @@ def _score_snapshots(left, right):
                 f"{_handover_label(other['handover'])})."
             ),
         ))
+    from app.answers.recommend import _status_rank
+    left["status_rank"] = _status_rank(left.get("status"))
+    right["status_rank"] = _status_rank(right.get("status"))
+    prefer_high("status_rank", "readiness", lambda value: str(int(value)))
 
     left_wins = sum(1 for name, _factor, _text in checks if name == left["name"])
     right_wins = len(checks) - left_wins
@@ -606,8 +626,9 @@ def _score_snapshots(left, right):
     table = "\n".join(table_rows)
     if not checks and not comparable_fields:
         intro = (
-            "I can't recommend one over the other because the records do not "
-            "contain comparable price, size, bedroom, or handover details."
+            f"{left['name']} and {right['name']} are both useful options to review; "
+            "the recorded price, size, bedroom and handover details are still light, "
+            "so the next step is to match them to your preferred layout."
         )
     elif left_score == right_score:
         intro = (
@@ -627,24 +648,27 @@ def _score_snapshots(left, right):
 
     if not checks:
         conclusion = (
-            "Conclusion: The available recorded factors do not distinguish these options."
+            "Conclusion: Both options look useful to review side by side."
         )
         recommendation = (
-            "Recommendation: There is no data-based reason to prefer one; compare your "
-            "personal priorities and confirm the listing details."
+            f"**Acot Recommend:** {left['name']} and {right['name']}\n"
+            "**Why:**\n"
+            "- Each brings helpful recorded details to compare next.\n"
+            "- A good next step is to match them to your preferred layout and community feel."
         )
     elif left_score == right_score:
         left_advantages = ", ".join(factor_wins[left["name"]])
         right_advantages = ", ".join(factor_wins[right["name"]])
         conclusion = (
-            f"Conclusion: The comparison is split. {left['name']} is stronger on "
-            f"{left_advantages}, while {right['name']} is stronger on {right_advantages}; "
-            "neither is the clear overall winner."
+            f"Conclusion: The comparison is balanced. {left['name']} leads on "
+            f"{left_advantages}, while {right['name']} leads on {right_advantages}."
         )
         recommendation = (
-            f"Recommendation: Choose {left['name']} if you prioritize "
-            f"{left_advantages}, or {right['name']} if you prioritize "
-            f"{right_advantages}."
+            f"**Acot Recommend:** {left['name']} and {right['name']}\n"
+            f"**Why:**\n"
+            f"- {left['name']} stands out for {left_advantages}.\n"
+            f"- {right['name']} stands out for {right_advantages}.\n"
+            f"- Pick the one that matches the lifestyle factor you value most."
         )
     else:
         winning_factors = ", ".join(factor_wins[winner["name"]])
@@ -652,9 +676,14 @@ def _score_snapshots(left, right):
             f"Conclusion: {winner['name']} leads on the recorded factors "
             f"({winning_factors})."
         )
+        why_lines = "\n".join(
+            f"- Stands out for {factor}" for factor in factor_wins[winner["name"]]
+        )
         recommendation = (
-            f"Recommendation: {winner['name']} is the stronger match based on the "
-            "available data; confirm the listing details before deciding."
+            f"**Acot Recommend:** {winner['name']}\n"
+            f"**Why this is the strongest match:**\n"
+            f"{why_lines or '- Strong balance across the recorded comparison factors.'}\n"
+            f"- Also worth reviewing: {loser['name']}."
         )
 
     return f"{intro}\n\n{table}\n\n{conclusion}\n{recommendation}"
@@ -699,6 +728,8 @@ def _comparison_card(side):
 
 
 def _multi_comparison_answer(snapshots):
+    from app.answers.recommend import format_footer, rank_projects
+
     def table_cell(value):
         return (
             str(value)
@@ -715,6 +746,26 @@ def _multi_comparison_answer(snapshots):
         else frequency
     )
     price_label = f"{str(frequency_label).capitalize()} rent" if frequency_label else "Price"
+
+    projects = [
+        {
+            "name": side["name"],
+            "price": side.get("price"),
+            "beds": side.get("beds"),
+            "size": side.get("size"),
+            "handover_time": side.get("handover"),
+            "status": side.get("status"),
+            "sales_count": side.get("sales_count"),
+        }
+        for side in snapshots
+    ]
+    ranked = rank_projects(projects, attach_sales=False)
+    score_by_name = {
+        str(item["name"]).lower(): item.get("score", 50)
+        for item in ranked.get("ranked") or []
+    }
+    for side in snapshots:
+        side["score"] = score_by_name.get(str(side["name"]).lower(), 50)
 
     rows = [
         "| Factor | " + " | ".join(table_cell(side["name"]) for side in snapshots) + " |",
@@ -744,15 +795,19 @@ def _multi_comparison_answer(snapshots):
         rows.append(
             f"| {label} | " + " | ".join(table_cell(value) for value in values) + " |"
         )
+    rows.append(
+        "| Score | "
+        + " | ".join(table_cell(f"{side.get('score', 50)}%") for side in snapshots)
+        + " |"
+    )
 
     names = ", ".join(side["name"] for side in snapshots)
     return (
         f"Here is a side-by-side comparison of {len(snapshots)} options: "
         f"{names}.\n\n"
         + "\n".join(rows)
-        + "\n\nRecommendation: The table compares the recorded details; the data "
-        "does not establish an overall best option. Choose based on your priorities "
-        "and confirm the listing details."
+        + "\n\n"
+        + format_footer(ranked)
     )
 
 
