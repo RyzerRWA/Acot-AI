@@ -909,6 +909,38 @@ def clean_profile(raw: Any) -> dict:
     return out
 
 
+def _broker_card(row: dict) -> dict:
+    return {"listing_id": str(row.get("brn") or row.get("id") or ""), "kind": "broker", "row": row}
+
+
+def search_brokers(raw) -> ToolResult:
+    a = _obj(raw)
+    name = str(a.get("name") or "").strip() or None
+    brn = str(a.get("brn") or "").strip() or None
+    place = str(a.get("place") or "").strip() or None
+    band = str(a.get("band") or "").strip().lower() or None
+    if band not in (None, "", "top", "mid"):
+        band = None
+    limit = int(round(_num(a, "limit", 1, 10) or 8))
+    from app.retrieval.propai_catalog import list_brokers
+    rows = list_brokers(name=name, brn=brn, limit=limit, place=place, band=band)
+    out = {
+        "matching_brokers": len(rows),
+        "showing": len(rows),
+        "note": (
+            "Licensed DLD agents ranked by card rank. When talking to the user say agent or agents, never broker. "
+            "Quote only these fields. Email and phone are not in this data and must not be invented."
+        ),
+        "brokers": rows,
+    }
+    if not rows:
+        out["note"] = (
+            "No licensed agent matched. Tell the user, and offer the top-ranked agents "
+            "by calling search_brokers with no name."
+        )
+    return ToolResult(out, [_broker_card(row) for row in rows])
+
+
 def update_profile(raw, profile=None) -> ToolResult:
     a = _obj(raw)
     if profile is None:
@@ -931,6 +963,7 @@ TOOL_FUNCTIONS = {
     "compare_projects": compare_projects,
     "market_stats": market_stats,
     "search_brochures": search_brochures,
+    "search_brokers": search_brokers,
     "area_sales": area_sales,
     "update_profile": update_profile,
 }
