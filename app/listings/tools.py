@@ -837,6 +837,45 @@ def search_brochures(raw, pgvector=None) -> ToolResult:
     })
 
 
+# ---------------------------------------------------------------- sales by area
+
+_popular_names: dict[str, str] = {}
+
+
+def _popular(areas: list[str]) -> dict[str, str]:
+    """Official sales-data area -> the name people use (AL BARSHA SOUTH FOURTH -> Jumeirah Village Circle)."""
+    # shortcut: about 2 s for a new set of areas, then cached per process; precompute if it gets slow.
+    missing = [a for a in areas if a not in _popular_names]
+    if missing:
+        rows = fetch("select area_name_prop_ai as area, mode() within group (order by master_project_prop_ai) as name "
+                     "from public.propai_sales where area_name_prop_ai = any(%s) and master_project_prop_ai is not null "
+                     "group by 1", (missing,))
+        for a in missing:
+            _popular_names[a] = next((r["name"] for r in rows if r["area"] == a), None) or a
+    return {a: _popular_names[a].title() for a in areas}
+
+
+def top_areas_by_sales(limit: int = 8) -> list[dict]:
+    """The areas with the most sale transactions in the last 12 months (Dubai Land Department records)."""
+    rows = fetch("select area, sales_12m, median_price, median_ppsf, median_rent from public.propai_area_stats "
+                 "where sales_12m > 0 order by sales_12m desc limit %s", (limit,))
+    names = _popular([r["area"] for r in rows])
+    return [{"area": names[r["area"]], "official_area": r["area"], "sales_12m": int(r["sales_12m"]),
+             "median_sale_price_aed": None if r["median_price"] is None else int(r["median_price"]),
+             "median_price_per_sqft_aed": None if r["median_ppsf"] is None else int(r["median_ppsf"]),
+             "median_yearly_rent_aed": None if r["median_rent"] is None else int(r["median_rent"])} for r in rows]
+
+
+def area_sales(raw) -> ToolResult:
+    a = _obj(raw)
+    limit = int(_num(a, "limit", 3, 15) or 8)
+    return ToolResult({
+        "areas": top_areas_by_sales(limit),
+        "note": "Dubai Land Department sale transactions in the last 12 months, all property types, ranked by count. "
+                "'area' is the name people use; 'official_area' is the land-registry name. The app shows this list.",
+    })
+
+
 # ---------------------------------------------------------------- user profile
 
 PROFILE_GOALS = ("buy_to_live", "invest", "rent_out", "holiday_home", "other")
@@ -892,6 +931,7 @@ TOOL_FUNCTIONS = {
     "compare_projects": compare_projects,
     "market_stats": market_stats,
     "search_brochures": search_brochures,
+    "area_sales": area_sales,
     "update_profile": update_profile,
 }
 
