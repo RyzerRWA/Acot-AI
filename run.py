@@ -1,4 +1,6 @@
 import asyncio
+from collections import Counter
+import contextvars
 import os
 import re
 import io
@@ -14,11 +16,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from app.listings.agent import ListingAgent, ListingsUnavailable
+from app.listings.tools import _find_projects, top_areas_by_sales
+from app.listings.agent import ListingAgent, ListingsUnavailable, _ID_TAG as _AGENT_TAG
 from app.listings.router import is_rent_question
 from app.llm.client import LLMQueueTimeoutError
+from app.answers.spoken import MAX_FACT_CHARS, start_spoken_reply
 from app.subscription.token_usage import add_tokens
 from app.listings import session_store
+from app.retrieval.hybrid.listing_turns import should_use_structured_listing_comparison
 
 
 # =========================================================
@@ -58,6 +63,7 @@ from app.retrieval.hybrid.entity_resolver import (
 from app.retrieval.hybrid.question_text import (
     asks_for_listings,
     collapse_stretched_letters,
+    is_group_attribute_question,
     prepare_user_question,
 )
 
@@ -591,7 +597,7 @@ def print_entity_resolution(entity):
 # FRONTEND-READY RESPONSE FORMATTER
 # =========================================================
 
-from app.answers.area_comparison import build_area_comparison, parse_area_comparison
+from app.answers.area_comparison import build_area_comparison, looks_like_comparison, market_signals, mentioned_area, official_area, parse_area_comparison
 from app.answers.structured_answer import (
     _SMALL_TALK_KINDS,
     _STARTER_CHIPS,
@@ -636,6 +642,344 @@ _SMALL_TALK_FILLER = {
 }
 
 
+_TRANSACTION = re.compile(
+    r"\b(?:transactions?|transcations?|trancations?|transctions?|sale history|sales history)\b",
+    re.I,
+)
+_MORE_TRANSACTIONS = re.compile(
+    r"\b(?:more|another|next|additional|further)\b",
+    re.I,
+)
+_TRANSACTION_PAGE_SIZE = 5
+_MORE_TRANSACTION_FOLLOWUP = "Can you show me more transactions"
+
+
+def _transaction_subject(question, conversation_memory):
+    """Projects a transaction follow-up refers to, or None so the agent does not run."""
+    if not _TRANSACTION.search(question or ""):
+        return None
+    items = getattr(conversation_memory, "active_candidates", None) or []
+    projects = [
+        item for item in items
+        if isinstance(item, dict)
+        and str(item.get("entity_type") or "project").lower() == "project"
+        and item.get("name")
+    ]
+    asked = (question or "").lower()
+    named = [project for project in projects if str(project["name"]).lower() in asked]
+    chosen = named or projects
+    return chosen[:8] or None
+
+
+def _sale_line(sale) -> str:
+    parts = []
+    if sale.get("price") is not None:
+        parts.append(f"AED {int(sale['price']):,}")
+    beds = sale.get("bedrooms")
+    if beds == 0:
+        parts.append("studio")
+    elif beds is not None:
+        parts.append("1 bedroom" if int(beds) == 1 else f"{int(beds)} bedrooms")
+    if sale.get("size_sqft"):
+        parts.append(f"{int(sale['size_sqft']):,} sqft")
+    detail = ", ".join(parts)
+    date = str(sale.get("date") or "")[:10]
+    if date:
+        return f"• **{date}**: {detail}" if detail else f"• **{date}**"
+    return f"• {detail}"
+
+
+def _format_transactions(name, payload, label=None, more=False) -> str:
+    sales = payload.get("sales") or []
+    names = [name] if isinstance(name, str) else list(name or [])
+    intro = label or (names[0] if len(names) == 1 else "these projects")
+    if not sales:
+        if more:
+            return f"There are no more recorded sales for {intro} in the transaction data."
+        return f"There are no recorded sales for {intro} in the transaction data."
+    grouped = {}
+    for sale in sales:
+        key = str(sale.get("project") or "").strip()
+        if not key:
+            continue
+        grouped.setdefault(key.upper(), {"name": key, "sales": []})["sales"].append(sale)
+    order = []
+    for item in names:
+        key = str(item or "").strip().upper()
+        if key and key in grouped and key not in order:
+            order.append(key)
+    for key in grouped:
+        if key not in order:
+            order.append(key)
+    lead = (
+        f"Here are more recent transaction details for {intro}:"
+        if more else
+        f"Here are the recent transaction details for {intro}:"
+    )
+    lines = [lead, ""]
+    for key in order:
+        block = grouped[key]
+        lines.append(f"**{block['name']}**")
+        lines.append("")
+        lines.append("**• Recent Transactions:**")
+        lines.append("")
+        for sale in block["sales"]:
+            lines.append(_sale_line(sale))
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def _transaction_turn(question, conversation_memory):
+    projects = _transaction_subject(question, conversation_memory)
+    if not projects:
+        return None
+    from app.retrieval.propai_catalog import recent_sales
+    names = [project.get("name") for project in projects]
+    communities = {
+        str(project.get("community") or "").strip()
+        for project in projects
+        if project.get("community")
+    }
+    developers = {
+        str(project.get("developer_name") or project.get("developer") or "").strip()
+        for project in projects
+        if project.get("developer_name") or project.get("developer")
+    }
+    if len(names) == 1:
+        intro = names[0]
+    elif len(developers) == 1 and len(communities) == 1:
+        intro = f"the {next(iter(developers))} projects in {next(iter(communities))}"
+    elif len(communities) == 1:
+        intro = f"the projects in {next(iter(communities))}"
+    else:
+        intro = "these projects"
+    fingerprint = "|".join(str(name or "").strip().upper() for name in names if name)
+    more = bool(_MORE_TRANSACTIONS.search(question or ""))
+    prev_fp = getattr(conversation_memory, "transaction_names", None)
+    prev_offset = int(getattr(conversation_memory, "transaction_offset", 0) or 0)
+    offset = prev_offset if more and prev_fp == fingerprint else 0
+    payload = recent_sales(names, per_project=_TRANSACTION_PAGE_SIZE, offset=offset)
+    if conversation_memory is not None:
+        conversation_memory.transaction_names = fingerprint
+        conversation_memory.transaction_offset = (
+            offset + _TRANSACTION_PAGE_SIZE if payload.get("sales") else offset
+        )
+    # Text only: do not attach project rows, or the app draws property cards under the sales list.
+    summary = _empty_structured_summary()
+    summary["transaction_followup"] = True
+    return {
+        "question": question,
+        "standalone_question": question,
+        "question_type": "general",
+        "structured_summary": summary,
+        "documents": [],
+        "investment_analysis": None,
+        "retrieval_result": {
+            "question_type": "general",
+            "structured_data": {"community": [], "projects": [], "sub_communities": []},
+            "documents": [],
+        },
+        "use_fast": True,
+        "fast_answer": _format_transactions(names, payload, label=intro, more=more and offset > 0),
+        "context": None,
+        "small_talk": None,
+    }
+
+
+_SHORTLIST_RECOMMEND = re.compile(
+    r"\b(?:"
+    r"which (?:one |of these |of those )?(?:is|are) (?:the )?best|"
+    r"which of these (?:is|are) better|"
+    r"which (?:of these |ones? |of those )?(?:should|would) i|"
+    r"what should i (?:pick|choose|buy)|"
+    r"which property is best|"
+    r"best (?:property|project) to (?:invest|buy)|"
+    r"recommend (?:one|one of these|the best|among these)|"
+    r"best (?:one|option|pick|project)(?:\s+of these)?|"
+    r"pick (?:one|for me)|"
+    r"which of these (?:do you )?recommend"
+    r")\b",
+    re.I,
+)
+_COMPARE_WORD = re.compile(r"\bcompar(?:e|ison|ing)\b", re.I)
+_COMPARE_ALL = re.compile(r"\b(?:all|every|each)\b", re.I)
+_COMPARE_FIRST_N = re.compile(
+    r"\b(?:first|top)\s+(two|three|four|both|2|3|4)\b|\b(?:both|the two)\b",
+    re.I,
+)
+_COMPARE_N = {"two": 2, "three": 3, "four": 4, "both": 2, "2": 2, "3": 3, "4": 4}
+_COMPARE_ALL_LIMIT = 12
+
+
+def _active_projects(conversation_memory) -> list[dict]:
+    items = getattr(conversation_memory, "active_candidates", None) or []
+    return [
+        item for item in items
+        if isinstance(item, dict)
+        and str(item.get("entity_type") or "project").lower() == "project"
+        and item.get("name")
+    ]
+
+
+def _shown_compare_limit(question: str) -> int | None:
+    """How many on-screen projects a compare follow-up asked for, or None."""
+    text = question or ""
+    if not _COMPARE_WORD.search(text):
+        return None
+    if _COMPARE_ALL.search(text):
+        return _COMPARE_ALL_LIMIT
+    match = _COMPARE_FIRST_N.search(text)
+    if not match:
+        return None
+    token = (match.group(1) or "both").lower()
+    return _COMPARE_N.get(token, 2)
+
+
+def _compare_shown_turn(question, conversation_memory):
+    """Compare N (or all) on-screen projects in a table + Acot Recommend."""
+    limit = _shown_compare_limit(question)
+    if not limit:
+        return None
+    if _TRANSACTION.search(question or ""):
+        return None
+    available = _active_projects(conversation_memory)
+    projects = available[:limit]
+    if len(projects) < 2:
+        return None
+    from app.answers.recommend import format_compare_table, rank_projects, wanted_bedrooms
+
+    ranked = rank_projects(projects, wanted_beds=wanted_bedrooms(question))
+    answer = format_compare_table(projects, ranked)
+    summary = _empty_structured_summary()
+    # Cards show the compared set; memory keeps the fuller shortlist via preserve logic.
+    summary["projects"] = projects
+    summary["project_total"] = len(projects)
+    summary["recommendation"] = ranked.get("recommendation")
+    summary["comparison"] = True
+    return {
+        "question": question,
+        "standalone_question": question,
+        "question_type": "comparison",
+        "structured_summary": summary,
+        "documents": [],
+        "investment_analysis": None,
+        "retrieval_result": {
+            "question_type": "comparison",
+            "structured_data": {
+                "community": [],
+                "projects": projects,
+                "sub_communities": [],
+            },
+            "documents": [],
+        },
+        "use_fast": True,
+        "fast_answer": answer,
+        "context": None,
+        "small_talk": None,
+    }
+
+
+def _shortlist_recommend_turn(question, conversation_memory):
+    """Rank projects already on screen and return Acot Recommend."""
+    if _shown_compare_limit(question):
+        return None
+    if not _SHORTLIST_RECOMMEND.search(question or ""):
+        return None
+    if _TRANSACTION.search(question or ""):
+        return None
+    projects = _active_projects(conversation_memory)
+    if len(projects) < 2:
+        return None
+    from app.answers.recommend import format_shortlist, rank_projects, wanted_bedrooms
+
+    selected = projects[:_COMPARE_ALL_LIMIT]
+    ranked = rank_projects(selected, wanted_beds=wanted_bedrooms(question))
+    # Compare-style "which is best" with many options still gets a table when asked to compare.
+    if _COMPARE_WORD.search(question or ""):
+        from app.answers.recommend import format_compare_table
+        answer = format_compare_table(selected, ranked)
+    else:
+        answer = format_shortlist(ranked, question=question)
+    summary = _empty_structured_summary()
+    by_name = {str(item.get("name") or "").lower(): item for item in selected}
+    ordered = []
+    for item in ranked.get("ranked") or []:
+        row = by_name.get(str(item.get("name") or "").lower())
+        if row and row not in ordered:
+            ordered.append(row)
+    summary["projects"] = ordered
+    summary["project_total"] = len(ordered)
+    summary["recommendation"] = ranked.get("recommendation")
+    return {
+        "question": question,
+        "standalone_question": question,
+        "question_type": "comparison",
+        "structured_summary": summary,
+        "documents": [],
+        "investment_analysis": None,
+        "retrieval_result": {
+            "question_type": "comparison",
+            "structured_data": {
+                "community": [],
+                "projects": summary["projects"],
+                "sub_communities": [],
+            },
+            "documents": [],
+        },
+        "use_fast": True,
+        "fast_answer": answer,
+        "context": None,
+        "small_talk": None,
+    }
+
+
+def _listing_question(question, conversation_memory) -> bool:
+    """Rental questions stay on the listing path. A place name must not turn them into projects."""
+    if asks_for_listings(question):
+        return True
+    context = {}
+    if conversation_memory is not None and hasattr(conversation_memory, "context"):
+        try:
+            context = conversation_memory.context() or {}
+        except Exception:
+            context = {}
+    return bool(should_use_structured_listing_comparison(question, context))
+
+
+def _shown_project_followup(question, conversation_memory):
+    """Projects already on screen for "their starting prices" and the other chip follow-ups.
+
+    Returns (projects, no_match) or None when this is not that kind of question.
+    """
+    if not is_group_attribute_question(question):
+        return None
+    items = getattr(conversation_memory, "active_candidates", None) or []
+    projects = [
+        item for item in items
+        if isinstance(item, dict)
+        and str(item.get("entity_type") or "project").lower() == "project"
+        and item.get("name")
+    ]
+    if not projects:
+        return None
+    bedrooms = re.search(r"\b(\d+)\s*[- ]?\s*bed", question or "", re.I)
+    if not bedrooms:
+        return projects, False
+    wanted = int(bedrooms.group(1))
+    narrowed = []
+    for project in projects:
+        low = project.get("bedroom_min")
+        high = project.get("bedroom_max")
+        if low is None:
+            continue
+        high = low if high is None else high
+        if float(low) <= wanted <= float(high):
+            narrowed.append(project)
+    if narrowed:
+        return narrowed, False
+    return projects, True
+
+
 def _classify_small_talk(question):
     """Return a small-talk kind when the whole message is a greeting or identity question."""
 
@@ -675,17 +1019,17 @@ def _small_talk_answer(kind, name=None):
             "- Pull amenities from their documents"
         )
 
-    if kind =="GoodMorning":
+    if kind in ("GoodMorning", "Good Morning", "Morning"):
         return (
             f"Good morning{who}, How can I help you with Dubai real estate today?"
         )
 
-    if kind =="GoodAfternoon":
+    if kind in ("GoodAfternoon", "Good Afternoon", "Afternoon"):
         return (
             f"Good afternoon{who}, How can I help you with Dubai real estate today?"
         )
 
-    if kind =="GoodEvening":
+    if kind in ("GoodEvening", "Good Evening", "Evening"):
         return (
             f"Good evening{who}, How can I help you with Dubai real estate today?"
         )
@@ -698,7 +1042,7 @@ def _small_talk_answer(kind, name=None):
 
     if kind == "bye":
         return (
-            f"Goodbye{who}. I'm here when you want to look at Dubai projects again."
+            f"Goodbye{who}. Have a great day! I'll be here when you want to look at Dubai projects again."
         )
 
     return f"Hello{who}, I'm ACOT, a Dubai real estate assistant. How can I help you?"
@@ -725,9 +1069,6 @@ def _empty_structured_summary():
 # The model chooses read-only tools (projects, brochures, rentals) and explains
 # the result. It is switched on with ACOT_USE_AGENT=1. If it is off, or it
 # fails for any reason, the standard pipeline below answers as before.
-
-_AGENT_TAG = re.compile(r"\[\[(\d{1,12})\]\]")
-
 
 def _agent_enabled(components):
     on = os.getenv("ACOT_USE_AGENT", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -781,10 +1122,31 @@ def _drop_repeated_name_lines(text, names):
     return "\n".join(kept)
 
 
+# Everything in a document request except the project name.
+_DOC_WORDS = re.compile(
+    r"\b(?:uh+|um+|okay|ok|please|can|could|would|you|i|we|get|send|share|give|show|open|me|us|the|a|an|of|for|"
+    r"to|about|its|it|project|brochures?|floor ?plans?|pdfs?|documents?|catalog(?:ue)?s?)\b|['’]s\b|[?.!,]",
+    re.I,
+)
+_INVEST_ASK = re.compile(
+    r"\b(?:invest\w*|should i (?:buy|get)|worth (?:it|buying|investing)|good (?:buy|deal)|roi|yields?|returns?|"
+    r"appreciat\w*|capital growth|price growth)\b",
+    re.I,
+)
+_DOC_ASK = re.compile(r"\b(?:brochures?|floor ?plans?|pdfs?|documents?|catalog(?:ue)?s?)\b", re.I)
+
+
 async def _try_agent_turn(question, components, timing_ms, ask_started):
     """Answer with the agent, or return None so the standard pipeline answers."""
 
     if not _agent_enabled(components):
+        return None
+
+    conversation_memory = components.get("conversation_memory")
+    if conversation_memory and should_use_structured_listing_comparison(
+        question,
+        conversation_memory.context(),
+    ):
         return None
 
     agent = components["listing_agent"]
@@ -805,7 +1167,7 @@ async def _try_agent_turn(question, components, timing_ms, ask_started):
     await llm._acquire_slot()
     try:
         result = await asyncio.to_thread(
-            agent.answer, question, list(history), None, profile
+            agent.answer, question, list(history), None, profile, _agent_results_hook.get()
         )
     except LLMQueueTimeoutError:
         raise
@@ -837,6 +1199,28 @@ async def _try_agent_turn(question, components, timing_ms, ask_started):
     answer = re.sub(r"[ \t]{2,}", " ", answer).strip()
 
     used = {tool["name"] for tool in result.tools if tool.get("ok")}
+    # Plain browse/search should not invent an Acot Recommend section.
+    wants_recommend = bool(re.search(
+        r"\b(?:invest|buy|recommend|best|compar(?:e|ison)|which should|suggest)\b",
+        question or "",
+        re.I,
+    ))
+    if (
+        not wants_recommend
+        and "compare_projects" not in used
+        and re.search(r"(?i)\b(?:acot recommend|recommendation)\b", answer)
+    ):
+        answer = re.split(
+            r"(?im)^\s*(?:\*\*)?(?:acot recommend|recommendation)\b.*",
+            answer,
+            maxsplit=1,
+        )[0].rstrip()
+        answer = re.sub(
+            r"(?is)\n+\s*(?:i suggest|i recommend|other strong options include).*$",
+            "",
+            answer,
+        ).rstrip()
+
     if "compare_projects" in used and len(projects) >= 2:
         question_type = "comparison"
     elif len(projects) + len(listings) > 1:
@@ -860,13 +1244,48 @@ async def _try_agent_turn(question, components, timing_ms, ask_started):
     structured_summary["projects"] = projects
     structured_summary["listings"] = listings
     timing_ms["agent"] = _elapsed_ms(started)
+    # "Tell me about JVC": no cards, so show the community the answer is about.
+    # "Should I buy in JVC?": the same community, with its market signals from sales and rent records.
+    investing = bool(_INVEST_ASK.search(question or ""))
+    # A question weighing places ("JVC or Downtown?") never gets a single community card.
+    if (investing or (not projects and not listings)) and not looks_like_comparison(question):
+        area = mentioned_area(question)
+        if not area and investing and projects:
+            area = Counter(str(row.get("community") or "") for row in projects).most_common(1)[0][0] or None
+        official = await asyncio.to_thread(official_area, area) if area else None
+        if official:
+            community = {"name": area, "official_area": official}
+            if investing:
+                community["focus"] = "investment"
+                community["signals"] = await asyncio.to_thread(market_signals, official)
+            structured_summary["community"] = [community]
+    # "Which area has the most sales?": the ranked areas go to the screen as a list.
+    if "area_sales" in used:
+        ranked = await asyncio.to_thread(top_areas_by_sales, 8)
+        structured_summary["community"] = [
+            {"name": row["area"], "official_area": row["official_area"], "focus": "ranking", "ranking": row}
+            for row in ranked
+        ]
+    # The agent sometimes only searches brochure text and returns no project: look the project up by name.
+    if _DOC_ASK.search(question or "") and not any(row.get("brochure_url") for row in projects):
+        name = re.sub(r"\s+", " ", _DOC_WORDS.sub(" ", question or "")).strip(" ?.!,")
+        rows = await asyncio.to_thread(_find_projects, name) if name else []
+        if len(rows) == 1:
+            projects.append(rows[0])
+    # "Send me the brochure": the projects' brochure links go to the screen as documents.
+    documents = [
+        {"id": row.get("id"), "document_title": f"{row.get('name') or 'Project'} brochure",
+         "document_type": "Brochure", "document_url": row["brochure_url"]}
+        for row in projects
+        if row.get("brochure_url")
+    ] if _DOC_ASK.search(question or "") else []
 
     return {
         "question": question,
         "standalone_question": question,
         "question_type": question_type,
         "structured_summary": structured_summary,
-        "documents": [],
+        "documents": documents,
         "investment_analysis": None,
         "retrieval_result": {
             "question_type": question_type,
@@ -876,7 +1295,7 @@ async def _try_agent_turn(question, components, timing_ms, ask_started):
                 "sub_communities": [],
                 "listings": listings,
             },
-            "documents": [],
+            "documents": documents,
         },
         "rag_chain": components["rag_chain"],
         "conversation_memory": components["conversation_memory"],
@@ -957,7 +1376,7 @@ async def _prepare_acot_turn(
         history.append({"role": "assistant", "content": compared})
         del history[:-12]
         # Build comparison_entities from area facts so the frontend renders cards.
-        from app.answers.area_comparison import _facts as _area_facts
+        from app.answers.area_comparison import _beds_text, _facts as _area_facts
         _area_comparison_entities = []
         if areas:
             for _area_name in areas:
@@ -975,6 +1394,15 @@ async def _prepare_acot_turn(
                         "rent_median": _f.get("rent_median"),
                         "projects_count": _f.get("projects"),
                         "listings_count": _f.get("listings"),
+                        # Shown as extra rows in the app's comparison table.
+                        "area_facts": {
+                            "projects": _f.get("projects"),
+                            "median_price": _f.get("median_price"),
+                            "handover_year": (_f.get("top_year") or {}).get("year"),
+                            "bedrooms": _beds_text(_f["beds"]) if _f.get("beds") else None,
+                            "rentals": _f.get("listings"),
+                            "rent_median": _f.get("rent_median"),
+                        },
                     }
                     _area_comparison_entities.append({
                         "entity_type": "community",
@@ -1003,6 +1431,72 @@ async def _prepare_acot_turn(
             "conversation_memory": conversation_memory,
             "use_fast": True,
             "fast_answer": compared,
+            "context": None,
+            "timing_ms": timing_ms,
+            "ask_started": ask_started,
+            "small_talk": None,
+        }
+
+    transaction_turn = await asyncio.to_thread(
+        _transaction_turn, question, conversation_memory
+    )
+    if transaction_turn is not None:
+        transaction_turn["timing_ms"] = timing_ms
+        transaction_turn["ask_started"] = ask_started
+        transaction_turn["rag_chain"] = rag_chain
+        transaction_turn["conversation_memory"] = conversation_memory
+        return transaction_turn
+
+    compare_shown = await asyncio.to_thread(
+        _compare_shown_turn, question, conversation_memory
+    )
+    if compare_shown is not None:
+        compare_shown["timing_ms"] = timing_ms
+        compare_shown["ask_started"] = ask_started
+        compare_shown["rag_chain"] = rag_chain
+        compare_shown["conversation_memory"] = conversation_memory
+        return compare_shown
+
+    shortlist_turn = await asyncio.to_thread(
+        _shortlist_recommend_turn, question, conversation_memory
+    )
+    if shortlist_turn is not None:
+        shortlist_turn["timing_ms"] = timing_ms
+        shortlist_turn["ask_started"] = ask_started
+        shortlist_turn["rag_chain"] = rag_chain
+        shortlist_turn["conversation_memory"] = conversation_memory
+        return shortlist_turn
+
+    shown_followup = _shown_project_followup(question, conversation_memory)
+    if shown_followup is not None:
+        projects, no_match = shown_followup
+        summary = _empty_structured_summary()
+        if no_match:
+            summary["filter_no_match"] = True
+            summary["filter_evidence_projects"] = projects
+        else:
+            summary["projects"] = projects
+            summary["project_total"] = len(projects)
+        return {
+            "question": question,
+            "standalone_question": question,
+            "question_type": "search",
+            "structured_summary": summary,
+            "documents": [],
+            "investment_analysis": None,
+            "retrieval_result": {
+                "question_type": "search",
+                "structured_data": {
+                    "community": [],
+                    "projects": [] if no_match else projects,
+                    "sub_communities": [],
+                },
+                "documents": [],
+            },
+            "rag_chain": rag_chain,
+            "conversation_memory": conversation_memory,
+            "use_fast": True,
+            "fast_answer": _build_fast_structured_answer(question, summary),
             "context": None,
             "timing_ms": timing_ms,
             "ask_started": ask_started,
@@ -1115,6 +1609,29 @@ async def _prepare_acot_turn(
     if comparison_built:
         structured_summary["comparison_view"] = comparison_built["sides"]
 
+    open_recommend = None
+    projects_for_rank = [
+        project for project in (structured_summary.get("projects") or [])
+        if isinstance(project, dict) and project.get("name")
+    ]
+    if question_type == "investment" and len(projects_for_rank) >= 2:
+        from app.answers.recommend import format_shortlist, rank_projects, wanted_bedrooms
+        open_recommend = rank_projects(
+            projects_for_rank,
+            wanted_beds=wanted_bedrooms(standalone_question),
+        )
+        structured_summary["recommendation"] = open_recommend.get("recommendation")
+        if investment_analysis is not None:
+            investment_analysis = dict(investment_analysis)
+            investment_analysis["project_recommendation"] = open_recommend.get("recommendation")
+            investment_analysis["recommendation_text"] = format_shortlist(
+                open_recommend,
+                question=standalone_question,
+                assumptions=(
+                    "Ranked on price, size, sales/transactions and rental activity."
+                ),
+            )
+
     use_fast = _is_fast_structured_question(
         question=standalone_question,
         question_type=question_type,
@@ -1122,6 +1639,8 @@ async def _prepare_acot_turn(
         documents=documents,
     )
     if comparison_built:
+        use_fast = True
+    elif open_recommend is not None:
         use_fast = True
     elif re.search(
         r"\b(?:which of these|which ones|which of those|which of the)\b",
@@ -1144,6 +1663,16 @@ async def _prepare_acot_turn(
 
     if comparison_built:
         fast_answer = comparison_built["answer"]
+        context = None
+    elif open_recommend is not None:
+        from app.answers.recommend import format_shortlist
+        fast_answer = format_shortlist(
+            open_recommend,
+            question=standalone_question,
+            assumptions=(
+                "Ranked on price, size, sales/transactions and rental activity."
+            ),
+        )
         context = None
     elif use_fast:
         fast_answer = _build_fast_structured_answer(
@@ -1277,7 +1806,10 @@ def _stream_sources(prepared):
     return sources
 
 
+_TRANSACTION_FOLLOWUP = "Show me the recent transaction details"
+
 _PROJECT_FOLLOWUPS = (
+    ("transactions", _TRANSACTION_FOLLOWUP),
     ("price", "What are their starting prices?"),
     ("bedroom", "Which of these have 2-bedroom options?"),
     ("handover", "What are their handover dates?"),
@@ -1311,6 +1843,8 @@ def _question_topics(text):
         topics.add("amenities")
     if any(term in question for term in ("size", "sqft", "square foot")):
         topics.add("size")
+    if any(term in question for term in ("transaction", "transactions", "transcation", "sale history")):
+        topics.add("transactions")
     return topics
 
 
@@ -1325,7 +1859,7 @@ def _questions_already_asked(prepared):
     return asked
 
 
-def _unused_followups(prepared, chips):
+def _unused_followups(prepared, chips, pinned=None):
     asked = _questions_already_asked(prepared)
     asked_text = {_normalize_chat_text(item) for item in asked if item}
     covered = set()
@@ -1339,6 +1873,11 @@ def _unused_followups(prepared, chips):
         if _question_topics(chip) & covered:
             continue
         unused.append(chip)
+
+    pinned_chip = pinned or None
+    if pinned_chip and _normalize_chat_text(pinned_chip) not in asked_text:
+        unused = [chip for chip in unused if _normalize_chat_text(chip) != _normalize_chat_text(pinned_chip)]
+        unused = [pinned_chip, *unused]
     return unused[:3]
 
 
@@ -1396,6 +1935,20 @@ def _followup_questions(prepared):
         return _unused_followups(prepared, _STARTER_CHIPS)
 
     summary = prepared.get("structured_summary") or {}
+    if summary.get("transaction_followup") or "transactions" in _question_topics(question):
+        answer = prepared.get("fast_answer") or ""
+        if "Recent Transactions" in answer or summary.get("transaction_followup"):
+            return _unused_followups(
+                prepared,
+                [
+                    _MORE_TRANSACTION_FOLLOWUP,
+                    "What are their starting prices?",
+                    "What are their handover dates?",
+                    "Who is the developer of each of these projects?",
+                ],
+                pinned=_MORE_TRANSACTION_FOLLOWUP,
+            )
+
     projects = [
         project
         for project in (summary.get("projects") or [])
@@ -1419,28 +1972,33 @@ def _followup_questions(prepared):
         return _unused_followups(
             prepared,
             [
+                _TRANSACTION_FOLLOWUP,
                 f"What is the starting price of {name}?",
                 f"What is the handover date of {name}?",
                 f"Who is the developer of {name}?",
                 f"What amenities does {name} offer?",
                 f"What is the bedroom range of {name}?",
             ],
+            pinned=_TRANSACTION_FOLLOWUP,
         )
 
     if len(projects) >= 2:
         return _unused_followups(
             prepared,
             [chip for _, chip in _PROJECT_FOLLOWUPS],
+            pinned=_TRANSACTION_FOLLOWUP,
         )
 
     if place and re.search(r"\bprojects?\b", question, flags=re.I):
         return _unused_followups(
             prepared,
             [
+                _TRANSACTION_FOLLOWUP,
                 f"What are the starting prices of projects in {place}?",
                 f"What are the handover dates of projects in {place}?",
                 f"Compare the first and second projects in {place}.",
             ],
+            pinned=_TRANSACTION_FOLLOWUP,
         )
 
     return []
@@ -1497,11 +2055,21 @@ def _slim_stream_response(response):
     return slim
 
 
+# Voice mode: set while a turn is being prepared, so the agent can start the spoken reply
+# from its search results instead of waiting for the whole written answer (saves 1-4s).
+_agent_results_hook = contextvars.ContextVar("agent_results_hook", default=None)
+
+
 async def stream_acot(
     question,
-    components
+    components,
+    mode="text",
+    language=None,
 ):
     """Yield typed stream events: meta, delta, followups, then done.
+
+    mode="voice" also yields `speech` events (a short spoken reply written in
+    parallel with the chat answer) and one `speech_done` before `done`.
 
     Database answers are split into small pieces so the client can show
     them like a typewriter. Model answers keep the provider's own tokens.
@@ -1511,10 +2079,37 @@ async def stream_acot(
     # No stdout redirect: the API installs a logging-backed sys.stdout at
     # startup, so pipeline output is captured without mutating global state
     # per request (which interleaved output across concurrent requests).
-    prepared = await _prepare_acot_turn(
-        question,
-        components
-    )
+    early = {}
+    hook_token = None
+    # Document and investment requests wait for the full result: brochures and market signals are added after the agent.
+    if mode == "voice" and not _DOC_ASK.search(question or "") and not _INVEST_ASK.search(question or ""):
+        loop = asyncio.get_running_loop()
+
+        def start_early(tool_outputs):
+            facts = "- Search results:\n" + "\n".join(tool_outputs)[:MAX_FACT_CHARS]
+            seed = {"context": facts, "conversation_memory": components.get("conversation_memory")}
+            # Runs in the agent's thread; the reply's task must start on the event loop.
+            loop.call_soon_threadsafe(lambda: early.setdefault("speech", start_spoken_reply(
+                components["rag_chain"].llm, question, seed, components.get("user_name"), language)))
+
+        hook_token = _agent_results_hook.set(start_early)
+    preparing = asyncio.create_task(_prepare_acot_turn(question, components))
+    try:
+        # Send the early spoken reply while the written answer is still being made.
+        while not preparing.done():
+            await asyncio.wait({preparing}, timeout=0.05)
+            for text in early["speech"].drain() if "speech" in early else ():
+                yield ("speech", {"type": "speech", "text": text})
+        prepared = preparing.result()
+    except BaseException:
+        if "speech" in early:
+            early["speech"].cancel()
+        raise
+    finally:
+        if not preparing.done():
+            preparing.cancel()
+        if hook_token is not None:
+            _agent_results_hook.reset(hook_token)
 
     yield (
         "meta",
@@ -1524,54 +2119,86 @@ async def stream_acot(
         }
     )
 
-    answer_started = time.perf_counter()
-    if prepared["use_fast"]:
-        answer = prepared["fast_answer"] or ""
-        for piece in _iter_typewriter_pieces(answer):
-            yield (
-                "delta",
-                {"type": "delta", "text": piece}
-            )
-            await asyncio.sleep(0.02)
-    else:
-        parts = []
-
-        async for delta in prepared["rag_chain"].stream_answer(
-            question=prepared["standalone_question"],
-            context=prepared["context"],
-            question_type=prepared["question_type"]
-        ):
-            if not delta:
-                continue
-
-            parts.append(delta)
-            yield (
-                "delta",
-                {"type": "delta", "text": delta}
-            )
-
-        answer = "".join(parts).strip()
-
-        if not answer:
-            raise RuntimeError(
-                "LLM returned an empty answer."
-            )
-
-    followups = _followup_questions(prepared)
-    if followups:
-        yield (
-            "followups",
-            {"type": "followups", "questions": followups}
-        )
-
-    yield (
-        "done",
-        _finalize_acot_turn(
+    speech = early.get("speech") or (
+        start_spoken_reply(
+            prepared["rag_chain"].llm,
+            question,
             prepared,
-            answer,
-            answer_started,
+            components.get("user_name"),
+            language,
         )
+        if mode == "voice"
+        else None
     )
+
+    def spoken_so_far():
+        for text in speech.drain() if speech else ():
+            yield ("speech", {"type": "speech", "text": text})
+
+    try:
+        answer_started = time.perf_counter()
+        if prepared["use_fast"]:
+            answer = prepared["fast_answer"] or ""
+            for piece in _iter_typewriter_pieces(answer):
+                yield (
+                    "delta",
+                    {"type": "delta", "text": piece}
+                )
+                for event in spoken_so_far():
+                    yield event
+                await asyncio.sleep(0.02)
+        else:
+            parts = []
+
+            async for delta in prepared["rag_chain"].stream_answer(
+                question=prepared["standalone_question"],
+                context=prepared["context"],
+                question_type=prepared["question_type"]
+            ):
+                if not delta:
+                    continue
+
+                parts.append(delta)
+                yield (
+                    "delta",
+                    {"type": "delta", "text": delta}
+                )
+                for event in spoken_so_far():
+                    yield event
+
+            answer = "".join(parts).strip()
+
+            if not answer:
+                raise RuntimeError(
+                    "LLM returned an empty answer."
+                )
+
+        followups = _followup_questions(prepared)
+        if followups:
+            yield (
+                "followups",
+                {"type": "followups", "questions": followups}
+            )
+
+        if speech:
+            # Finish the spoken reply before `done`, so its tokens are billed with this turn.
+            for event in spoken_so_far():
+                yield event
+            async for text in speech.rest():
+                yield ("speech", {"type": "speech", "text": text})
+            yield ("speech_done", {"type": "speech_done", "ok": speech.ok})
+
+        yield (
+            "done",
+            _finalize_acot_turn(
+                prepared,
+                answer,
+                answer_started,
+            )
+        )
+    finally:
+        if speech:
+            speech.cancel()
 
 
 def _elapsed_ms(started):

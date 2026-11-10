@@ -269,6 +269,11 @@ def _format_community_card(record):
     return {
         "id": _json_safe(record.get("id")),
         "name": record.get("name"),
+        # The sales-data name the app's community pages use (Dubai Marina -> MARSA DUBAI).
+        "official_area": record.get("official_area"),
+        "focus": record.get("focus"),
+        "signals": _json_safe(record.get("signals")),
+        "ranking": _json_safe(record.get("ranking")),
         "slug": record.get("slug"),
         "city": record.get("city"),
         "location": {
@@ -426,8 +431,11 @@ def _side_snapshot(name, records):
     beds = []
     handovers = []
     frequencies = []
+    status_ranks = []
+    sales_counts = []
     photo = None
     link = None
+    status = None
     for record in records:
         price = _record_number(record, "price_aed", "price")
         size = _record_number(record, "size_sqft")
@@ -447,6 +455,7 @@ def _side_snapshot(name, records):
             else:
                 bed = bed_min if bed_min is not None else bed_max
         handover = _handover_stamp(record.get("handover_time"))
+        sale_count = _record_number(record, "sales_count", "recent_sales_count")
         if price is not None:
             prices.append(price)
             frequency = str(record.get("rent_frequency") or "").strip().lower()
@@ -458,6 +467,11 @@ def _side_snapshot(name, records):
             beds.append(bed)
         if handover is not None:
             handovers.append(handover)
+        if sale_count is not None:
+            sales_counts.append(sale_count)
+        record_status = record.get("project_status") or record.get("status")
+        if record_status and status is None:
+            status = record_status
         if photo is None:
             photo = _record_photo(record)
         if link is None:
@@ -472,8 +486,11 @@ def _side_snapshot(name, records):
         "beds": _median(beds),
         "handover": _median(handovers),
         "frequency": shared_frequency,
+        "status": status,
+        "sales_count": _median(sales_counts),
         "photo": photo,
         "link": link,
+        "area_facts": records[0].get("area_facts") if len(records) == 1 else None,
     }
 
 
@@ -481,6 +498,27 @@ def _score_snapshots(left, right):
     """Score two sides from shared fields. Higher means stronger on those fields."""
 
     checks = []
+
+    def _table_cell(value):
+        return (
+            str(value)
+            .replace("\\", "\\\\")
+            .replace("|", "\\|")
+            .replace("\n", " ")
+        )
+
+    rent_frequency = left.get("frequency")
+    if rent_frequency == right.get("frequency") and rent_frequency:
+        normalized_frequency = str(rent_frequency).strip().lower()
+        frequency_label = (
+            "yearly"
+            if normalized_frequency in {"yearly", "annual", "annually"}
+            else normalized_frequency
+        )
+        price_label = f"{frequency_label.capitalize()} rent"
+    else:
+        price_label = "Price"
+    price_factor = f"lower {price_label.lower()}"
 
     def prefer_high(key, label, formatter):
         left_value = left.get(key)
@@ -491,6 +529,7 @@ def _score_snapshots(left, right):
         other = right if winner is left else left
         checks.append((
             winner["name"],
+            label.lower(),
             (
                 f"**{label.capitalize()}:** {winner['name']} is ahead "
                 f"({formatter(winner[key])} versus {formatter(other[key])})."
@@ -506,14 +545,16 @@ def _score_snapshots(left, right):
         other = right if winner is left else left
         checks.append((
             winner["name"],
+            label.lower(),
             (
                 f"**{label.capitalize()}:** {winner['name']} is ahead "
                 f"({formatter(winner[key])} versus {formatter(other[key])})."
             ),
         ))
 
-    prefer_low("price", "price", lambda value: _format_aed(value) or str(value))
-    prefer_high("size", "size", lambda value: f"{int(value):,} sqft")
+    prefer_low("price", price_factor, lambda value: _format_aed(value) or str(value))
+    prefer_high("size", "more space", lambda value: f"{int(value):,} sqft")
+
     def _bedroom_text(value):
         if value == 0:
             return "Studio"
@@ -521,7 +562,12 @@ def _score_snapshots(left, right):
             return "1 bedroom"
         return f"{value:g} bedrooms"
 
-    prefer_high("beds", "bedrooms", _bedroom_text)
+    prefer_high("beds", "more bedrooms", _bedroom_text)
+    prefer_high(
+        "sales_count",
+        "more recent sales activity",
+        lambda value: f"{int(value):,} sales",
+    )
     left_handover = left.get("handover")
     right_handover = right.get("handover")
     if (
@@ -533,14 +579,19 @@ def _score_snapshots(left, right):
         other = right if winner is left else left
         checks.append((
             winner["name"],
+            "earlier handover",
             (
                 f"**Handover:** {winner['name']} is earlier "
                 f"({_handover_label(winner['handover'])} versus "
                 f"{_handover_label(other['handover'])})."
             ),
         ))
+    from app.answers.recommend import _status_rank
+    left["status_rank"] = _status_rank(left.get("status"))
+    right["status_rank"] = _status_rank(right.get("status"))
+    prefer_high("status_rank", "readiness", lambda value: str(int(value)))
 
-    left_wins = sum(1 for name, _text in checks if name == left["name"])
+    left_wins = sum(1 for name, _factor, _text in checks if name == left["name"])
     right_wins = len(checks) - left_wins
     if not checks or left_wins == right_wins:
         left_score = right_score = 50
@@ -551,9 +602,12 @@ def _score_snapshots(left, right):
     right["score"] = right_score
     winner = left if left_score >= right_score else right
     loser = right if winner is left else left
-    table_rows = [f"| Factor | {left['name']} | {right['name']} |", "| --- | --- | --- |"]
+    table_rows = [
+        f"| Factor | {_table_cell(left['name'])} | {_table_cell(right['name'])} |",
+        "| --- | --- | --- |",
+    ]
     fields = (
-        ("Price", "price", lambda value: _format_aed(value) or str(value)),
+        (price_label, "price", lambda value: _format_aed(value) or str(value)),
         ("Size", "size", lambda value: f"{int(value):,} sqft"),
         ("Bedrooms", "beds", _bedroom_text),
         ("Handover", "handover", _handover_label),
@@ -572,8 +626,9 @@ def _score_snapshots(left, right):
     table = "\n".join(table_rows)
     if not checks and not comparable_fields:
         intro = (
-            "I can't recommend one over the other because the records do not "
-            "contain comparable price, size, bedroom, or handover details."
+            f"{left['name']} and {right['name']} are both useful options to review; "
+            "the recorded price, size, bedroom and handover details are still light, "
+            "so the next step is to match them to your preferred layout."
         )
     elif left_score == right_score:
         intro = (
@@ -586,7 +641,52 @@ def _score_snapshots(left, right):
             f"{loser['name']} scores {loser['score']}%. "
             f"{winner['name']} is the stronger of the two on these records."
         )
-    return f"{intro}\n\n{table}"
+
+    factor_wins = {left["name"]: [], right["name"]: []}
+    for name, factor, _text in checks:
+        factor_wins[name].append(factor)
+
+    if not checks:
+        conclusion = (
+            "Conclusion: Both options look useful to review side by side."
+        )
+        recommendation = (
+            f"**Acot Recommend:** {left['name']} and {right['name']}\n"
+            "**Why:**\n"
+            "- Each brings helpful recorded details to compare next.\n"
+            "- A good next step is to match them to your preferred layout and community feel."
+        )
+    elif left_score == right_score:
+        left_advantages = ", ".join(factor_wins[left["name"]])
+        right_advantages = ", ".join(factor_wins[right["name"]])
+        conclusion = (
+            f"Conclusion: The comparison is balanced. {left['name']} leads on "
+            f"{left_advantages}, while {right['name']} leads on {right_advantages}."
+        )
+        recommendation = (
+            f"**Acot Recommend:** {left['name']} and {right['name']}\n"
+            f"**Why:**\n"
+            f"- {left['name']} stands out for {left_advantages}.\n"
+            f"- {right['name']} stands out for {right_advantages}.\n"
+            f"- Pick the one that matches the lifestyle factor you value most."
+        )
+    else:
+        winning_factors = ", ".join(factor_wins[winner["name"]])
+        conclusion = (
+            f"Conclusion: {winner['name']} leads on the recorded factors "
+            f"({winning_factors})."
+        )
+        why_lines = "\n".join(
+            f"- Stands out for {factor}" for factor in factor_wins[winner["name"]]
+        )
+        recommendation = (
+            f"**Acot Recommend:** {winner['name']}\n"
+            f"**Why this is the strongest match:**\n"
+            f"{why_lines or '- Strong balance across the recorded comparison factors.'}\n"
+            f"- Also worth reviewing: {loser['name']}."
+        )
+
+    return f"{intro}\n\n{table}\n\n{conclusion}\n{recommendation}"
 
 
 def _comparison_card(side):
@@ -623,7 +723,92 @@ def _comparison_card(side):
         "property_finder_url": side.get("link"),
         "handover_time": _handover_label(side.get("handover")),
         "status": f"{side['score']}%" if side.get("score") is not None else None,
+        "area_facts": side.get("area_facts"),
     }
+
+
+def _multi_comparison_answer(snapshots):
+    from app.answers.recommend import format_footer, rank_projects
+
+    def table_cell(value):
+        return (
+            str(value)
+            .replace("\\", "\\\\")
+            .replace("|", "\\|")
+            .replace("\n", " ")
+        )
+
+    frequencies = {side.get("frequency") for side in snapshots}
+    frequency = next(iter(frequencies)) if len(frequencies) == 1 else None
+    frequency_label = (
+        "yearly"
+        if str(frequency or "").lower() in {"yearly", "annual", "annually"}
+        else frequency
+    )
+    price_label = f"{str(frequency_label).capitalize()} rent" if frequency_label else "Price"
+
+    projects = [
+        {
+            "name": side["name"],
+            "price": side.get("price"),
+            "beds": side.get("beds"),
+            "size": side.get("size"),
+            "handover_time": side.get("handover"),
+            "status": side.get("status"),
+            "sales_count": side.get("sales_count"),
+        }
+        for side in snapshots
+    ]
+    ranked = rank_projects(projects, attach_sales=False)
+    score_by_name = {
+        str(item["name"]).lower(): item.get("score", 50)
+        for item in ranked.get("ranked") or []
+    }
+    for side in snapshots:
+        side["score"] = score_by_name.get(str(side["name"]).lower(), 50)
+
+    rows = [
+        "| Factor | " + " | ".join(table_cell(side["name"]) for side in snapshots) + " |",
+        "|" + " --- |" * (len(snapshots) + 1),
+    ]
+    fields = (
+        (price_label, "price", lambda value: _format_aed(value) or str(value)),
+        ("Size", "size", lambda value: f"{int(value):,} sqft"),
+        (
+            "Bedrooms",
+            "beds",
+            lambda value: (
+                "Studio"
+                if value == 0
+                else f"{value:g} bedroom" if value == 1 else f"{value:g} bedrooms"
+            ),
+        ),
+        ("Handover", "handover", _handover_label),
+    )
+    for label, key, formatter in fields:
+        if not any(side.get(key) is not None for side in snapshots):
+            continue
+        values = [
+            formatter(side[key]) if side.get(key) is not None else "Not recorded"
+            for side in snapshots
+        ]
+        rows.append(
+            f"| {label} | " + " | ".join(table_cell(value) for value in values) + " |"
+        )
+    rows.append(
+        "| Score | "
+        + " | ".join(table_cell(f"{side.get('score', 50)}%") for side in snapshots)
+        + " |"
+    )
+
+    names = ", ".join(side["name"] for side in snapshots)
+    return (
+        f"Here is a side-by-side comparison of {len(snapshots)} options: "
+        f"{names}.\n\n"
+        + "\n".join(rows)
+        + "\n\n"
+        + format_footer(ranked)
+    )
 
 
 def _build_comparison(structured_summary):
@@ -636,7 +821,7 @@ def _build_comparison(structured_summary):
         return None
 
     snapshots = []
-    for entity in entities[:2]:
+    for entity in entities:
         data = entity.get("data") or {}
         records = data.get("listings") or data.get("projects") or []
         records = [record for record in records if isinstance(record, dict)]
@@ -649,7 +834,11 @@ def _build_comparison(structured_summary):
         )
         snapshots.append(_side_snapshot(name, records))
 
-    answer = _score_snapshots(snapshots[0], snapshots[1])
+    answer = (
+        _score_snapshots(snapshots[0], snapshots[1])
+        if len(snapshots) == 2
+        else _multi_comparison_answer(snapshots)
+    )
     return {
         "answer": answer,
         "sides": [_comparison_card(side) for side in snapshots],
@@ -707,6 +896,10 @@ def _detect_response_type(
         if not projects:
             return "investment_analysis"
 
+    # The agent marks a turn as a comparison when it used compare_projects.
+    if question_type == "comparison" and len(projects) >= 2:
+        return "project_comparison"
+
     if any(
         phrase in question_lower
         for phrase in (
@@ -714,7 +907,10 @@ def _detect_response_type(
             "comparison",
             "difference between",
             "vs ",
-            " versus "
+            " versus ",
+            "which is better",
+            "which one is better",
+            "better option",
         )
     ) and len(projects) >= 2:
         return "project_comparison"

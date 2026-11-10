@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from typing import Literal
 from pydantic import BaseModel, Field
 
 from run import initialize_acot, ask_acot, stream_acot, _slim_stream_response
@@ -121,6 +122,10 @@ class AskRequest(BaseModel):
     profile: dict | None = None
     # Optional, from the backend: the signed-in user's name, so greetings can say "Hello Priya".
     user_name: str | None = Field(default=None, max_length=120)
+    # "voice": also stream a short spoken reply (`speech` events) for voice mode.
+    mode: Literal["text", "voice"] = "text"
+    # Voice mode: the language of the spoken reply, whatever the user speaks. None: follow the question.
+    language: Literal["en", "hi"] | None = None
 
 
 def _apply_user_name(components, name):
@@ -459,7 +464,7 @@ def health_check():
     return {
         "status": "ok",
         "service": "ACOT",
-        "message": "ACOT FastAPI backend is running."
+        "message": "ACOT FastAPI backend is running. cheppra "
     }
 
 
@@ -619,7 +624,9 @@ async def ask_stream_endpoint(request: AskRequest):
 
             async for event_name, data in stream_acot(
                 question,
-                components
+                components,
+                mode=request.mode,
+                language=request.language,
             ):
                 if event_name == "meta" and isinstance(data, dict):
                     data = dict(data)

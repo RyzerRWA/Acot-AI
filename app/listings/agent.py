@@ -26,7 +26,7 @@ MAX_ROUNDS = 5
 MAX_TOOL_JSON = 9_000  # characters of tool output handed back to the model
 HISTORY_TURNS = 6      # earlier messages sent along with a question
 HISTORY_CHARS = 1_200  # longest earlier message sent in full
-_ID_TAG = re.compile(r"\[\[(\d{1,12})\]\]")
+_ID_TAG = re.compile(r"\[\[(P\d{12}|\d{1,12})\]\]")
 
 
 class ListingsUnavailable(RuntimeError):
@@ -89,8 +89,10 @@ class ListingAgent:
         raise ListingsUnavailable(last)
 
     def answer(self, question: str, history: list[dict] | None = None, listing_id: str | None = None,
-               profile: dict | None = None) -> AgentResult:
-        """profile: what is known about the user. The update_profile tool writes into this same dict."""
+               profile: dict | None = None, on_results=None) -> AgentResult:
+        """profile: what is known about the user. The update_profile tool writes into this same dict.
+        on_results(tool_outputs): called once, from this thread, as soon as a search has returned records
+        and before the model writes its answer, so voice mode can start speaking early."""
         started = time.perf_counter()
         profile = {} if profile is None else profile
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -113,9 +115,26 @@ class ListingAgent:
         messages.append({"role": "user", "content": question})
 
         tools = tools_for(question)
+        found = []
+        pending = [on_results] if on_results else []
+
+        def tool(name, args):
+            result = run_tool(name, args, pgvector=self.pgvector, profile=profile)
+            found.extend(result.cards)
+            return result
+
+        def chat(msgs):
+            # Records came back, so the model is about to write the answer from them: hand them over now.
+            if pending and found:
+                try:
+                    pending.pop()([str(m.get("content") or "") for m in msgs if m.get("role") == "tool"])
+                except Exception:
+                    log.exception("on_results failed")
+            return self._chat(msgs, tools)
+
         graph = build_agent_graph(
-            lambda msgs: self._chat(msgs, tools),
-            lambda name, args: run_tool(name, args, pgvector=self.pgvector, profile=profile),
+            chat,
+            tool,
             ToolInputError, max_rounds=MAX_ROUNDS, max_tool_json=MAX_TOOL_JSON, log=log,
             needs_grounding=mentions_known_name)
         state = graph.invoke({"messages": messages, "seen": {}, "used": [], "tokens": 0, "rounds": 0})
@@ -126,6 +145,7 @@ class ListingAgent:
     def _finish(text, seen, used, model, tokens, started) -> AgentResult:
         cleaned = strip_links(text)
         cited = list(dict.fromkeys(_ID_TAG.findall(cleaned)))
+        cited_ids = set(cited)
         # A card is shown for every id the model tagged. If it described a project or listing by name
         # without tagging it, the card is still shown (only items a tool returned, only if named).
         lowered = cleaned.lower()
@@ -134,7 +154,10 @@ class ListingAgent:
             name = str(row.get("name") or card.get("title") or "").strip().lower()
             if key not in cited and len(name) >= 6 and name in lowered:
                 cited.append(key)
-        cards = [seen[i] for i in cited if i in seen][:10]   # only ids a tool really returned
+                cited_ids.add(key)
+        # Preserve the order in which the search tool returned the records,
+        # rather than making card order depend on how the model mentions them.
+        cards = [card for key, card in seen.items() if key in cited_ids][:10]
         answer = _ID_TAG.sub(lambda m: m.group(0) if m.group(1) in seen else "", cleaned).strip()
         ms = int(round((time.perf_counter() - started) * 1000))
         log.info("listings: %s | %s tokens | %sms | %s",

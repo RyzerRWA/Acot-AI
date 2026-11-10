@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, TypedDict
 
 from langgraph.graph import END, StateGraph
@@ -109,23 +110,32 @@ def build_agent_graph(
         calls = [(c.id, c.function.name, c.function.arguments) for c in message.tool_calls]
         return {**base, "calls": calls, "messages": [*state["messages"], assistant]}
 
+    def _run_one(call_id, name, arguments):
+        try:
+            result = run_tool(name, json.loads(arguments or "{}"))
+            return call_id, name, result.output, result.cards, True
+        except (tool_error, json.JSONDecodeError) as exc:
+            # bad arguments go back so the model can correct itself
+            return call_id, name, {"error": str(exc)}, [], False
+        except Exception:
+            if log:
+                log.exception("tool %s failed", name)
+            return call_id, name, {"error": "That lookup failed."}, [], False
+
     def tools_node(state: AgentState) -> dict:
         messages, seen, used = list(state["messages"]), dict(state.get("seen", {})), list(state.get("used", []))
-        for call_id, name, arguments in state["calls"]:
-            try:
-                result = run_tool(name, json.loads(arguments or "{}"))
-                output = result.output
-                used.append({"name": name, "ok": True})
-                for card in result.cards:
-                    seen[card["listing_id"]] = card
-            except (tool_error, json.JSONDecodeError) as exc:
-                used.append({"name": name, "ok": False})   # bad arguments go back so the model can correct itself
-                output = {"error": str(exc)}
-            except Exception:
-                if log:
-                    log.exception("tool %s failed", name)
-                used.append({"name": name, "ok": False})
-                output = {"error": "That lookup failed."}
+        calls = list(state["calls"] or [])
+        # Same outputs as sequential; run independent tool calls together to cut wait time.
+        if len(calls) <= 1:
+            results = [_run_one(*calls[0])] if calls else []
+        else:
+            workers = min(len(calls), 4)
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                results = list(pool.map(lambda item: _run_one(*item), calls))
+        for call_id, name, output, cards, ok in results:
+            used.append({"name": name, "ok": ok})
+            for card in cards:
+                seen[card["listing_id"]] = card
             messages.append({"role": "tool", "tool_call_id": call_id,
                              "content": json.dumps(_compact(output), default=str,
                                                    separators=(",", ":"))[:max_tool_json]})
