@@ -1,4 +1,5 @@
 import asyncio
+from collections import Counter
 import contextvars
 import os
 import re
@@ -16,6 +17,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from app.listings.agent import ListingAgent, ListingsUnavailable
+from app.listings.tools import _find_projects, top_areas_by_sales
 from app.listings.router import is_rent_question
 from app.llm.client import LLMQueueTimeoutError
 from app.answers.spoken import MAX_FACT_CHARS, start_spoken_reply
@@ -594,7 +596,7 @@ def print_entity_resolution(entity):
 # FRONTEND-READY RESPONSE FORMATTER
 # =========================================================
 
-from app.answers.area_comparison import build_area_comparison, parse_area_comparison
+from app.answers.area_comparison import build_area_comparison, looks_like_comparison, market_signals, mentioned_area, official_area, parse_area_comparison
 from app.answers.structured_answer import (
     _SMALL_TALK_KINDS,
     _STARTER_CHIPS,
@@ -784,6 +786,20 @@ def _drop_repeated_name_lines(text, names):
     return "\n".join(kept)
 
 
+# Everything in a document request except the project name.
+_DOC_WORDS = re.compile(
+    r"\b(?:uh+|um+|okay|ok|please|can|could|would|you|i|we|get|send|share|give|show|open|me|us|the|a|an|of|for|"
+    r"to|about|its|it|project|brochures?|floor ?plans?|pdfs?|documents?|catalog(?:ue)?s?)\b|['’]s\b|[?.!,]",
+    re.I,
+)
+_INVEST_ASK = re.compile(
+    r"\b(?:invest\w*|should i (?:buy|get)|worth (?:it|buying|investing)|good (?:buy|deal)|roi|yields?|returns?|"
+    r"appreciat\w*|capital growth|price growth)\b",
+    re.I,
+)
+_DOC_ASK = re.compile(r"\b(?:brochures?|floor ?plans?|pdfs?|documents?|catalog(?:ue)?s?)\b", re.I)
+
+
 async def _try_agent_turn(question, components, timing_ms, ask_started):
     """Answer with the agent, or return None so the standard pipeline answers."""
 
@@ -870,13 +886,48 @@ async def _try_agent_turn(question, components, timing_ms, ask_started):
     structured_summary["projects"] = projects
     structured_summary["listings"] = listings
     timing_ms["agent"] = _elapsed_ms(started)
+    # "Tell me about JVC": no cards, so show the community the answer is about.
+    # "Should I buy in JVC?": the same community, with its market signals from sales and rent records.
+    investing = bool(_INVEST_ASK.search(question or ""))
+    # A question weighing places ("JVC or Downtown?") never gets a single community card.
+    if (investing or (not projects and not listings)) and not looks_like_comparison(question):
+        area = mentioned_area(question)
+        if not area and investing and projects:
+            area = Counter(str(row.get("community") or "") for row in projects).most_common(1)[0][0] or None
+        official = await asyncio.to_thread(official_area, area) if area else None
+        if official:
+            community = {"name": area, "official_area": official}
+            if investing:
+                community["focus"] = "investment"
+                community["signals"] = await asyncio.to_thread(market_signals, official)
+            structured_summary["community"] = [community]
+    # "Which area has the most sales?": the ranked areas go to the screen as a list.
+    if "area_sales" in used:
+        ranked = await asyncio.to_thread(top_areas_by_sales, 8)
+        structured_summary["community"] = [
+            {"name": row["area"], "official_area": row["official_area"], "focus": "ranking", "ranking": row}
+            for row in ranked
+        ]
+    # The agent sometimes only searches brochure text and returns no project: look the project up by name.
+    if _DOC_ASK.search(question or "") and not any(row.get("brochure_url") for row in projects):
+        name = re.sub(r"\s+", " ", _DOC_WORDS.sub(" ", question or "")).strip(" ?.!,")
+        rows = await asyncio.to_thread(_find_projects, name) if name else []
+        if len(rows) == 1:
+            projects.append(rows[0])
+    # "Send me the brochure": the projects' brochure links go to the screen as documents.
+    documents = [
+        {"id": row.get("id"), "document_title": f"{row.get('name') or 'Project'} brochure",
+         "document_type": "Brochure", "document_url": row["brochure_url"]}
+        for row in projects
+        if row.get("brochure_url")
+    ] if _DOC_ASK.search(question or "") else []
 
     return {
         "question": question,
         "standalone_question": question,
         "question_type": question_type,
         "structured_summary": structured_summary,
-        "documents": [],
+        "documents": documents,
         "investment_analysis": None,
         "retrieval_result": {
             "question_type": question_type,
@@ -886,7 +937,7 @@ async def _try_agent_turn(question, components, timing_ms, ask_started):
                 "sub_communities": [],
                 "listings": listings,
             },
-            "documents": [],
+            "documents": documents,
         },
         "rag_chain": components["rag_chain"],
         "conversation_memory": components["conversation_memory"],
@@ -967,7 +1018,7 @@ async def _prepare_acot_turn(
         history.append({"role": "assistant", "content": compared})
         del history[:-12]
         # Build comparison_entities from area facts so the frontend renders cards.
-        from app.answers.area_comparison import _facts as _area_facts
+        from app.answers.area_comparison import _beds_text, _facts as _area_facts
         _area_comparison_entities = []
         if areas:
             for _area_name in areas:
@@ -985,6 +1036,15 @@ async def _prepare_acot_turn(
                         "rent_median": _f.get("rent_median"),
                         "projects_count": _f.get("projects"),
                         "listings_count": _f.get("listings"),
+                        # Shown as extra rows in the app's comparison table.
+                        "area_facts": {
+                            "projects": _f.get("projects"),
+                            "median_price": _f.get("median_price"),
+                            "handover_year": (_f.get("top_year") or {}).get("year"),
+                            "bedrooms": _beds_text(_f["beds"]) if _f.get("beds") else None,
+                            "rentals": _f.get("listings"),
+                            "rent_median": _f.get("rent_median"),
+                        },
                     }
                     _area_comparison_entities.append({
                         "entity_type": "community",
@@ -1533,7 +1593,8 @@ async def stream_acot(
     # per request (which interleaved output across concurrent requests).
     early = {}
     hook_token = None
-    if mode == "voice":
+    # Document and investment requests wait for the full result: brochures and market signals are added after the agent.
+    if mode == "voice" and not _DOC_ASK.search(question or "") and not _INVEST_ASK.search(question or ""):
         loop = asyncio.get_running_loop()
 
         def start_early(tool_outputs):

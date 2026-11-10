@@ -209,3 +209,40 @@ def test_spoken_facts_drop_amenity_codes():
     ))
     assert "PR" not in facts and "SE" not in facts
     assert "Private Parking" in facts and "Steam Room" in facts
+
+
+def test_spoken_prompt_summarises_comparisons():
+    prompt = build_spoken_prompt("compare these two", "- facts")
+    assert "comparison is on their screen" in prompt
+    assert "Do not go through every detail" in prompt
+
+
+def test_spoken_facts_list_documents_on_screen():
+    prepared = prepared_with(fast_answer="Here is the brochure.")
+    prepared["documents"] = [{"document_title": "Damac Bay brochure", "document_url": "https://example.com/b.pdf"}]
+    assert "Documents shown on screen as links: Damac Bay brochure" in spoken_facts(prepared)
+    assert "Documents shown" not in spoken_facts(prepared_with(fast_answer="x"))
+
+
+def test_document_request_keeps_only_the_project_name():
+    for question, name in [
+        ("Can I get the Damac Bay brochure?", "Damac Bay"),
+        ("Send me the floor plan for Sobha One please", "Sobha One"),
+        ("Sobha One's brochure", "Sobha One"),
+    ]:
+        assert run._DOC_ASK.search(question)
+        assert run.re.sub(r"\s+", " ", run._DOC_WORDS.sub(" ", question)).strip(" ?.!,") == name
+
+
+def test_spoken_facts_put_market_signals_first():
+    prepared = prepared_with(fast_answer="Five projects.")
+    prepared["structured_summary"]["community"] = [{"name": "JVC", "signals": {"gross_yield_pct": 6.3}}]
+    facts = spoken_facts(prepared)
+    assert facts.startswith("- Market signals for JVC")
+    assert "isn't financial advice" in build_spoken_prompt("is JVC a good investment", facts)
+
+
+def test_area_sales_tool_is_offered_for_every_kind_of_question():
+    from app.listings.prompt import tools_for
+    for question in ("which area has the most sales?", "cheapest rentals in JVC", "off-plan projects to buy"):
+        assert "area_sales" in {t["function"]["name"] for t in tools_for(question)}
