@@ -28,6 +28,7 @@ _GROUPS = (
     ("listings", "listings"),
     ("community", "communities"),
     ("sub_communities", "sub-communities"),
+    ("brokers", "agents"),
 )
 
 
