@@ -261,6 +261,28 @@ def _format_project_card(record):
     }
 
 
+def _format_broker_card(record):
+    """Public DLD broker fields only. Email and phone are never copied."""
+    name = record.get("name") or record.get("name_en")
+    photos = []
+    photo = record.get("photo_url")
+    if isinstance(photo, str) and photo.strip():
+        photos = [photo.strip()]
+    return {
+        "id": _json_safe(record.get("id") or record.get("brn")),
+        "brn": _json_safe(record.get("brn") or record.get("id")),
+        "name": name,
+        "agency_name": record.get("agency_name"),
+        "card_rank": record.get("card_rank"),
+        "orn": record.get("orn"),
+        "license_number": record.get("license_number"),
+        "awards_count": _json_safe(record.get("awards_count")),
+        "card_expiry_date": _json_safe(record.get("card_expiry_date")),
+        "office_rank": record.get("office_rank"),
+        "photos": _json_safe(photos),
+    }
+
+
 def _format_community_card(record):
     """
     Convert a community database row into a frontend-friendly card.
@@ -864,9 +886,13 @@ def _detect_response_type(
         []
     )
     listings = structured_summary.get("listings") or []
+    brokers = structured_summary.get("brokers") or []
 
     if structured_summary.get("comparison"):
         return "comparison"
+
+    if brokers and not listings and not (projects or []):
+        return "broker_list"
 
     if question_type == "information" and len(listings) + len(projects or []) == 1:
         return "fact"
@@ -974,6 +1000,12 @@ def build_frontend_response(
         if isinstance(listing, dict)
     ]
 
+    formatted_brokers = [
+        _format_broker_card(broker)
+        for broker in (structured_summary.get("brokers") or [])
+        if isinstance(broker, dict)
+    ]
+
     response_type = _detect_response_type(
         question,
         question_type,
@@ -991,6 +1023,7 @@ def build_frontend_response(
             "communities": formatted_communities,
             "projects": formatted_projects,
             "listings": formatted_listings,
+            "brokers": formatted_brokers,
             "sub_communities": formatted_sub_communities,
             "documents": formatted_documents,
             "investment_analysis": _json_safe(
@@ -1003,6 +1036,7 @@ def build_frontend_response(
                 "communities": len(formatted_communities),
                 "projects": len(formatted_projects),
                 "listings": len(formatted_listings),
+                "brokers": len(formatted_brokers),
                 "sub_communities": len(
                     formatted_sub_communities
                 ),
