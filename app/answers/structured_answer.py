@@ -291,6 +291,11 @@ def _format_community_card(record):
     return {
         "id": _json_safe(record.get("id")),
         "name": record.get("name"),
+        # The sales-data name the app's community pages use (Dubai Marina -> MARSA DUBAI).
+        "official_area": record.get("official_area"),
+        "focus": record.get("focus"),
+        "signals": _json_safe(record.get("signals")),
+        "ranking": _json_safe(record.get("ranking")),
         "slug": record.get("slug"),
         "city": record.get("city"),
         "location": {
@@ -507,6 +512,7 @@ def _side_snapshot(name, records):
         "sales_count": _median(sales_counts),
         "photo": photo,
         "link": link,
+        "area_facts": records[0].get("area_facts") if len(records) == 1 else None,
     }
 
 
@@ -739,6 +745,7 @@ def _comparison_card(side):
         "property_finder_url": side.get("link"),
         "handover_time": _handover_label(side.get("handover")),
         "status": f"{side['score']}%" if side.get("score") is not None else None,
+        "area_facts": side.get("area_facts"),
     }
 
 
@@ -915,6 +922,10 @@ def _detect_response_type(
         if not projects:
             return "investment_analysis"
 
+    # The agent marks a turn as a comparison when it used compare_projects.
+    if question_type == "comparison" and len(projects) >= 2:
+        return "project_comparison"
+
     if any(
         phrase in question_lower
         for phrase in (
@@ -922,7 +933,10 @@ def _detect_response_type(
             "comparison",
             "difference between",
             "vs ",
-            " versus "
+            " versus ",
+            "which is better",
+            "which one is better",
+            "better option",
         )
     ) and len(projects) >= 2:
         return "project_comparison"

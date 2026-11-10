@@ -464,7 +464,7 @@ def health_check():
     return {
         "status": "ok",
         "service": "ACOT",
-        "message": "ACOT FastAPI backend is running."
+        "message": "ACOT FastAPI backend is running. cheppra "
     }
 
 

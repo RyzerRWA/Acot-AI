@@ -45,6 +45,11 @@ def spoken_facts(prepared):
     """What the spoken reply may talk about: counts, top names and the on-screen answer."""
     summary = prepared.get("structured_summary") or {}
     lines = []
+    # Investment questions: the market signals come first so the reply is built around them.
+    for community in summary.get("community") or []:
+        signals = community.get("signals") if isinstance(community, dict) else None
+        if signals:
+            lines.append(f"- Market signals for {community.get('name')} (sales and rent records, shown on screen): {signals}")
     for key, label in _GROUPS:
         items = summary.get(key) or []
         if not isinstance(items, list) or not items:
@@ -54,6 +59,9 @@ def spoken_facts(prepared):
         if names:
             line += f" (first ones: {', '.join(names)})"
         lines.append(line)
+    titles = [str(d.get("document_title") or d.get("title") or "") for d in (prepared.get("documents") or []) if isinstance(d, dict)]
+    if any(titles):
+        lines.append(f"- Documents shown on screen as links: {', '.join(t for t in titles if t)}")
     if summary.get("filter_no_match"):
         lines.append("- Nothing matched the user's exact filters.")
 
@@ -113,6 +121,7 @@ Rules:
 - First work out exactly what was asked, and answer only that:
   - One detail (like the property type, price, handover, bedrooms, amenities, location or developer of a project): answer it first and fully, then add ONE closely related fact the user would likely want next, in 1 to 2 natural sentences. For example: "It's an apartment project, with studios up to three-bedroom units starting from about 618 thousand dirhams." Not a full overview, and no follow-up question.
   - A broad question ("show me projects in JVC", "tell me about a project"): 2 to 4 short sentences, about 60 words at most.
+  - A comparison of projects or areas ("compare A and B", "A vs B"): 2 to 3 short sentences with the two or three biggest differences (like price, handover or size) and which suits what kind of buyer, then say the full comparison is on their screen. Do not go through every detail.
 - If the user corrects themselves mid-sentence ("how many... sorry, what is the property type"), answer only the last thing they asked.
 - Sound like a friendly person chatting on a call, not a report: warm, relaxed and human.
   - Use contractions ("it's", "there's", "you'll") and short, easy sentences.
@@ -122,6 +131,8 @@ Rules:
 - Say numbers the way people speak: "about 1.2 million dirhams", "around 7 percent". No sqft lists, IDs, links, markdown, emojis, bullet points or tables.
 - Never say a two-letter amenity code. Say only the amenity name, for example "private parking", not "P R" or "PR private parking".
 - Point to the screen for the details, for example "I've put them all on your screen".
+- If the facts include market signals (an investment question), you must build the reply on them: say how the price per sq ft moved over the last year and the rough rental yield, in plain words ("prices are up about 3 percent on last year, and rents work out to roughly 6 percent a year"). Then say the details are on screen and end with "this isn't financial advice". Never tell them to buy or not to buy.
+- If the user asks for a brochure, floor plan or other document, never read it out. If the facts list documents shown on screen, say you've put the brochure on their screen. If none is listed, say you couldn't find one for that project.
 - For broad questions you may end with one short, friendly follow-up question.
 - If the user's message is only a greeting, thanks, or sounds cut off or unfinished (for example "Hello. So, uh,"), do not talk about search results or listings: reply in one short, warm sentence and ask what they would like to know about Dubai property.
 - Otherwise use only the facts below, and never add details that are not in them (no guessed amenities, prices or dates). If a real search found nothing, say so kindly and suggest widening the search or a nearby area.

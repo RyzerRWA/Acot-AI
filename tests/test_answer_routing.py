@@ -133,6 +133,15 @@ def test_investment_answer_with_projects_shows_cards():
     ) == "investment_analysis"
 
 
+def test_agent_comparison_shows_comparison_even_without_compare_words():
+    # The agent sets question_type "comparison" when it used compare_projects.
+    question = "Which is better for a family, Serenz or Sobha One?"
+    assert _detect_response_type(question, "comparison", _summary()) == "project_comparison"
+    assert _detect_response_type(question, "search", _summary()) == "project_comparison"
+    one = _summary(projects=_projects()[:1])
+    assert _detect_response_type(question, "comparison", one) != "project_comparison"
+
+
 def test_price_follow_up_is_written_information():
     question = (
         "What are the starting prices of the projects in "
@@ -846,6 +855,25 @@ def test_two_area_comparison_is_built_without_a_model(monkeypatch):
     assert ac.parse_area_comparison("marina vs jvc") == ("Dubai Marina", "Jumeirah Village Circle")
     assert ac.parse_area_comparison("what is the difference between Business Bay and Downtown?") == (
         "Business Bay", "Downtown Dubai")
+    # what speech-to-text actually writes
+    assert ac.parse_area_comparison("Comparative Business Bay and Dubai, Marina.") == ("Business Bay", "Dubai Marina")
+    assert ac.parse_area_comparison("Compared Business Bay and Dubai Marina") == ("Business Bay", "Dubai Marina")
+    assert ac.parse_area_comparison("Uh, compare Business Bay and Dubai Marina.") == ("Business Bay", "Dubai Marina")
+    assert ac.parse_area_comparison("Compare business way and Dubai Marina.") == ("Business Bay", "Dubai Marina")
+    assert ac.parse_area_comparison("Compare those 2 like Dubai Marina and Business Bay.") == ("Dubai Marina", "Business Bay")
+    assert ac.parse_area_comparison("which is better for families, JVC or Downtown?") == ("Jumeirah Village Circle", "Downtown Dubai")
+    assert ac.parse_area_comparison("Dubai Marina and Business Bay") is None  # no comparison word
+    assert ac.parse_area_comparison("Which is the best for families? Is it, JBC or downtown?") == (
+        "Jumeirah Village Circle", "Downtown Dubai")
+    assert ac.looks_like_comparison("JVC or Downtown?")
+    assert not ac.looks_like_comparison("Should I buy in JVC or not?")
+    assert ac.parse_area_comparison("Okay so, marina vs jvc") == ("Dubai Marina", "Jumeirah Village Circle")
+    assert ac.parse_area_comparison("comparison between Dubai Marina and Business Bay") == ("Dubai Marina", "Business Bay")
+    # "Tell me about JVC": exactly one known area named
+    assert ac.mentioned_area("Tell me about JVC") == "Jumeirah Village Circle"
+    assert ac.mentioned_area("how is the marina for families?") == "Dubai Marina"
+    assert ac.mentioned_area("marina vs jvc") is None
+    assert ac.mentioned_area("Tell me about Sobha One") is None
     # developers, projects and the same area twice are not area comparisons
     assert ac.parse_area_comparison("Compare Sobha and Damac") is None
     assert ac.parse_area_comparison("Compare Dubai Marina and Dubai Marina") is None

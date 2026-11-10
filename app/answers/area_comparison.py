@@ -9,6 +9,7 @@ profile rows. The conclusion is written from the numbers and never claims a yiel
 from __future__ import annotations
 
 import re
+from difflib import get_close_matches
 
 from app.database.postgres import fetch
 from app.listings.tools import ALIASES, area_stats, market_stats
@@ -49,10 +50,23 @@ PROFILES = {
 _PROFILE_LOWER = {name.lower(): name for name in PROFILES}
 
 _COMPARE = (
-    re.compile(r"^\s*(?:please\s+)?(?:can you\s+)?compar(?:e|ing|ison of)\s+(.+?)\s+(?:and|with|to|vs\.?|versus|&)\s+(.+?)\s*[?.!]*$", re.I),
+    re.compile(r"^\s*(?:please\s+)?(?:can you\s+)?compar(?:e|ed|ing|ative|ison(?:\s+of)?)(?:\s+between)?\s+(.+?)\s+(?:and|with|to|vs\.?|versus|&)\s+(.+?)\s*[?.!]*$", re.I),
     re.compile(r"^\s*(?:what(?:'s| is)\s+)?(?:the\s+)?difference between\s+(.+?)\s+and\s+(.+?)\s*[?.!]*$", re.I),
     re.compile(r"^\s*(.+?)\s+(?:vs\.?|versus)\s+(.+?)\s*[?.!]*$", re.I),
 )
+# Spoken openers before the real question: "Uh, compare…", "Okay so, Marina vs JVC".
+_FILLER = re.compile(r"^\W*(?:(?:uh+|um+|erm|hmm+|ah|so|okay|ok|well|hey|hi|acot|now|and|also|right)\b[\s,.!]*)+", re.I)
+_COMPARE_WORD = re.compile(r"\b(?:compar\w*|vs|versus|difference between|better|best|or)\b", re.I)
+# Speech-to-text slips for short names that the speech hints don't always fix.
+_SPOKEN_SLIPS = {"jbc": "Jumeirah Village Circle"}
+
+
+_COMPARE_STRICT = re.compile(r"\b(?:compar\w*|vs|versus|difference between)\b", re.I)
+
+
+def looks_like_comparison(question: str) -> bool:
+    """"Compare…", "A vs B", or two areas named: the question weighs places against each other."""
+    return bool(_COMPARE_STRICT.search(question or "")) or len(areas_in(question)) >= 2
 _TRAILING = re.compile(r"\s+(?:for|in terms of|regarding|as|when it comes to|on)\s+.*$", re.I)
 
 _names: dict[str, str] | None = None
@@ -70,6 +84,8 @@ def _known_areas() -> dict[str, str]:
 
 def _resolve(text: str) -> str | None:
     text = re.sub(r"\s+", " ", _TRAILING.sub("", text or "")).strip(" ?.!,'\"")
+    # Speech-to-text can add commas inside a name ("Dubai, Marina").
+    text = re.sub(r"\s*,\s*", " ", text)
     text = re.sub(r"^the\s+", "", text, flags=re.I)
     text = re.sub(r"\s+(?:area|community|neighbourhood|neighborhood)$", "", text, flags=re.I)
     known = _known_areas()
@@ -81,18 +97,103 @@ def _resolve(text: str) -> str | None:
         for name in (alias.lower() if alias else None, key, f"dubai {key}"):
             if name and name in known:
                 return known[name]
-    return None
+    # Speech-to-text slips: "business way" for Business Bay. Only near-identical names count.
+    close = get_close_matches(text.lower().strip(), list(known), n=1, cutoff=0.88)
+    return known[close[0]] if close else None
+
+
+def areas_in(question: str) -> list[str]:
+    """Known areas named in a question, in the order they appear; a name inside a longer one doesn't count."""
+    text = f" {re.sub(r'[^a-z0-9]+', ' ', (question or '').lower())} "
+    known = _known_areas()
+    keys = {**known, **{alias: known[proper.lower()] for alias, proper in {**ALIASES, **_SPOKEN_SLIPS}.items()
+                        if proper.lower() in known}}
+    spans = []
+    for key, proper in keys.items():
+        if len(key) > 2:
+            for m in re.finditer(rf"(?<= ){re.escape(key)}(?= )", text):
+                spans.append((m.start(), m.end(), proper))
+    # "jumeirah village circle" also contains "jumeirah": keep the longest match only.
+    kept = [s for s in spans if not any(o[0] <= s[0] and s[1] <= o[1] and (o[1] - o[0]) > (s[1] - s[0]) for o in spans)]
+    ordered = []
+    for _, _, proper in sorted(kept):
+        if proper not in ordered:
+            ordered.append(proper)
+    return ordered
+
+
+def mentioned_area(question: str) -> str | None:
+    """The one known area a question names ("tell me about JVC"), else None."""
+    hits = areas_in(question)
+    return hits[0] if len(hits) == 1 else None
+
+
+_official: dict[str, str | None] = {}
+
+
+def official_area(name: str) -> str | None:
+    """The sales-data area for a popular name: Dubai Marina -> MARSA DUBAI, JVC -> AL BARSHA SOUTH FOURTH."""
+    # shortcut: cached per process, about 1.5 s on first use of a name; precompute the map if it gets slow.
+    if name not in _official:
+        rows = fetch(
+            "select coalesce((select area from public.propai_area_stats where upper(area) = upper(%s)),"
+            " (select area_name_prop_ai from public.propai_sales where upper(master_project_prop_ai) = upper(%s)"
+            " group by 1 order by count(*) desc limit 1)) as area",
+            (name, name),
+        )
+        _official[name] = rows[0]["area"] if rows else None
+    return _official[name]
+
+
+_signals: dict[str, dict | None] = {}
+
+
+def market_signals(official: str) -> dict | None:
+    """Price trend, sales activity and a rough gross yield for one sales-data area, from the last 24 months."""
+    # shortcut: cached per process until restart; add an expiry if the AI runs for days.
+    if official not in _signals:
+        rows = fetch(
+            "with s as (select instance_date, price_per_sqft from public.propai_sales"
+            " where upper(area_name_prop_ai) = upper(%s) and deleted_at is null and coalesce(outlier_flag,'') <> 'True'"
+            " and instance_date between current_date - interval '24 months' and current_date),"
+            " cur as (select * from s where instance_date >= current_date - interval '12 months'),"
+            " prev as (select * from s where instance_date < current_date - interval '12 months')"
+            " select (select count(*)::int from cur) as sales, (select count(*)::int from prev) as prev_sales,"
+            " (select percentile_cont(0.5) within group (order by price_per_sqft)::float8 from cur where price_per_sqft > 0) as psf,"
+            " (select percentile_cont(0.5) within group (order by price_per_sqft)::float8 from prev where price_per_sqft > 0) as prev_psf,"
+            " (select median_price::float8 from public.propai_area_stats where upper(area) = upper(%s)) as median_price,"
+            " (select median_rent::float8 from public.propai_area_stats where upper(area) = upper(%s)) as median_rent",
+            (official, official, official),
+        )
+        r = rows[0] if rows else {}
+        change = lambda now, before: round(100 * (now - before) / before, 1) if now and before else None
+        _signals[official] = {
+            "price_psf": round(r["psf"]) if r.get("psf") else None,
+            "price_psf_change_pct": change(r.get("psf"), r.get("prev_psf")),
+            "sales_12m": r.get("sales"),
+            "sales_change_pct": change(r.get("sales"), r.get("prev_sales")),
+            # Median yearly rent over median sale price: different homes on each side, so only a rough guide.
+            "gross_yield_pct": round(100 * r["median_rent"] / r["median_price"], 1)
+            if r.get("median_rent") and r.get("median_price") else None,
+        } if r.get("sales") else None
+    return _signals[official]
 
 
 def parse_area_comparison(question: str) -> tuple[str, str] | None:
     """The two area names when the question compares two known areas, else None (the agent handles it)."""
+    question = _FILLER.sub("", question or "")
     for pattern in _COMPARE:
-        match = pattern.match(question or "")
+        match = pattern.match(question)
         if match:
             first, second = _resolve(match.group(1)), _resolve(match.group(2))
             if first and second and first != second:
                 return first, second
-            return None
+            break
+    # Spoken questions add words around the names: "compare those 2 like Dubai Marina and Business Bay".
+    if _COMPARE_WORD.search(question):
+        named = areas_in(question)
+        if len(named) == 2:
+            return named[0], named[1]
     return None
 
 
