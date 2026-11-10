@@ -9,13 +9,17 @@ from app.retrieval.hybrid.question_text import (
 from run import (
     _build_comparison,
     _build_fast_structured_answer,
+    _broker_band,
+    _broker_turn,
     _classify_small_talk,
     _detect_response_type,
     _followup_questions,
     _is_fast_structured_question,
+    _format_brokers,
     _format_transactions,
     _listing_question,
     _compare_shown_turn,
+    _project_is_full,
     _shortlist_recommend_turn,
     _shown_project_followup,
     _transaction_subject,
@@ -890,3 +894,263 @@ def test_two_area_comparison_is_built_without_a_model(monkeypatch):
     assert "Business Bay has more projects for sale (15 against 1)" in answer
     assert "no yield" in answer
     assert "Summary:" in answer
+
+
+def _broker_rows():
+    return [
+        {
+            "id": "1001",
+            "brn": "1001",
+            "name": "Amal Khan",
+            "agency_name": "Horizon Realty",
+            "card_rank": "Gold",
+            "license_number": "L-1",
+            "card_expiry_date": "2027-06-01",
+            "awards_count": 4,
+        },
+        {
+            "id": "1002",
+            "brn": "1002",
+            "name": "Sara Nair",
+            "agency_name": "Creek Homes",
+            "card_rank": "Silver",
+            "license_number": "L-2",
+            "card_expiry_date": "2026-12-01",
+            "awards_count": 1,
+        },
+    ]
+
+
+def test_public_broker_omits_contact_fields():
+    from app.retrieval.propai_catalog import _BROKER_COLUMNS, _BROKER_PUBLIC, _public_broker
+
+    assert "email" not in _BROKER_COLUMNS
+    assert "mobile" not in _BROKER_COLUMNS
+    assert "landline" not in _BROKER_COLUMNS
+    shown = _public_broker({
+        "brn": "689",
+        "name_en": "Test Broker",
+        "agency_name": "Acme",
+        "email": "hidden@example.com",
+        "mobile": "+971500000000",
+        "landline": "+97140000000",
+        "card_rank": "Gold",
+        "card_expiry_date": "2027-06-01",
+        "awards_count": 2,
+    })
+    blob = str(shown).lower()
+    assert "email" not in shown
+    assert "mobile" not in shown
+    assert "landline" not in shown
+    assert "hidden@" not in blob
+    assert shown["name"] == "Test Broker"
+    assert shown["brn"] == "689"
+    assert set(shown) == set(_BROKER_PUBLIC)
+
+
+def test_broker_turn_lists_top_brokers(monkeypatch):
+    rows = _broker_rows()
+    monkeypatch.setattr(
+        "app.retrieval.propai_catalog.list_brokers",
+        lambda **kwargs: rows[: kwargs.get("limit", 8)],
+    )
+    turn = _broker_turn("Show me brokers", None)
+    assert turn is not None
+    assert turn["use_fast"] is True
+    assert "Amal Khan" in turn["fast_answer"]
+    assert "Sara Nair" in turn["fast_answer"]
+    assert "broker" not in turn["fast_answer"].lower()
+    assert "licensed agents" in turn["fast_answer"].lower()
+    assert 1 <= len(turn["structured_summary"]["brokers"]) <= 8
+    assert "email" not in str(turn["structured_summary"]["brokers"]).lower()
+    assert _broker_turn("Show me projects in Business Bay", None) is None
+    assert _broker_turn("Show me agents", None) is not None
+
+
+def test_broker_turn_does_not_fake_nationality_or_gender(monkeypatch):
+    called = []
+
+    def fake_list(**kwargs):
+        called.append(kwargs)
+        return _broker_rows()[: kwargs.get("limit", 8)]
+
+    monkeypatch.setattr("app.retrieval.propai_catalog.list_brokers", fake_list)
+    indian = _broker_turn("Show me indian brokers", None)
+    assert indian is not None
+    assert indian["use_fast"] is True
+    assert called == []
+    assert indian["structured_summary"]["brokers"] == []
+    assert "nationality" in indian["fast_answer"].lower()
+    assert "broker" not in indian["fast_answer"].lower()
+    assert "Indian" in indian["fast_answer"]
+
+    mixed = _broker_turn("indian female and male brokers", None)
+    assert mixed is not None
+    assert called == []
+    assert mixed["structured_summary"]["brokers"] == []
+    assert "broker" not in mixed["fast_answer"].lower()
+
+    follow = _broker_turn("only indian female", None)
+    assert follow is not None
+    assert called == []
+    assert "female" in follow["fast_answer"].lower()
+
+
+def test_broker_followup_uses_the_community_on_screen(monkeypatch):
+    class _Memory:
+        active_candidates = [
+            {
+                "name": "Serenz",
+                "entity_type": "project",
+                "community": "Jumeirah Village Circle",
+            },
+            {
+                "name": "Azizi Ruby",
+                "entity_type": "project",
+                "community": "Jumeirah Village Circle",
+            },
+        ]
+
+    captured = {}
+
+    def fake_list(**kwargs):
+        captured.update(kwargs)
+        return _broker_rows()[: kwargs.get("limit", 5)]
+
+    monkeypatch.setattr("app.retrieval.propai_catalog.list_brokers", fake_list)
+    memory = _Memory()
+    turn = _broker_turn(
+        "Tell me the top brokers for Jumeirah Village Circle",
+        memory,
+    )
+    assert turn is not None
+    assert "Jumeirah Village Circle" in turn["fast_answer"]
+    assert "broker" not in turn["fast_answer"].lower()
+    assert "Here are licensed agents for Jumeirah Village Circle." in turn["fast_answer"]
+    assert captured.get("place") == "Jumeirah Village Circle"
+    assert captured.get("band") == "mid"
+    assert memory.active_candidates[0]["name"] == "Serenz"
+    assert turn["structured_summary"]["projects"] == []
+    text = _format_brokers(_broker_rows(), label="Jumeirah Village Circle")
+    assert "**Amal Khan**" in text
+    assert "BRN 1001" in text
+    assert "not exclusive" not in text.lower()
+
+
+def test_project_search_offers_broker_followup():
+    chips = _followup_questions({
+        "question": "Show me projects in Jumeirah Village Circle",
+        "question_type": "search",
+        "structured_summary": _summary(),
+    })
+    assert chips[0] == "Tell me the top agents for Jumeirah Village Circle"
+
+    one = _followup_questions({
+        "question": "Tell me about Serenz",
+        "question_type": "information",
+        "structured_summary": _summary(projects=[_projects()[0]]),
+    })
+    assert one[0] == "Tell me the top agents for Serenz"
+
+
+def test_broker_list_response_omits_contact_fields():
+    response = build_frontend_response(
+        question="Show me brokers",
+        standalone_question="Show me brokers",
+        answer="Here are the top-ranked licensed brokers in our DLD data:",
+        question_type="general",
+        structured_summary={
+            "brokers": [{
+                "brn": "689",
+                "name": "Amal Khan",
+                "agency_name": "Horizon Realty",
+                "card_rank": "Gold",
+                "email": "hidden@example.com",
+                "mobile": "+971500000000",
+            }],
+            "projects": [],
+            "listings": [],
+        },
+        documents=[],
+    )
+    assert response["response_type"] == "broker_list"
+    broker = response["data"]["brokers"][0]
+    assert broker["name"] == "Amal Khan"
+    assert "email" not in broker
+    assert "mobile" not in broker
+
+
+def test_full_project_data_uses_top_broker_band(monkeypatch):
+    class _Memory:
+        active_candidates = [{
+            "name": "Canal Crown",
+            "entity_type": "project",
+            "community": "Business Bay",
+            "price": 1_150_000,
+            "bedroom_min": 1,
+            "bedroom_max": 2,
+            "size_min": 700,
+            "size_max": 1100,
+            "handover_time": "2027-06-01",
+            "photos": ["https://example.com/p.jpg"],
+            "sales_count": 12,
+        }]
+
+    captured = {}
+
+    def fake_list(**kwargs):
+        captured.update(kwargs)
+        return _broker_rows()[: kwargs.get("limit", 5)]
+
+    monkeypatch.setattr("app.retrieval.propai_catalog.list_brokers", fake_list)
+    assert _project_is_full(_Memory.active_candidates[0]) is True
+    assert _broker_band(_Memory(), "Business Bay") == "top"
+    turn = _broker_turn("Tell me the top brokers for Business Bay", _Memory())
+    assert turn is not None
+    assert captured.get("band") == "top"
+    assert captured.get("place") == "Business Bay"
+
+
+def test_broker_rank_filter_uses_bound_params(monkeypatch):
+    from app.retrieval import propai_catalog as catalog
+
+    captured = {}
+
+    def fake_fetch(sql, params=()):
+        captured["sql"] = sql
+        captured["params"] = params
+        return []
+
+    monkeypatch.setattr(catalog, "fetch", fake_fetch)
+    catalog._broker_rows(ranks="top", limit=5)
+    assert "%five" not in captured["sql"]
+    assert captured["params"] == ("%five%star%", 5)
+    catalog._broker_rows(ranks="mid", limit=5)
+    assert "%four" not in captured["sql"]
+    assert captured["params"] == ("%four%star%", "%three%star%", 5)
+
+
+def test_seeded_broker_pick_varies_by_place():
+    from app.retrieval.propai_catalog import seeded_broker_pick
+
+    pool = [{"id": str(i), "brn": str(i), "name": f"Broker {i}"} for i in range(1, 21)]
+    jvc = seeded_broker_pick(pool, "Jumeirah Village Circle", 5, shuffle=False)
+    bay = seeded_broker_pick(pool, "Business Bay", 5, shuffle=False)
+    jvc_again = seeded_broker_pick(pool, "Jumeirah Village Circle", 5, shuffle=False)
+    assert [row["brn"] for row in jvc] == [row["brn"] for row in jvc_again]
+    assert [row["brn"] for row in jvc] != [row["brn"] for row in bay]
+    mid_jvc = seeded_broker_pick(pool, "Jumeirah Village Circle", 5, shuffle=True)
+    mid_bay = seeded_broker_pick(pool, "Business Bay", 5, shuffle=True)
+    assert [row["brn"] for row in mid_jvc] != [row["brn"] for row in mid_bay]
+
+
+def test_tools_for_keeps_search_brokers_on_broker_questions():
+    from app.listings.prompt import tools_for
+
+    names = {tool["function"]["name"] for tool in tools_for("Show me brokers")}
+    assert names == {"search_brokers", "update_profile"}
+    agents = {tool["function"]["name"] for tool in tools_for("Show me agents")}
+    assert agents == {"search_brokers", "update_profile"}
+    rent = {tool["function"]["name"] for tool in tools_for("apartments for rent in marina")}
+    assert "search_brokers" not in rent
+    assert "search_listings" in rent
