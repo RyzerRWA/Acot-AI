@@ -32,6 +32,13 @@ _EARLIER_ID = re.compile(r"\(id (P\d{12}|\d{1,12})\)")
 _NO_MATCH = re.compile(r'"matching_(?:projects|listings)":\s*0\b')
 NO_MATCH_LINE = ("NO EXACT MATCH: a search for the full request found nothing. Any results below are a fallback "
                  "(another filter, place or rentals instead), not what was asked.")
+# The app page a chat was started from ("Ask ACOT about this"). Fixed keys only: the app never sends free text here.
+PAGE_CONTEXT = {
+    "market": ("The user opened this chat from the Dubai market pulse page: the busiest areas by sales in the last "
+               "12 months, from Dubai Land Department records. Read vague questions (\"what stands out\", \"which "
+               "areas\", \"is it a good time\") as about the Dubai sales market over the last 12 months, and use "
+               "area_sales for them. A question that names something else wins."),
+}
 EARLIER_NAME = re.compile(r"(?:Shown: |; )([^;\]]+?) \(id (P\d{12}|\d{1,12})\)")
 
 
@@ -95,7 +102,7 @@ class ListingAgent:
         raise ListingsUnavailable(last)
 
     def answer(self, question: str, history: list[dict] | None = None, listing_id: str | None = None,
-               profile: dict | None = None, on_results=None) -> AgentResult:
+               profile: dict | None = None, on_results=None, page: str | None = None) -> AgentResult:
         """profile: what is known about the user. The update_profile tool writes into this same dict.
         on_results(tool_outputs): called once, from this thread, as soon as a search has returned records
         and before the model writes its answer, so voice mode can start speaking early."""
@@ -107,6 +114,8 @@ class ListingAgent:
                              "What is known about this user (from their own earlier messages or the app). Use it to "
                              "personalise, but never present it as something they just said, and if their question "
                              "conflicts with it, the question wins: " + json.dumps(profile, default=str)})
+        if page in PAGE_CONTEXT:
+            messages.append({"role": "system", "content": PAGE_CONTEXT[page]})
         if listing_id:
             messages.append({"role": "system", "content":
                              f'The user is looking at listing {listing_id}. "this one" or "is this fair" means that '

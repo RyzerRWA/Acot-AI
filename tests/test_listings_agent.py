@@ -503,3 +503,27 @@ class SessionStoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PageContextTests(unittest.TestCase):
+    """"Ask ACOT about this" on Market insights: the page the chat came from reaches the model."""
+
+    def _system_notes(self, page):
+        from types import SimpleNamespace as NS
+        agent = ListingAgent(client=object())
+        seen = []
+
+        def chat(messages, tools):
+            seen.extend(messages)
+            return "fake", NS(usage=NS(total_tokens=1), choices=[NS(message=NS(content="ok", tool_calls=None))])
+
+        agent._chat = chat
+        agent.answer("What stands out right now?", page=page)
+        return [m["content"] for m in seen if m["role"] == "system"]
+
+    def test_market_page_adds_a_note(self):
+        self.assertTrue(any("market pulse" in note for note in self._system_notes("market")))
+
+    def test_no_page_or_unknown_page_adds_nothing(self):
+        for page in (None, "anything else"):
+            self.assertFalse(any("market pulse" in note for note in self._system_notes(page)))

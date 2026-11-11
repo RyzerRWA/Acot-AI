@@ -1215,3 +1215,11 @@ def test_broker_question_with_a_place_is_not_read_as_a_name(monkeypatch):
     assert seen[0].get("name") is None
     assert seen[0].get("place") == "Jumeirah Village Circle"
     assert turn["fast_answer"] == "Here are licensed agents for Jumeirah Village Circle."
+
+
+def test_agency_question_goes_to_the_broker_cards():
+    # "tell me top agency JVC" used to fall through to the model, which listed every agent as text above the cards.
+    import run
+
+    assert run._BROKER.search("tell me top agency JVC")
+    assert run._BROKER.search("best real estate agencies in Dubai Marina")

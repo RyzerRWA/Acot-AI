@@ -806,7 +806,7 @@ def _transaction_turn(question, conversation_memory):
 
 
 _BROKER = re.compile(
-    r"\b(?:brokers?|agents?|licensed agents?|rera agents?|real[\s-]?estate agents?|top agents?)\b",
+    r"\b(?:brokers?|agents?|agenc(?:y|ies)|licensed agents?|rera agents?|real[\s-]?estate agents?|top agents?)\b",
     re.I,
 )
 _BROKER_NATIONALITIES = (
@@ -1558,7 +1558,7 @@ async def _try_agent_turn(question, components, timing_ms, ask_started):
     await llm._acquire_slot()
     try:
         result = await asyncio.to_thread(
-            agent.answer, question, list(history), None, profile, _agent_results_hook.get()
+            agent.answer, question, list(history), None, profile, _agent_results_hook.get(), components.get("page")
         )
     except LLMQueueTimeoutError:
         raise
