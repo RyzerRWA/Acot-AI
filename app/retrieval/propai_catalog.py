@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import random
 import re
 from datetime import datetime
 
@@ -571,6 +572,149 @@ def rent_summary(areas, beds_min=None, beds_max=None) -> dict | None:
         "median_annual_rent_aed": None if median is None else int(median),
         "note": "Registered rents from the new data since September 2025. Listing cards remain advertised asking rents.",
     }
+
+
+_BROKER_COLUMNS = (
+    "brn, name_en, agency_name, card_rank, card_rank_id, orn, license_number, "
+    "awards_count, card_expiry_date, photo_url, office_rank"
+)
+_BROKER_PUBLIC = (
+    "id", "brn", "name", "name_en", "agency_name", "card_rank", "orn",
+    "license_number", "awards_count", "card_expiry_date", "photo_url", "office_rank",
+)
+
+
+def _public_broker(row: dict) -> dict:
+    """Customer-facing broker fields. Email and phone stay out."""
+    expiry = row.get("card_expiry_date")
+    expiry_text = str(expiry)[:10] if expiry else None
+    name = str(row.get("name_en") or "").strip() or None
+    brn = str(row.get("brn") or "").strip()
+    awards = row.get("awards_count")
+    return {
+        "id": brn,
+        "brn": brn,
+        "name": name,
+        "name_en": name,
+        "agency_name": str(row.get("agency_name") or "").strip() or None,
+        "card_rank": str(row.get("card_rank") or "").strip() or None,
+        "orn": str(row.get("orn") or "").strip() or None,
+        "license_number": str(row.get("license_number") or "").strip() or None,
+        "awards_count": None if awards is None else int(awards),
+        "card_expiry_date": expiry_text,
+        "photo_url": str(row.get("photo_url") or "").strip() or None,
+        "office_rank": str(row.get("office_rank") or "").strip() or None,
+    }
+
+
+_BROKER_POOL = 80
+
+
+def _broker_rows(name=None, brn=None, brns=None, ranks=None, limit: int = 8) -> list[dict]:
+    parts = ["coalesce(name_en, '') <> ''", "(card_expiry_date is null or card_expiry_date >= current_date)"]
+    params: list = []
+    wanted = str(brn or "").strip()
+    if wanted:
+        parts.append("brn = %s")
+        params.append(wanted)
+    elif brns:
+        ids = [str(item).strip() for item in brns if str(item).strip()]
+        if not ids:
+            return []
+        parts.append("brn = any(%s)")
+        params.append(ids)
+    else:
+        text = str(name or "").strip()
+        if text:
+            if re.fullmatch(r"\d{3,12}", text):
+                parts.append("brn = %s")
+                params.append(text)
+            else:
+                parts.append("(name_en ilike %s or agency_name ilike %s)")
+                like = f"%{text}%"
+                params.extend([like, like])
+        if ranks == "top":
+            parts.append("lower(coalesce(card_rank, '')) like %s")
+            params.append("%five%star%")
+        elif ranks == "mid":
+            parts.append(
+                "(lower(coalesce(card_rank, '')) like %s "
+                "or lower(coalesce(card_rank, '')) like %s)"
+            )
+            params.extend(["%four%star%", "%three%star%"])
+    rows = fetch(
+        f"""
+        select {_BROKER_COLUMNS}
+        from propai_brokers
+        where {' and '.join(parts)}
+        order by card_rank_id desc nulls last, awards_count desc nulls last, brn
+        limit %s
+        """,
+        tuple([*params, limit]),
+    )
+    return rows or []
+
+
+def _place_seed(place: str) -> int:
+    return int(hashlib.sha256((place or "").strip().lower().encode()).hexdigest(), 16)
+
+
+def seeded_broker_pick(rows: list[dict], place: str | None, limit: int, shuffle: bool) -> list[dict]:
+    """Stable per place: same community keeps the same slice, another community shifts."""
+    public = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if "name_en" in row or "card_rank_id" in row:
+            public.append(_public_broker(row))
+        else:
+            public.append(dict(row))
+    if not public:
+        return []
+    cap = max(1, min(int(limit or 5), 10))
+    seed = _place_seed(place or "")
+    if shuffle:
+        picked = list(public)
+        random.Random(seed).shuffle(picked)
+        return picked[:cap]
+    if len(public) <= cap:
+        return public
+    start = seed % (len(public) - cap + 1)
+    return public[start:start + cap]
+
+
+def list_brokers(name=None, brn=None, limit: int = 8, place=None, band=None) -> list[dict]:
+    """Named lookup, or a place-seeded slice of Five Star (top) / 3-4 star (mid) brokers."""
+    cap = max(1, min(int(limit or 8), 10))
+    if name or brn:
+        rows = _broker_rows(name=name, brn=brn, limit=cap)
+        if rows or not str(name or "").strip() or brn:
+            return [_public_broker(row) for row in rows]
+        try:
+            from app.retrieval.propai_vector_search import search_propai
+            hits = search_propai(str(name).strip(), table="brokers", limit=cap)
+        except Exception:
+            return []
+        ids = [str(hit.get("brn") or "").strip() for hit in hits if hit.get("brn")]
+        if not ids:
+            return []
+        found = [_public_broker(row) for row in _broker_rows(brns=ids, limit=cap)]
+        by_id = {row["brn"]: row for row in found}
+        return [by_id[item] for item in ids if item in by_id][:cap]
+
+    pool = max(_BROKER_POOL, cap)
+    if band == "mid":
+        rows = _broker_rows(ranks="mid", limit=pool)
+        if not rows:
+            all_rows = _broker_rows(limit=pool)
+            rows = all_rows[len(all_rows) // 2:] or all_rows
+        return seeded_broker_pick(rows, place, cap, shuffle=True)
+    if band == "top" or place:
+        rows = _broker_rows(ranks="top", limit=pool)
+        if not rows:
+            rows = _broker_rows(limit=pool)
+        return seeded_broker_pick(rows, place, cap, shuffle=False)
+    return [_public_broker(row) for row in _broker_rows(limit=cap)]
 
 
 def sale_summary(communities) -> dict | None:

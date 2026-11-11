@@ -795,6 +795,304 @@ def _transaction_turn(question, conversation_memory):
     }
 
 
+_BROKER = re.compile(
+    r"\b(?:brokers?|agents?|licensed agents?|rera agents?|real[\s-]?estate agents?|top agents?)\b",
+    re.I,
+)
+_BROKER_NATIONALITIES = (
+    ("sri lankan", "Sri Lankan"),
+    ("pakistani", "Pakistani"),
+    ("filipino", "Filipino"),
+    ("emirati", "Emirati"),
+    ("egyptian", "Egyptian"),
+    ("iranian", "Iranian"),
+    ("lebanese", "Lebanese"),
+    ("british", "British"),
+    ("indian", "Indian"),
+    ("india", "Indian"),
+)
+_BROKER_FILTER_WORDS = re.compile(
+    r"\b(?:sri lankan|pakistani|pakistan|filipino|emirati|egyptian|iranian|lebanese|"
+    r"british|indian|india|nationality|nationalities|gender|female|male|"
+    r"women|woman|ladies|lady|men|man|both)\b",
+    re.I,
+)
+_BROKER_FILLER = re.compile(
+    r"\b(?:show|me|tell|find|list|the|top|best|licensed|rera|dubai|please|who|are|is|"
+    r"can|help|with|this|these|those|property|properties|project|projects|community|"
+    r"brokers?|agents?|real[\s-]?estate|for|in|at|of|only|just|from|"
+    r"sri lankan|pakistani|pakistan|filipino|emirati|egyptian|iranian|lebanese|"
+    r"british|indian|india|nationality|nationalities|gender|female|male|"
+    r"women|woman|ladies|lady|men|man|both)\b",
+    re.I,
+)
+_BROKER_PLACE = re.compile(
+    r"\b(?:for|in|at)\s+(.+?)$",
+    re.I,
+)
+
+
+def _broker_identity_filters(question):
+    """Nationality or gender the user asked for. DLD rows we store do not have these fields."""
+    text = question or ""
+    nationality = None
+    for needle, label in _BROKER_NATIONALITIES:
+        if re.search(rf"\b{re.escape(needle)}\b", text, re.I):
+            nationality = label
+            break
+    female = bool(re.search(r"\b(?:female|women|woman|ladies|lady)\b", text, re.I))
+    male = bool(re.search(r"\b(?:male|men|man)\b", text, re.I))
+    if female and male:
+        return nationality, None, True
+    if female:
+        return nationality, "female", False
+    if male:
+        return nationality, "male", False
+    return nationality, None, False
+
+
+def _broker_identity_unsupported(question) -> bool:
+    nationality, gender, _both = _broker_identity_filters(question)
+    return bool(nationality or gender)
+
+
+def _is_broker_question(question, conversation_memory=None) -> bool:
+    text = question or ""
+    if _TRANSACTION.search(text):
+        return False
+    if _BROKER.search(text):
+        return True
+    if not _BROKER_FILTER_WORDS.search(text):
+        return False
+    if asks_for_listings(text):
+        return False
+    if re.search(r"\b(?:projects?|listings?|communities?|developers?|handover|brochure)\b", text, re.I):
+        return False
+    return True
+
+
+def _broker_place(question, conversation_memory):
+    """Community or project a broker follow-up refers to."""
+    asked = (question or "").strip()
+    match = _BROKER_PLACE.search(asked)
+    if match:
+        place = match.group(1).strip(" .?")
+        place = re.split(
+            r"\b(?:and tell|tell me|please)\b",
+            place,
+            maxsplit=1,
+            flags=re.I,
+        )[0].strip(" .?")
+        place = " ".join(_BROKER_FILTER_WORDS.sub(" ", place).split()).strip(" .?")
+        if place:
+            return place
+    items = getattr(conversation_memory, "active_candidates", None) or []
+    communities = []
+    names = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("entity_type") or "project").lower() != "project":
+            continue
+        community = str(item.get("community") or "").strip()
+        name = str(item.get("name") or "").strip()
+        if community and community not in communities:
+            communities.append(community)
+        if name:
+            names.append(name)
+    if len(communities) == 1:
+        return communities[0]
+    if len(names) == 1:
+        return names[0]
+    return None
+
+
+def _broker_lookup(question, conversation_memory):
+    """Name or BRN to search, or None for the ranked list."""
+    leftover = _BROKER_FILLER.sub(" ", question or "")
+    leftover = re.sub(r"[^a-zA-Z0-9\s]", " ", leftover)
+    leftover = " ".join(leftover.split())
+    place = _broker_place(question, conversation_memory)
+    if place:
+        leftover = re.sub(
+            rf"\b{re.escape(place)}\b",
+            " ",
+            leftover,
+            flags=re.I,
+        )
+        leftover = " ".join(leftover.split())
+    if re.fullmatch(r"\d{3,12}", leftover or ""):
+        return None, leftover
+    if leftover and len(leftover) >= 3:
+        return leftover, None
+    return None, None
+
+
+def _broker_expiry(value):
+    text = str(value or "")[:10]
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").strftime("%b %Y")
+    except ValueError:
+        return text
+
+
+def _project_is_full(project) -> bool:
+    """Enough structured fields to send the highest-ranked brokers."""
+    if not isinstance(project, dict):
+        return False
+    has_price = bool(project.get("price"))
+    has_beds = project.get("bedroom_min") is not None or project.get("bedroom_max") is not None
+    size = project.get("size_sqft") if isinstance(project.get("size_sqft"), dict) else {}
+    has_size = (
+        project.get("size_min") is not None
+        or project.get("size_max") is not None
+        or size.get("min") is not None
+        or size.get("max") is not None
+    )
+    has_handover = bool(project.get("handover_time") or project.get("handover"))
+    photos = project.get("photos") or []
+    has_photo = isinstance(photos, list) and any(photos)
+    has_sales = bool(project.get("sales_count") or project.get("recent_sales_count"))
+    return bool(has_price and has_beds and has_size and has_handover and (has_photo or has_sales))
+
+
+def _shown_projects_for_place(conversation_memory, place=None):
+    items = getattr(conversation_memory, "active_candidates", None) or []
+    projects = [
+        item
+        for item in items
+        if isinstance(item, dict)
+        and str(item.get("entity_type") or "project").lower() == "project"
+        and item.get("name")
+    ]
+    if not place:
+        return projects
+    needle = str(place).strip().lower()
+    matched = [
+        project
+        for project in projects
+        if needle in str(project.get("community") or "").lower()
+        or needle in str(project.get("name") or "").lower()
+    ]
+    return matched or projects
+
+
+def _broker_band(conversation_memory, place=None) -> str:
+    projects = _shown_projects_for_place(conversation_memory, place)
+    if any(_project_is_full(project) for project in projects):
+        return "top"
+    return "mid"
+
+
+def _format_brokers(rows, label=None) -> str:
+    if not rows:
+        if label:
+            return f"I couldn't find licensed agents for {label} in our DLD data."
+        return "I couldn't find licensed agents in our DLD data."
+    if label:
+        lead = f"Here are licensed agents for {label}."
+    else:
+        lead = "Here are licensed agents in our DLD data:"
+    lines = [lead, ""]
+    for row in rows:
+        name = row.get("name") or row.get("name_en") or "Agent"
+        bits = []
+        if row.get("agency_name"):
+            bits.append(row["agency_name"])
+        if row.get("card_rank"):
+            bits.append(row["card_rank"])
+        if row.get("brn"):
+            bits.append(f"BRN {row['brn']}")
+        if row.get("license_number"):
+            bits.append(f"License {row['license_number']}")
+        expiry = _broker_expiry(row.get("card_expiry_date"))
+        if expiry:
+            bits.append(f"card until {expiry}")
+        if row.get("awards_count"):
+            bits.append(f"{int(row['awards_count'])} awards")
+        detail = " · ".join(str(bit) for bit in bits if bit)
+        lines.append(f"**{name}**")
+        if detail:
+            lines.append(detail)
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def _broker_turn(question, conversation_memory):
+    if not _is_broker_question(question, conversation_memory):
+        return None
+    from app.retrieval.propai_catalog import list_brokers
+    place = _broker_place(question, conversation_memory)
+    if _broker_identity_unsupported(question):
+        nationality, gender, _both = _broker_identity_filters(question)
+        wanted = []
+        if nationality:
+            wanted.append(nationality)
+        if gender:
+            wanted.append(gender)
+        label = " and ".join(wanted) if wanted else "nationality or gender"
+        answer = (
+            "Our DLD agent records don't include nationality or gender, "
+            f"so I can't show only {label} agents."
+        )
+        summary = _empty_structured_summary()
+        summary["brokers"] = []
+        summary["broker_followup"] = True
+        return {
+            "question": question,
+            "standalone_question": question,
+            "question_type": "general",
+            "structured_summary": summary,
+            "documents": [],
+            "investment_analysis": None,
+            "retrieval_result": {
+                "question_type": "general",
+                "structured_data": {"community": [], "projects": [], "sub_communities": []},
+                "documents": [],
+            },
+            "use_fast": True,
+            "fast_answer": answer,
+            "context": None,
+            "small_talk": None,
+        }
+    name, brn = _broker_lookup(question, conversation_memory)
+    follow_up = bool(place or re.search(r"\b(?:this|these|those|for)\b", question or "", re.I))
+    limit = 5 if follow_up else 8
+    band = _broker_band(conversation_memory, place) if follow_up and not name and not brn else None
+    rows = list_brokers(name=name, brn=brn, limit=limit, place=place, band=band)
+    if name and not rows:
+        rows = list_brokers(limit=limit, place=place, band=band)
+        label = place
+        answer = (
+            f'I couldn\'t find a licensed agent matching "{name}" in our DLD data. '
+            + _format_brokers(rows, label=label)
+        )
+    else:
+        answer = _format_brokers(rows, label=place)
+    summary = _empty_structured_summary()
+    summary["brokers"] = rows
+    summary["broker_followup"] = True
+    return {
+        "question": question,
+        "standalone_question": question,
+        "question_type": "general",
+        "structured_summary": summary,
+        "documents": [],
+        "investment_analysis": None,
+        "retrieval_result": {
+            "question_type": "general",
+            "structured_data": {"community": [], "projects": [], "sub_communities": []},
+            "documents": [],
+        },
+        "use_fast": True,
+        "fast_answer": answer,
+        "context": None,
+        "small_talk": None,
+    }
+
+
 _SHORTLIST_RECOMMEND = re.compile(
     r"\b(?:"
     r"which (?:one |of these |of those )?(?:is|are) (?:the )?best|"
@@ -1063,6 +1361,7 @@ def _empty_structured_summary():
         "projects": [],
         "sub_communities": [],
         "listings": [],
+        "brokers": [],
         "filter_no_match": False,
         "filter_evidence_projects": [],
     }
@@ -1191,9 +1490,13 @@ async def _try_agent_turn(question, components, timing_ms, ask_started):
     if not (result.answer or "").strip():
         return None
 
-    projects, listings, labels = [], [], {}
+    projects, listings, brokers, labels = [], [], [], {}
     for card in result.cards:
-        if card.get("kind") == "project":
+        if card.get("kind") == "broker":
+            row = card.get("row") or {}
+            brokers.append(row)
+            labels[card["listing_id"]] = row.get("name") or row.get("name_en") or "this agent"
+        elif card.get("kind") == "project":
             row = card["row"]
             projects.append(row)
             labels[card["listing_id"]] = row.get("name") or "this project"
@@ -1252,6 +1555,7 @@ async def _try_agent_turn(question, components, timing_ms, ask_started):
     structured_summary = _empty_structured_summary()
     structured_summary["projects"] = projects
     structured_summary["listings"] = listings
+    structured_summary["brokers"] = brokers
     timing_ms["agent"] = _elapsed_ms(started)
     # "Tell me about JVC": no cards, so show the community the answer is about.
     # "Should I buy in JVC?": the same community, with its market signals from sales and rent records.
@@ -1455,6 +1759,16 @@ async def _prepare_acot_turn(
         transaction_turn["rag_chain"] = rag_chain
         transaction_turn["conversation_memory"] = conversation_memory
         return transaction_turn
+
+    broker_turn = await asyncio.to_thread(
+        _broker_turn, question, conversation_memory
+    )
+    if broker_turn is not None:
+        broker_turn["timing_ms"] = timing_ms
+        broker_turn["ask_started"] = ask_started
+        broker_turn["rag_chain"] = rag_chain
+        broker_turn["conversation_memory"] = conversation_memory
+        return broker_turn
 
     compare_shown = await asyncio.to_thread(
         _compare_shown_turn, question, conversation_memory
@@ -1817,7 +2131,10 @@ def _stream_sources(prepared):
 
 _TRANSACTION_FOLLOWUP = "Show me the recent transaction details"
 
+_BROKER_FOLLOWUP = "Tell me the top agents for these projects"
+
 _PROJECT_FOLLOWUPS = (
+    ("brokers", _BROKER_FOLLOWUP),
     ("transactions", _TRANSACTION_FOLLOWUP),
     ("price", "What are their starting prices?"),
     ("bedroom", "Which of these have 2-bedroom options?"),
@@ -1854,6 +2171,8 @@ def _question_topics(text):
         topics.add("size")
     if any(term in question for term in ("transaction", "transactions", "transcation", "sale history")):
         topics.add("transactions")
+    if _BROKER.search(question):
+        topics.add("brokers")
     return topics
 
 
@@ -1920,10 +2239,20 @@ def _followup_place(prepared):
     return place or None
 
 
+def _broker_followup_chip(place=None, project_name=None):
+    if project_name:
+        return f"Tell me the top agents for {project_name}"
+    if place:
+        return f"Tell me the top agents for {place}"
+    return _BROKER_FOLLOWUP
+
+
 def _listing_followup_chips(place, listings):
+    broker_chip = _broker_followup_chip(place=place)
     if len(listings) == 1:
         title = listings[0].get("title") or listings[0].get("name") or "this rental"
         return [
+            broker_chip,
             f"What is the yearly rent of {title}?",
             f"How many bedrooms does {title} have?",
             f"What is the size of {title}?",
@@ -1931,6 +2260,7 @@ def _listing_followup_chips(place, listings):
 
     where = f" in {place}" if place else ""
     return [
+        broker_chip,
         f"Compare the first two rentals{where} and tell me which is best.",
         "Which of these has the lowest yearly rent?",
         "Which of these are 1-bedroom apartments?",
@@ -1968,47 +2298,70 @@ def _followup_questions(prepared):
         for listing in (summary.get("listings") or [])
         if isinstance(listing, dict)
     ]
+    broker_done = summary.get("broker_followup") or "brokers" in _question_topics(question)
+    if not projects and (summary.get("broker_followup") or summary.get("transaction_followup")):
+        items = getattr(prepared.get("conversation_memory"), "active_candidates", None) or []
+        projects = [
+            item
+            for item in items
+            if isinstance(item, dict)
+            and str(item.get("entity_type") or "project").lower() == "project"
+            and item.get("name")
+        ]
     place = _followup_place(prepared)
 
     if listings or asks_for_listings(question):
-        return _unused_followups(
-            prepared,
-            _listing_followup_chips(place, listings),
-        )
+        chips = _listing_followup_chips(place, listings)
+        if broker_done:
+            chips = [chip for chip in chips if not _BROKER.search(chip)]
+            return _unused_followups(prepared, chips)
+        return _unused_followups(prepared, chips, pinned=chips[0] if chips else None)
 
     if len(projects) == 1:
         name = projects[0].get("name") or "this project"
-        return _unused_followups(
-            prepared,
-            [
-                _TRANSACTION_FOLLOWUP,
-                f"What is the starting price of {name}?",
-                f"What is the handover date of {name}?",
-                f"Who is the developer of {name}?",
-                f"What amenities does {name} offer?",
-                f"What is the bedroom range of {name}?",
-            ],
-            pinned=_TRANSACTION_FOLLOWUP,
-        )
+        broker_chip = _broker_followup_chip(project_name=name)
+        chips = [
+            broker_chip,
+            _TRANSACTION_FOLLOWUP,
+            f"What is the starting price of {name}?",
+            f"What is the handover date of {name}?",
+            f"Who is the developer of {name}?",
+            f"What amenities does {name} offer?",
+            f"What is the bedroom range of {name}?",
+        ]
+        if broker_done:
+            chips = [chip for chip in chips if chip != broker_chip]
+            return _unused_followups(prepared, chips, pinned=_TRANSACTION_FOLLOWUP)
+        return _unused_followups(prepared, chips, pinned=broker_chip)
 
     if len(projects) >= 2:
-        return _unused_followups(
-            prepared,
-            [chip for _, chip in _PROJECT_FOLLOWUPS],
-            pinned=_TRANSACTION_FOLLOWUP,
+        communities = []
+        for project in projects:
+            community = str(project.get("community") or "").strip()
+            if community and community not in communities:
+                communities.append(community)
+        broker_chip = _broker_followup_chip(
+            place=communities[0] if len(communities) == 1 else place
         )
+        chips = [broker_chip, *[chip for topic, chip in _PROJECT_FOLLOWUPS if topic != "brokers"]]
+        if broker_done:
+            chips = [chip for chip in chips if chip != broker_chip]
+            return _unused_followups(prepared, chips, pinned=_TRANSACTION_FOLLOWUP)
+        return _unused_followups(prepared, chips, pinned=broker_chip)
 
     if place and re.search(r"\bprojects?\b", question, flags=re.I):
-        return _unused_followups(
-            prepared,
-            [
-                _TRANSACTION_FOLLOWUP,
-                f"What are the starting prices of projects in {place}?",
-                f"What are the handover dates of projects in {place}?",
-                f"Compare the first and second projects in {place}.",
-            ],
-            pinned=_TRANSACTION_FOLLOWUP,
-        )
+        broker_chip = _broker_followup_chip(place=place)
+        chips = [
+            broker_chip,
+            _TRANSACTION_FOLLOWUP,
+            f"What are the starting prices of projects in {place}?",
+            f"What are the handover dates of projects in {place}?",
+            f"Compare the first and second projects in {place}.",
+        ]
+        if broker_done:
+            chips = [chip for chip in chips if chip != broker_chip]
+            return _unused_followups(prepared, chips, pinned=_TRANSACTION_FOLLOWUP)
+        return _unused_followups(prepared, chips, pinned=broker_chip)
 
     return []
 
