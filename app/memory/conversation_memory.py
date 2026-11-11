@@ -100,6 +100,7 @@ class ConversationMemory:
         # ---------------------------------------------------------
         self.last_user_question: Optional[str] = None
         self.last_standalone_question: Optional[str] = None
+        self.pending_place_choice: Optional[str] = None
 
     # =============================================================
     # BASIC HELPERS
@@ -1781,6 +1782,7 @@ Rules:
 
         self.last_user_question = None
         self.last_standalone_question = None
+        self.pending_place_choice = None
 
     # =============================================================
     # DEBUG

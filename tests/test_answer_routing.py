@@ -5,8 +5,11 @@ from app.retrieval.hybrid.question_text import (
     interpret_search,
     is_group_attribute_question,
     prepare_user_question,
+    repair_typed_question,
 )
 from run import (
+    _ambiguous_place_question,
+    _apply_pending_place_choice,
     _build_comparison,
     _build_fast_structured_answer,
     _broker_band,
@@ -19,10 +22,12 @@ from run import (
     _format_transactions,
     _listing_question,
     _compare_shown_turn,
+    _place_choice_turn,
     _project_is_full,
     _shortlist_recommend_turn,
     _shown_project_followup,
     _transaction_subject,
+    _transaction_turn,
     _small_talk_answer,
     build_frontend_response,
 )
@@ -501,6 +506,54 @@ def test_transaction_followup_uses_the_project_on_screen():
     found = _transaction_subject("show me the recent transcation details", _Memory())
     assert found and found[0]["name"] == "15 Northside"
     assert _transaction_subject("Show me projects in Business Bay", _Memory()) is None
+
+
+def test_latest_transactions_work_without_projects_on_screen(monkeypatch):
+    sales = {
+        "count": 1,
+        "sales": [{
+            "project": "Mayfair Tower",
+            "date": "2026-10-19",
+            "price": 1000000,
+            "bedrooms": 1,
+            "size_sqft": 807,
+        }],
+    }
+
+    def fake_latest(**kwargs):
+        captured.update(kwargs)
+        return sales
+
+    captured = {}
+    monkeypatch.setattr("app.retrieval.propai_catalog.latest_sales", fake_latest)
+    monkeypatch.setattr(
+        "app.retrieval.propai_catalog.resolve_dubai_place",
+        lambda place: None if not place else {
+            "busines bay": "Business Bay",
+            "business bay": "Business Bay",
+        }.get(str(place).strip().lower()),
+    )
+    monkeypatch.setattr("app.retrieval.propai_catalog.is_outside_dubai", lambda place: False)
+    monkeypatch.setattr(
+        "app.retrieval.propai_catalog.recent_sales",
+        lambda *args, **kwargs: {"count": 0, "sales": []},
+    )
+
+    turn = _transaction_turn("show me the latest transcations", None)
+    assert turn is not None
+    assert turn["use_fast"] is True
+    assert "Mayfair Tower" in turn["fast_answer"]
+    assert "couldn't find an exact match" not in turn["fast_answer"].lower()
+    assert captured.get("place") in (None, "")
+    assert captured.get("limit") == 8
+
+    captured.clear()
+    area = _transaction_turn("show me the latest transcations in busines bay", None)
+    assert area is not None
+    assert "Mayfair Tower" in area["fast_answer"]
+    assert captured.get("place") == "Business Bay"
+
+    assert _transaction_turn("Show me projects in Business Bay", None) is None
     text = _format_transactions(
         ["Mayfair Tower", "Mayfair Residency"],
         {
@@ -965,6 +1018,125 @@ def test_broker_turn_lists_top_brokers(monkeypatch):
     assert "email" not in str(turn["structured_summary"]["brokers"]).lower()
     assert _broker_turn("Show me projects in Business Bay", None) is None
     assert _broker_turn("Show me agents", None) is not None
+    assert _broker_turn("show me in dubai marina", None) is None
+
+
+def test_broker_followup_keeps_agent_intent(monkeypatch):
+    captured = {}
+
+    def fake_list(**kwargs):
+        captured.update(kwargs)
+        return _broker_rows()[: kwargs.get("limit", 5)]
+
+    class _Memory:
+        last_user_question = "show me agents details in mumbai"
+        last_standalone_question = "show me agents details in mumbai"
+        turns = [{"user_question": "show me agents details in mumbai"}]
+        active_candidates = []
+
+    monkeypatch.setattr("app.retrieval.propai_catalog.list_brokers", fake_list)
+    turn = _broker_turn("show me in dubai marina", _Memory())
+    assert turn is not None
+    assert turn["structured_summary"]["brokers"]
+    assert captured.get("place") == "Dubai Marina"
+    assert "licensed agents" in turn["fast_answer"].lower()
+    assert _broker_turn("show me apartments in dubai marina", _Memory()) is None
+    assert _broker_turn("show me projects in dubai marina", _Memory()) is None
+
+
+def test_broker_followup_accepts_businessbay_spelling(monkeypatch):
+    captured = {}
+
+    def fake_list(**kwargs):
+        captured.update(kwargs)
+        return _broker_rows()[: kwargs.get("limit", 5)]
+
+    class _Memory:
+        last_user_question = "i want agents in anantapur"
+        last_standalone_question = "i want agents in anantapur"
+        turns = [{"user_question": "i want agents in anantapur"}]
+        active_candidates = []
+
+    monkeypatch.setattr("app.retrieval.propai_catalog.list_brokers", fake_list)
+    refused = _broker_turn("i want agents in anantapur", None)
+    assert refused is not None
+    assert refused["structured_summary"]["brokers"] == []
+    assert "dubai" in refused["fast_answer"].lower()
+
+    turn = _broker_turn("show me in businessbay", _Memory())
+    assert turn is not None
+    assert turn["structured_summary"]["brokers"]
+    assert captured.get("place") == "Business Bay"
+    assert "licensed agents" in turn["fast_answer"].lower()
+    assert "only show licensed agents in dubai" not in turn["fast_answer"].lower()
+
+
+def test_broker_turn_reads_mistyped_agent_sentence(monkeypatch):
+    captured = {}
+
+    def fake_list(**kwargs):
+        captured.update(kwargs)
+        return _broker_rows()[: kwargs.get("limit", 5)]
+
+    monkeypatch.setattr("app.retrieval.propai_catalog.list_brokers", fake_list)
+    assert "agents" in repair_typed_question("show me agnets in busines bay")
+    assert "agents" in prepare_user_question("show me agnets in busines bay")
+    turn = _broker_turn("show me agnets in busines bay", None)
+    assert turn is not None
+    assert turn["structured_summary"]["brokers"]
+    assert captured.get("place") == "Business Bay"
+    assert "licensed agents" in turn["fast_answer"].lower()
+
+    captured.clear()
+    marina = _broker_turn("show me agnets in marinna", None)
+    assert marina is not None
+    assert captured.get("place") == "Dubai Marina"
+
+    assert _ambiguous_place_question("show me in marinna", None) == "Dubai Marina"
+    assert _ambiguous_place_question("show me in jumera", None) is None
+    assert _broker_turn("show me agnets in chennai", None)["structured_summary"]["brokers"] == []
+
+
+def test_first_place_only_question_asks_properties_or_agents():
+    assert _ambiguous_place_question("show me in dubai marina", None) == "Dubai Marina"
+    assert _ambiguous_place_question("in jvc", None) == "Jumeirah Village Circle"
+    assert _ambiguous_place_question("show me agents in dubai marina", None) is None
+    assert _ambiguous_place_question("show me projects in dubai marina", None) is None
+    assert _ambiguous_place_question("show me apartments in dubai marina", None) is None
+    assert _ambiguous_place_question("show me in mumbai", None) is False
+
+    class _AgentMemory:
+        last_user_question = "show me agents details in mumbai"
+        last_standalone_question = "show me agents details in mumbai"
+        turns = [{"user_question": "show me agents details in mumbai"}]
+        active_candidates = []
+
+    assert _ambiguous_place_question("show me in dubai marina", _AgentMemory()) is None
+
+    class _PropertyMemory:
+        last_user_question = "show me projects in Business Bay"
+        last_standalone_question = "show me projects in Business Bay"
+        turns = [{"user_question": "show me projects in Business Bay"}]
+        active_candidates = [{"name": "Canal Crown", "entity_type": "project"}]
+
+    assert _ambiguous_place_question("show me in dubai marina", _PropertyMemory()) is None
+
+    turn = _place_choice_turn("show me in dubai marina", "Dubai Marina", None)
+    assert "properties or agents" in turn["fast_answer"].lower()
+    assert turn["structured_summary"]["place_choice"] is True
+    chips = _followup_questions(turn)
+    assert chips == [
+        "Show me properties in Dubai Marina",
+        "Show me agents in Dubai Marina",
+    ]
+
+    class _Pending:
+        pending_place_choice = "Dubai Marina"
+
+    assert _apply_pending_place_choice("agents", _Pending()) == "Show me agents in Dubai Marina"
+    pending = _Pending()
+    assert _apply_pending_place_choice("properties", pending) == "Show me projects in Dubai Marina"
+    assert pending.pending_place_choice is None
 
 
 def test_broker_turn_does_not_fake_nationality_or_gender(monkeypatch):
@@ -994,6 +1166,76 @@ def test_broker_turn_does_not_fake_nationality_or_gender(monkeypatch):
     assert follow is not None
     assert called == []
     assert "female" in follow["fast_answer"].lower()
+
+
+def test_broker_turn_refuses_places_outside_dubai(monkeypatch):
+    called = []
+
+    def fake_list(**kwargs):
+        called.append(kwargs)
+        return _broker_rows()
+
+    monkeypatch.setattr("app.retrieval.propai_catalog.list_brokers", fake_list)
+    turn = _broker_turn("show me agents details in chennai", None)
+    assert turn is not None
+    assert called == []
+    assert turn["structured_summary"]["brokers"] == []
+    text = turn["fast_answer"].lower()
+    assert "dubai" in text
+    assert "dld" not in text
+    assert "isn't a dubai community" not in text
+    assert "licensed agents for chennai" not in text
+    assert "broker" not in text
+    assert "layla" not in text
+
+    mumbai = _broker_turn("show me agents in mumbai", None)
+    assert mumbai["structured_summary"]["brokers"] == []
+    assert "dubai" in mumbai["fast_answer"].lower()
+    assert "dld" not in mumbai["fast_answer"].lower()
+    assert called == []
+
+    leftover = _broker_turn("chennai agents", None)
+    assert leftover["structured_summary"]["brokers"] == []
+    assert called == []
+
+    mixed = _broker_turn("indian brokers in chennai", None)
+    assert mixed["structured_summary"]["brokers"] == []
+    assert "dld" not in mixed["fast_answer"].lower()
+    assert called == []
+
+    class _Memory:
+        active_candidates = [
+            {
+                "name": "Layla Hadi Alsayedmousa Alsayedabdulla Almousawi",
+                "entity_type": "project",
+                "community": "chennai",
+            }
+        ]
+
+    prior = _broker_turn("show me agents details in chennai", _Memory())
+    assert prior["structured_summary"]["brokers"] == []
+    assert called == []
+
+
+def test_broker_turn_still_lists_dubai_places(monkeypatch):
+    captured = {}
+
+    def fake_list(**kwargs):
+        captured.update(kwargs)
+        return _broker_rows()[:5]
+
+    monkeypatch.setattr("app.retrieval.propai_catalog.list_brokers", fake_list)
+    turn = _broker_turn("show me agents details in palm jumeirah", None)
+    assert turn is not None
+    assert "Palm Jumeirah" in turn["fast_answer"]
+    assert captured.get("place") == "Palm Jumeirah"
+    assert captured.get("name") in (None, "")
+    assert turn["structured_summary"]["brokers"]
+
+    captured.clear()
+    dubai = _broker_turn("show me agents in dubai", None)
+    assert dubai["structured_summary"]["brokers"]
+    assert captured.get("place") == "Dubai"
 
 
 def test_broker_followup_uses_the_community_on_screen(monkeypatch):
@@ -1142,6 +1384,20 @@ def test_seeded_broker_pick_varies_by_place():
     mid_jvc = seeded_broker_pick(pool, "Jumeirah Village Circle", 5, shuffle=True)
     mid_bay = seeded_broker_pick(pool, "Business Bay", 5, shuffle=True)
     assert [row["brn"] for row in mid_jvc] != [row["brn"] for row in mid_bay]
+
+
+def test_search_brokers_refuses_places_outside_dubai(monkeypatch):
+    from app.listings.tools import search_brokers
+
+    def boom(**kwargs):
+        raise AssertionError("must not list Dubai agents for a city outside Dubai")
+
+    monkeypatch.setattr("app.retrieval.propai_catalog.list_brokers", boom)
+    result = search_brokers({"place": "chennai"})
+    assert result.output["out_of_coverage"] is True
+    assert result.output["brokers"] == []
+    assert result.cards == []
+    assert "dubai" in result.output["note"].lower()
 
 
 def test_tools_for_keeps_search_brokers_on_broker_questions():

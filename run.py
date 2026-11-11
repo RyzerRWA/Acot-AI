@@ -65,6 +65,7 @@ from app.retrieval.hybrid.question_text import (
     collapse_stretched_letters,
     is_group_attribute_question,
     prepare_user_question,
+    repair_typed_question,
 )
 
 
@@ -646,12 +647,43 @@ _TRANSACTION = re.compile(
     r"\b(?:transactions?|transcations?|trancations?|transctions?|sale history|sales history)\b",
     re.I,
 )
+_TRANSACTION_BROWSE = re.compile(
+    r"\b(?:show|list|find|give|tell|latest|recent|last|newest|more)\b",
+    re.I,
+)
+_TRANSACTION_FILLER = re.compile(
+    r"\b(?:show|me|tell|find|list|give|the|top|best|latest|recent|last|newest|"
+    r"recorded|please|can|you|could|what|are|is|any|all|"
+    r"transactions?|transcations?|trancations?|transctions?|"
+    r"sale history|sales history|details?|info|information|about|"
+    r"for|in|at|of|dubai)\b",
+    re.I,
+)
 _MORE_TRANSACTIONS = re.compile(
     r"\b(?:more|another|next|additional|further)\b",
     re.I,
 )
 _TRANSACTION_PAGE_SIZE = 5
 _MORE_TRANSACTION_FOLLOWUP = "Can you show me more transactions"
+
+
+def _transaction_place(question):
+    """Area or project named in a transaction ask, after stripping show/latest/transactions."""
+    asked = (question or "").strip()
+    match = _BROKER_PLACE.search(asked)
+    if match:
+        place = match.group(1).strip(" .?")
+        place = re.split(
+            r"\b(?:and tell|tell me|please)\b",
+            place,
+            maxsplit=1,
+            flags=re.I,
+        )[0].strip(" .?")
+        place = " ".join(_TRANSACTION_FILLER.sub(" ", place).split()).strip(" .?")
+        if place:
+            return place
+    leftover = " ".join(_TRANSACTION_FILLER.sub(" ", asked).split()).strip(" .?")
+    return leftover or None
 
 
 def _transaction_subject(question, conversation_memory):
@@ -729,42 +761,7 @@ def _format_transactions(name, payload, label=None, more=False) -> str:
     return "\n".join(lines).rstrip()
 
 
-def _transaction_turn(question, conversation_memory):
-    projects = _transaction_subject(question, conversation_memory)
-    if not projects:
-        return None
-    from app.retrieval.propai_catalog import recent_sales
-    names = [project.get("name") for project in projects]
-    communities = {
-        str(project.get("community") or "").strip()
-        for project in projects
-        if project.get("community")
-    }
-    developers = {
-        str(project.get("developer_name") or project.get("developer") or "").strip()
-        for project in projects
-        if project.get("developer_name") or project.get("developer")
-    }
-    if len(names) == 1:
-        intro = names[0]
-    elif len(developers) == 1 and len(communities) == 1:
-        intro = f"the {next(iter(developers))} projects in {next(iter(communities))}"
-    elif len(communities) == 1:
-        intro = f"the projects in {next(iter(communities))}"
-    else:
-        intro = "these projects"
-    fingerprint = "|".join(str(name or "").strip().upper() for name in names if name)
-    more = bool(_MORE_TRANSACTIONS.search(question or ""))
-    prev_fp = getattr(conversation_memory, "transaction_names", None)
-    prev_offset = int(getattr(conversation_memory, "transaction_offset", 0) or 0)
-    offset = prev_offset if more and prev_fp == fingerprint else 0
-    payload = recent_sales(names, per_project=_TRANSACTION_PAGE_SIZE, offset=offset)
-    if conversation_memory is not None:
-        conversation_memory.transaction_names = fingerprint
-        conversation_memory.transaction_offset = (
-            offset + _TRANSACTION_PAGE_SIZE if payload.get("sales") else offset
-        )
-    # Text only: do not attach project rows, or the app draws property cards under the sales list.
+def _transaction_reply(question, answer):
     summary = _empty_structured_summary()
     summary["transaction_followup"] = True
     return {
@@ -780,10 +777,93 @@ def _transaction_turn(question, conversation_memory):
             "documents": [],
         },
         "use_fast": True,
-        "fast_answer": _format_transactions(names, payload, label=intro, more=more and offset > 0),
+        "fast_answer": answer,
         "context": None,
         "small_talk": None,
     }
+
+
+def _transaction_turn(question, conversation_memory):
+    question = repair_typed_question(question)
+    if not _TRANSACTION.search(question or ""):
+        return None
+    from app.retrieval.propai_catalog import (
+        is_outside_dubai,
+        latest_sales,
+        recent_sales,
+        resolve_dubai_place,
+    )
+    projects = _transaction_subject(question, conversation_memory)
+    more = bool(_MORE_TRANSACTIONS.search(question or ""))
+    prev_fp = getattr(conversation_memory, "transaction_names", None)
+    prev_offset = int(getattr(conversation_memory, "transaction_offset", 0) or 0)
+    names = []
+    intro = "Dubai"
+    payload = None
+    fingerprint = None
+    if projects:
+        names = [project.get("name") for project in projects]
+        communities = {
+            str(project.get("community") or "").strip()
+            for project in projects
+            if project.get("community")
+        }
+        developers = {
+            str(project.get("developer_name") or project.get("developer") or "").strip()
+            for project in projects
+            if project.get("developer_name") or project.get("developer")
+        }
+        if len(names) == 1:
+            intro = names[0]
+        elif len(developers) == 1 and len(communities) == 1:
+            intro = f"the {next(iter(developers))} projects in {next(iter(communities))}"
+        elif len(communities) == 1:
+            intro = f"the projects in {next(iter(communities))}"
+        else:
+            intro = "these projects"
+        fingerprint = "|".join(str(name or "").strip().upper() for name in names if name)
+        offset = prev_offset if more and prev_fp == fingerprint else 0
+        payload = recent_sales(names, per_project=_TRANSACTION_PAGE_SIZE, offset=offset)
+    else:
+        if not _TRANSACTION_BROWSE.search(question or ""):
+            return None
+        asked = _transaction_place(question)
+        if asked and is_outside_dubai(asked):
+            return _transaction_reply(
+                question,
+                "I only have recorded sales in Dubai. "
+                "Ask about an area such as Dubai Marina, Business Bay, or Palm Jumeirah.",
+            )
+        resolved = resolve_dubai_place(asked) if asked else None
+        place = resolved
+        if asked and not resolved:
+            named = recent_sales(asked, per_project=_TRANSACTION_PAGE_SIZE, offset=0)
+            if named.get("sales"):
+                payload = named
+                names = [asked]
+                intro = asked
+                fingerprint = str(asked).strip().upper()
+                offset = 0
+        if payload is None:
+            fingerprint = f"LATEST|{(place or 'Dubai').strip().upper()}"
+            offset = prev_offset if more and prev_fp == fingerprint else 0
+            payload = latest_sales(place=place, limit=8, offset=offset)
+            names = list(dict.fromkeys(
+                str(sale.get("project") or "").strip()
+                for sale in (payload.get("sales") or [])
+                if sale.get("project")
+            ))
+            intro = place or "Dubai"
+    if conversation_memory is not None:
+        conversation_memory.transaction_names = fingerprint
+        conversation_memory.transaction_offset = (
+            offset + _TRANSACTION_PAGE_SIZE if payload.get("sales") else offset
+        )
+    # Text only: do not attach project rows, or the app draws property cards under the sales list.
+    return _transaction_reply(
+        question,
+        _format_transactions(names, payload, label=intro, more=more and offset > 0),
+    )
 
 
 _BROKER = re.compile(
@@ -812,6 +892,7 @@ _BROKER_FILLER = re.compile(
     r"\b(?:show|me|tell|find|list|the|top|best|licensed|rera|dubai|please|who|are|is|"
     r"can|help|with|this|these|those|property|properties|project|projects|community|"
     r"brokers?|agents?|real[\s-]?estate|for|in|at|of|only|just|from|"
+    r"details?|info|information|about|"
     r"sri lankan|pakistani|pakistan|filipino|emirati|egyptian|iranian|lebanese|"
     r"british|indian|india|nationality|nationalities|gender|female|male|"
     r"women|woman|ladies|lady|men|man|both)\b",
@@ -847,19 +928,190 @@ def _broker_identity_unsupported(question) -> bool:
     return bool(nationality or gender)
 
 
+_BROKER_SWITCH_AWAY = re.compile(
+    r"\b(?:projects?|listings?|communities?|developers?|handover|brochure|"
+    r"propert(?:y|ies)|apartments?|villas?|townhouses?|penthouses?|"
+    r"rentals?|for sale|off[- ]?plan)\b",
+    re.I,
+)
+
+
+def _last_asked_about_agents(conversation_memory) -> bool:
+    if conversation_memory is None:
+        return False
+    texts = [
+        getattr(conversation_memory, "last_user_question", None),
+        getattr(conversation_memory, "last_standalone_question", None),
+    ]
+    for turn in reversed((getattr(conversation_memory, "turns", None) or [])[-4:]):
+        if isinstance(turn, dict):
+            texts.append(turn.get("user_question"))
+            texts.append(turn.get("standalone_question"))
+    return any(_BROKER.search(str(text or "")) for text in texts)
+
+
 def _is_broker_question(question, conversation_memory=None) -> bool:
     text = question or ""
     if _TRANSACTION.search(text):
         return False
     if _BROKER.search(text):
         return True
-    if not _BROKER_FILTER_WORDS.search(text):
+    if asks_for_listings(text) or _BROKER_SWITCH_AWAY.search(text):
         return False
-    if asks_for_listings(text):
+    if _BROKER_FILTER_WORDS.search(text):
+        return True
+    return _last_asked_about_agents(conversation_memory)
+
+
+_AMBIGUOUS_FILLER = re.compile(
+    r"\b(?:show|me|tell|find|list|see|look|looking|please|can|you|could|"
+    r"what|whats|about|any|anything|there|available|"
+    r"in|at|for|of|the|a|an|is|are)\b",
+    re.I,
+)
+_AMBIGUOUS_BLOCK = re.compile(
+    r"\b(?:bed(?:room)?s?|studio|budget|aed|sqft|sq\s*ft|price|rent|buy|"
+    r"compare|vs|versus)\b",
+    re.I,
+)
+_CHOICE_AGENTS = re.compile(r"^\s*(?:show\s+me\s+)?(?:the\s+)?(?:agents?|brokers?)\s*[.!]?\s*$", re.I)
+_CHOICE_PROPERTIES = re.compile(
+    r"^\s*(?:show\s+me\s+)?(?:the\s+)?(?:propert(?:y|ies)|projects?|listings?)\s*[.!]?\s*$",
+    re.I,
+)
+
+
+def _memory_question_texts(conversation_memory) -> list[str]:
+    if conversation_memory is None:
+        return []
+    texts = [
+        getattr(conversation_memory, "last_user_question", None),
+        getattr(conversation_memory, "last_standalone_question", None),
+    ]
+    for turn in reversed((getattr(conversation_memory, "turns", None) or [])[-4:]):
+        if isinstance(turn, dict):
+            texts.append(turn.get("user_question"))
+            texts.append(turn.get("standalone_question"))
+    return [str(text or "") for text in texts if text]
+
+
+def _last_asked_about_properties(conversation_memory) -> bool:
+    for text in _memory_question_texts(conversation_memory):
+        if asks_for_listings(text) or _BROKER_SWITCH_AWAY.search(text):
+            return True
+    items = getattr(conversation_memory, "active_candidates", None) or []
+    return any(
+        isinstance(item, dict)
+        and str(item.get("entity_type") or "").lower() in {"project", "listing"}
+        and item.get("name")
+        for item in items
+    )
+
+
+def _place_choice_reply(question):
+    text = (question or "").strip()
+    if not text:
+        return None
+    if _CHOICE_AGENTS.fullmatch(text):
+        return "agents"
+    if _CHOICE_PROPERTIES.fullmatch(text):
+        return "properties"
+    if _BROKER.search(text) and not _BROKER_SWITCH_AWAY.search(text):
+        return "agents"
+    if asks_for_listings(text) or _BROKER_SWITCH_AWAY.search(text):
+        return "properties"
+    return None
+
+
+def _bare_place(question):
+    asked = (question or "").strip()
+    if not asked:
+        return None
+    match = _BROKER_PLACE.search(asked)
+    if match:
+        place = match.group(1).strip(" .?")
+        place = re.split(
+            r"\b(?:and tell|tell me|please)\b",
+            place,
+            maxsplit=1,
+            flags=re.I,
+        )[0].strip(" .?")
+        place = " ".join(_BROKER_FILTER_WORDS.sub(" ", place).split()).strip(" .?")
+        if place:
+            return place
+    leftover = " ".join(_AMBIGUOUS_FILLER.sub(" ", asked).split()).strip(" .?")
+    leftover = " ".join(_BROKER_FILTER_WORDS.sub(" ", leftover).split()).strip(" .?")
+    return leftover or None
+
+
+def _ambiguous_place_question(question, conversation_memory):
+    """Known Dubai place with no noun, on a first turn that has no inherited intent."""
+    text = repair_typed_question(question or "")
+    if _is_broker_question(text, conversation_memory):
+        return None
+    if _last_asked_about_properties(conversation_memory):
+        return None
+    if (
+        _BROKER.search(text)
+        or _BROKER_SWITCH_AWAY.search(text)
+        or asks_for_listings(text)
+        or _TRANSACTION.search(text)
+        or _BROKER_FILTER_WORDS.search(text)
+        or _AMBIGUOUS_BLOCK.search(text)
+    ):
+        return None
+    place = _bare_place(text)
+    if not place:
+        return None
+    from app.retrieval.propai_catalog import is_outside_dubai, resolve_dubai_place
+    if is_outside_dubai(place) or is_outside_dubai(text):
         return False
-    if re.search(r"\b(?:projects?|listings?|communities?|developers?|handover|brochure)\b", text, re.I):
-        return False
-    return True
+    return resolve_dubai_place(place)
+
+
+def _apply_pending_place_choice(question, conversation_memory):
+    pending = getattr(conversation_memory, "pending_place_choice", None) if conversation_memory else None
+    if not pending:
+        return question
+    choice = _place_choice_reply(question)
+    named = bool(re.search(r"\b(?:in|at|for)\b", question or "", re.I) and _bare_place(question))
+    if choice == "agents":
+        conversation_memory.pending_place_choice = None
+        if _BROKER.search(question or "") and named:
+            return question
+        return f"Show me agents in {pending}"
+    if choice == "properties":
+        conversation_memory.pending_place_choice = None
+        if named and (_BROKER_SWITCH_AWAY.search(question or "") or asks_for_listings(question or "")):
+            return question
+        kind = "listings" if asks_for_listings(question or "") else "projects"
+        return f"Show me {kind} in {pending}"
+    return question
+
+
+def _place_choice_turn(question, place, conversation_memory):
+    if conversation_memory is not None:
+        conversation_memory.pending_place_choice = place
+    summary = _empty_structured_summary()
+    summary["place_choice"] = True
+    summary["understood_subject"] = place
+    return {
+        "question": question,
+        "standalone_question": question,
+        "question_type": "general",
+        "structured_summary": summary,
+        "documents": [],
+        "investment_analysis": None,
+        "retrieval_result": {
+            "question_type": "general",
+            "structured_data": {"community": [], "projects": [], "sub_communities": []},
+            "documents": [],
+        },
+        "use_fast": True,
+        "fast_answer": f"Are you looking for properties or agents in {place}?",
+        "context": None,
+        "small_talk": None,
+    }
 
 
 def _broker_place(question, conversation_memory):
@@ -877,6 +1129,12 @@ def _broker_place(question, conversation_memory):
         place = " ".join(_BROKER_FILTER_WORDS.sub(" ", place).split()).strip(" .?")
         if place:
             return place
+    leftover = " ".join(_BROKER_FILLER.sub(" ", asked).split())
+    leftover = " ".join(_BROKER_FILTER_WORDS.sub(" ", leftover).split()).strip(" .?")
+    if leftover:
+        from app.retrieval.propai_catalog import is_outside_dubai, known_dubai_label
+        if is_outside_dubai(leftover) or known_dubai_label(leftover):
+            return leftover
     items = getattr(conversation_memory, "active_candidates", None) or []
     communities = []
     names = []
@@ -977,6 +1235,29 @@ def _broker_band(conversation_memory, place=None) -> str:
     return "mid"
 
 
+def _broker_reply(question, answer, brokers=None):
+    summary = _empty_structured_summary()
+    summary["brokers"] = brokers or []
+    summary["broker_followup"] = True
+    return {
+        "question": question,
+        "standalone_question": question,
+        "question_type": "general",
+        "structured_summary": summary,
+        "documents": [],
+        "investment_analysis": None,
+        "retrieval_result": {
+            "question_type": "general",
+            "structured_data": {"community": [], "projects": [], "sub_communities": []},
+            "documents": [],
+        },
+        "use_fast": True,
+        "fast_answer": answer,
+        "context": None,
+        "small_talk": None,
+    }
+
+
 def _format_brokers(rows, label=None) -> str:
     if not rows:
         if label:
@@ -1011,11 +1292,50 @@ def _format_brokers(rows, label=None) -> str:
     return "\n".join(lines).rstrip()
 
 
+def _outside_coverage_reply(question, asked=None):
+    from app.retrieval.propai_catalog import outside_dubai_city
+    city = asked or outside_dubai_city(question)
+    if not city:
+        return None
+    answer = (
+        "I can only show licensed agents in Dubai. "
+        "Ask about an area such as Dubai Marina, Business Bay, or Palm Jumeirah."
+    )
+    return _broker_reply(question, answer)
+
+
 def _broker_turn(question, conversation_memory):
+    question = repair_typed_question(question)
     if not _is_broker_question(question, conversation_memory):
         return None
-    from app.retrieval.propai_catalog import list_brokers
+    from app.retrieval.propai_catalog import is_outside_dubai, known_dubai_label, list_brokers, resolve_dubai_place
+    blocked = _outside_coverage_reply(question)
+    if blocked:
+        return blocked
     place = _broker_place(question, conversation_memory)
+    if place and is_outside_dubai(place):
+        return _outside_coverage_reply(question, place.strip())
+    if place:
+        needle = place.strip().lower()
+        on_screen = False
+        for item in getattr(conversation_memory, "active_candidates", None) or []:
+            if not isinstance(item, dict):
+                continue
+            if needle in {
+                str(item.get("community") or "").strip().lower(),
+                str(item.get("name") or "").strip().lower(),
+            }:
+                on_screen = True
+                break
+        if not on_screen:
+            resolved = resolve_dubai_place(place)
+            if resolved is None:
+                return _broker_reply(
+                    question,
+                    "I can only show licensed agents in Dubai. "
+                    "Ask about an area such as Dubai Marina, Business Bay, or Palm Jumeirah.",
+                )
+            place = resolved
     if _broker_identity_unsupported(question):
         nationality, gender, _both = _broker_identity_filters(question)
         wanted = []
@@ -1028,27 +1348,10 @@ def _broker_turn(question, conversation_memory):
             "Our DLD agent records don't include nationality or gender, "
             f"so I can't show only {label} agents."
         )
-        summary = _empty_structured_summary()
-        summary["brokers"] = []
-        summary["broker_followup"] = True
-        return {
-            "question": question,
-            "standalone_question": question,
-            "question_type": "general",
-            "structured_summary": summary,
-            "documents": [],
-            "investment_analysis": None,
-            "retrieval_result": {
-                "question_type": "general",
-                "structured_data": {"community": [], "projects": [], "sub_communities": []},
-                "documents": [],
-            },
-            "use_fast": True,
-            "fast_answer": answer,
-            "context": None,
-            "small_talk": None,
-        }
+        return _broker_reply(question, answer)
     name, brn = _broker_lookup(question, conversation_memory)
+    if name and not brn and (is_outside_dubai(name) or known_dubai_label(name)):
+        name = None
     follow_up = bool(place or re.search(r"\b(?:this|these|those|for)\b", question or "", re.I))
     limit = 5 if follow_up else 8
     band = _broker_band(conversation_memory, place) if follow_up and not name and not brn else None
@@ -1062,26 +1365,7 @@ def _broker_turn(question, conversation_memory):
         )
     else:
         answer = _format_brokers(rows, label=place)
-    summary = _empty_structured_summary()
-    summary["brokers"] = rows
-    summary["broker_followup"] = True
-    return {
-        "question": question,
-        "standalone_question": question,
-        "question_type": "general",
-        "structured_summary": summary,
-        "documents": [],
-        "investment_analysis": None,
-        "retrieval_result": {
-            "question_type": "general",
-            "structured_data": {"community": [], "projects": [], "sub_communities": []},
-            "documents": [],
-        },
-        "use_fast": True,
-        "fast_answer": answer,
-        "context": None,
-        "small_talk": None,
-    }
+    return _broker_reply(question, answer, rows)
 
 
 _SHORTLIST_RECOMMEND = re.compile(
@@ -1461,6 +1745,15 @@ async def _try_agent_turn(question, components, timing_ms, ask_started):
             profile.setdefault(key, value)
     llm = components["rag_chain"].llm
 
+    if _is_broker_question(question, conversation_memory):
+        blocked = _outside_coverage_reply(question)
+        if blocked:
+            blocked["timing_ms"] = timing_ms
+            blocked["ask_started"] = ask_started
+            blocked["rag_chain"] = components.get("rag_chain")
+            blocked["conversation_memory"] = conversation_memory
+            return blocked
+
     started = time.perf_counter()
     # Same concurrency cap as every other model call, so the provider is not flooded.
     await llm._acquire_slot()
@@ -1632,6 +1925,8 @@ async def _prepare_acot_turn(
     investment_analyzer = components["investment_analyzer"]
     rag_chain = components["rag_chain"]
     conversation_memory = components["conversation_memory"]
+    question = repair_typed_question(question)
+    question = _apply_pending_place_choice(question, conversation_memory)
 
     timing_ms = {}
     ask_started = time.perf_counter()
@@ -1760,6 +2055,43 @@ async def _prepare_acot_turn(
         broker_turn["rag_chain"] = rag_chain
         broker_turn["conversation_memory"] = conversation_memory
         return broker_turn
+
+    wanted_place = await asyncio.to_thread(
+        _ambiguous_place_question, question, conversation_memory
+    )
+    if wanted_place is False:
+        coverage = _empty_structured_summary()
+        return {
+            "question": question,
+            "standalone_question": question,
+            "question_type": "general",
+            "structured_summary": coverage,
+            "documents": [],
+            "investment_analysis": None,
+            "retrieval_result": {
+                "question_type": "general",
+                "structured_data": {"community": [], "projects": [], "sub_communities": []},
+                "documents": [],
+            },
+            "rag_chain": rag_chain,
+            "conversation_memory": conversation_memory,
+            "use_fast": True,
+            "fast_answer": (
+                "I only cover Dubai real estate. "
+                "Ask about an area such as Dubai Marina, Business Bay, or Palm Jumeirah."
+            ),
+            "context": None,
+            "timing_ms": timing_ms,
+            "ask_started": ask_started,
+            "small_talk": None,
+        }
+    if wanted_place:
+        choice = _place_choice_turn(question, wanted_place, conversation_memory)
+        choice["timing_ms"] = timing_ms
+        choice["ask_started"] = ask_started
+        choice["rag_chain"] = rag_chain
+        choice["conversation_memory"] = conversation_memory
+        return choice
 
     compare_shown = await asyncio.to_thread(
         _compare_shown_turn, question, conversation_memory
@@ -2265,6 +2597,12 @@ def _followup_questions(prepared):
         return _unused_followups(prepared, _STARTER_CHIPS)
 
     summary = prepared.get("structured_summary") or {}
+    if summary.get("place_choice"):
+        place = str(summary.get("understood_subject") or "").strip() or "Dubai"
+        return [
+            f"Show me properties in {place}",
+            f"Show me agents in {place}",
+        ]
     if summary.get("transaction_followup") or "transactions" in _question_topics(question):
         answer = prepared.get("fast_answer") or ""
         if "Recent Transactions" in answer or summary.get("transaction_followup"):

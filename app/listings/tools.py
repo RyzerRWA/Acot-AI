@@ -922,7 +922,26 @@ def search_brokers(raw) -> ToolResult:
     if band not in (None, "", "top", "mid"):
         band = None
     limit = int(round(_num(a, "limit", 1, 10) or 8))
-    from app.retrieval.propai_catalog import list_brokers
+    from app.retrieval.propai_catalog import list_brokers, resolve_dubai_place
+    if place:
+        resolved = resolve_dubai_place(place)
+        if resolved is None:
+            asked = place
+            return ToolResult(
+                {
+                    "matching_brokers": 0,
+                    "showing": 0,
+                    "out_of_coverage": True,
+                    "place": asked,
+                    "note": (
+                        "Out of coverage. Tell the user you can only show licensed agents in Dubai. "
+                        "Do not list any agents or invent names."
+                    ),
+                    "brokers": [],
+                },
+                [],
+            )
+        place = resolved
     rows = list_brokers(name=name, brn=brn, limit=limit, place=place, band=band)
     out = {
         "matching_brokers": len(rows),

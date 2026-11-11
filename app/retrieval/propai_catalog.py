@@ -35,7 +35,13 @@ def _focus(question: str) -> str:
             return ALIASES[key]
     kept = _FILLER.sub(" ", text)
     kept = re.sub(r"[^a-z0-9\s]", " ", kept, flags=re.I)
-    return " ".join(kept.split())
+    kept = " ".join(kept.split())
+    if not kept:
+        return kept
+    label = known_dubai_label(kept)
+    if label:
+        return label
+    return kept
 
 
 def _photo_base() -> str:
@@ -524,6 +530,66 @@ def recent_sales(name, limit: int = 8, per_project: int = 5, offset: int = 0) ->
     return {"count": len(sales), "sales": sales}
 
 
+def latest_sales(place=None, limit: int = 8, offset: int = 0) -> dict:
+    """Newest recorded sales, optionally limited to one Dubai area or project name."""
+    cap = max(1, min(int(limit or 8), 15))
+    start = max(0, int(offset or 0))
+    parts = [
+        "deleted_at is null",
+        "sale_price between 10000 and 2000000000",
+        "instance_date is not null",
+        "coalesce(project_name_prop_ai, '') <> ''",
+        "(procedure_area_sqft is null or procedure_area_sqft between 50 and 100000)",
+    ]
+    params: list = []
+    text = str(place or "").strip()
+    if text:
+        likes = _likes(_expanded([text]))
+        parts.append(
+            "(area_name_prop_ai ilike any(%s::text[]) "
+            "or master_project_prop_ai ilike any(%s::text[]) "
+            "or project_name_prop_ai ilike any(%s::text[]))"
+        )
+        params.extend([likes, likes, likes])
+    rows = fetch(
+        f"""
+        select project_name_prop_ai as project,
+               instance_date as sold_on,
+               sale_price::bigint as price,
+               bedrooms,
+               procedure_area_sqft as size_sqft,
+               property_type_en as property_type
+        from propai_sales
+        where {' and '.join(parts)}
+        order by instance_date desc nulls last
+        limit %s offset %s
+        """,
+        tuple([*params, cap, start]),
+    )
+    sales = []
+    for row in rows or []:
+        sold = row.get("sold_on")
+        size = row.get("size_sqft")
+        try:
+            size_sqft = int(round(float(size))) if size is not None else None
+        except (OverflowError, TypeError, ValueError):
+            size_sqft = None
+        beds = row.get("bedrooms")
+        try:
+            bedrooms = int(float(beds)) if beds is not None else None
+        except (OverflowError, TypeError, ValueError):
+            bedrooms = None
+        sales.append({
+            "project": row.get("project"),
+            "date": sold.isoformat() if hasattr(sold, "isoformat") else (str(sold)[:10] if sold else None),
+            "price": None if row.get("price") is None else int(row["price"]),
+            "bedrooms": bedrooms,
+            "size_sqft": size_sqft,
+            "property_type": row.get("property_type"),
+        })
+    return {"count": len(sales), "sales": sales}
+
+
 def agent_by_id(agent_id: str) -> dict | None:
     key = _id_index().get(agent_id)
     if not key:
@@ -657,6 +723,202 @@ def _place_seed(place: str) -> int:
     return int(hashlib.sha256((place or "").strip().lower().encode()).hexdigest(), 16)
 
 
+_WHOLE_MARKET = {
+    "dubai",
+    "uae",
+    "u.a.e",
+    "u.a.e.",
+    "united arab emirates",
+    "emirate of dubai",
+    "dubai uae",
+    "dubai, uae",
+}
+# Cities and emirates ACOT does not cover. Checked before any DLD lookup so a
+# foreign name can never be used as a seed for Dubai licensed agents.
+_OUTSIDE_DUBAI = {
+    "chennai", "mumbai", "delhi", "new delhi", "bangalore", "bengaluru",
+    "hyderabad", "kolkata", "calcutta", "pune", "ahmedabad", "kochi", "goa",
+    "anantapur", "vijayawada", "visakhapatnam", "tirupati", "warangal",
+    "coimbatore", "madurai", "mysore", "mysuru", "nagpur", "jaipur", "lucknow",
+    "london", "manchester", "paris", "berlin", "rome", "madrid",
+    "new york", "nyc", "los angeles", "toronto", "singapore", "hong kong",
+    "tokyo", "sydney", "melbourne", "cairo", "istanbul", "moscow",
+    "doha", "riyadh", "jeddah", "kuwait", "bahrain", "muscat",
+    "abu dhabi", "abudhabi", "sharjah", "ajman", "fujairah",
+    "ras al khaimah", "rak", "umm al quwain", "al ain",
+}
+def _normalize_place(place) -> str:
+    text = re.sub(r"\s+", " ", str(place or "").strip(" .?!,;:'\""))
+    text = re.sub(r"^(?:the|in|at|for)\s+", "", text, flags=re.I)
+    text = re.sub(
+        r"\s+(?:area|community|city|emirate|details?|agents?|brokers?)$",
+        "",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(r",?\s*dubai$", "", text, flags=re.I).strip()
+    return " ".join(text.split())
+
+
+def _static_dubai_names() -> dict[str, str]:
+    names = {key.lower(): ALIASES[key] for key in ALIASES}
+    for proper in ALIASES.values():
+        names[proper.lower()] = proper
+    extras = (
+        "Dubai Marina", "Business Bay", "Downtown Dubai", "Palm Jumeirah",
+        "Jumeirah Village Circle", "Jumeirah Village Triangle",
+        "Jumeirah Lake Towers", "Jumeirah Beach Residence", "Dubai Hills Estate",
+        "Dubai Creek Harbour", "Dubai Silicon Oasis", "Dubai Sports City",
+        "Dubai Investments Park", "Al Barsha", "Al Furjan", "Arabian Ranches",
+        "Motor City", "Damac Hills", "Meydan", "City Walk", "DIFC",
+        "Dubai Harbour", "Dubai South", "MBR City", "Mohammed Bin Rashid City",
+        "International City", "Discovery Gardens", "Dubai Production City",
+        "Dubai Studio City", "Jumeirah Islands", "Jumeirah Park", "The Springs",
+        "The Meadows", "Emirates Hills", "The Lakes", "The Views", "Al Jaddaf",
+        "Deira", "Bur Dubai", "Karama", "Mirdif", "Town Square", "Tilal Al Ghaf",
+        "Emaar Beachfront", "Bluewaters", "Bluewaters Island", "Dubai Islands",
+        "Port De La Mer", "La Mer", "Arjan",
+    )
+    for proper in extras:
+        names.setdefault(proper.lower(), proper)
+    return names
+
+
+def is_outside_dubai(place) -> bool:
+    """True for a named city or emirate that is not Dubai."""
+    return outside_dubai_city(place) is not None
+
+
+def outside_dubai_city(text) -> str | None:
+    """The foreign city/emirate named in this text, if any."""
+    blob = str(text or "").lower()
+    if not blob:
+        return None
+    if known_dubai_label(text):
+        return None
+    for city in sorted(_OUTSIDE_DUBAI, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(city)}\b", blob):
+            return " ".join(part.capitalize() for part in city.split())
+    return None
+
+
+def _compact_place(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (text or "").lower())
+
+
+def _outside_compacts() -> set[str]:
+    return {_compact_place(city) for city in _OUTSIDE_DUBAI}
+
+
+def _fuzzy_dubai_label(compact: str, known: dict[str, str]) -> str | None:
+    """One known Dubai name within 1–2 letter edits. Ties stay unmatched."""
+    from app.retrieval.hybrid.question_text import _edit_distance
+
+    scored: dict[str, int] = {}
+    for name, proper in known.items():
+        name_compact = _compact_place(name)
+        if abs(len(compact) - len(name_compact)) > 2:
+            continue
+        dist = _edit_distance(compact, name_compact)
+        if dist > 2:
+            continue
+        previous = scored.get(proper)
+        if previous is None or dist < previous:
+            scored[proper] = dist
+    if not scored:
+        return None
+    best = min(scored.values())
+    winners = [proper for proper, dist in scored.items() if dist == best]
+    if len(winners) != 1:
+        return None
+    return winners[0]
+
+
+def known_dubai_label(place) -> str | None:
+    """Whole-market or a known Dubai community from the static list. Does not query the database."""
+    raw = _normalize_place(place)
+    if not raw:
+        whole = re.sub(r"\s+", " ", str(place or "").strip(" .?!,;:'\"")).lower()
+        if whole in _WHOLE_MARKET or re.sub(r",?\s*dubai$", "", whole).strip() == "":
+            return "Dubai"
+        return None
+    key = raw.lower()
+    if key in _WHOLE_MARKET:
+        return "Dubai"
+    known = _static_dubai_names()
+    if key in known:
+        return known[key]
+    compact = _compact_place(key)
+    if len(compact) < 4:
+        return None
+    for name, proper in known.items():
+        if _compact_place(name) == compact:
+            return proper
+    if key in _OUTSIDE_DUBAI or compact in _outside_compacts():
+        return None
+    if len(compact) < 5:
+        return None
+    return _fuzzy_dubai_label(compact, known)
+
+
+def resolve_dubai_place(place) -> str | None:
+    """Canonical Dubai area/project name, 'Dubai' for the whole market, or None if out of coverage."""
+    if is_outside_dubai(place):
+        return None
+    known = known_dubai_label(place)
+    if known:
+        return known
+    raw = _normalize_place(place)
+    key = raw.lower()
+    if len(key) < 3:
+        return None
+    like = "%" + re.sub(r"([%_\\])", r"\\\1", key) + "%"
+    try:
+        rows = fetch(
+            """
+            select label, area, master, 1 as weight
+            from propai_places
+            where level in ('area', 'master')
+              and (
+                lower(btrim(coalesce(label, ''))) = %s
+                or lower(btrim(coalesce(area, ''))) = %s
+                or lower(btrim(coalesce(master, ''))) = %s
+                or (length(%s) >= 5 and (
+                    lower(label) like %s
+                    or lower(area) like %s
+                    or lower(coalesce(master, '')) like %s
+                ))
+              )
+            union all
+            select name as label, area, master_project as master, 2 as weight
+            from propai_projects
+            where coalesce(name, '') <> ''
+              and (
+                lower(btrim(name)) = %s
+                or lower(btrim(coalesce(area, ''))) = %s
+                or lower(btrim(coalesce(master_project, ''))) = %s
+                or (length(%s) >= 5 and (
+                    lower(name) like %s
+                    or lower(area) like %s
+                    or lower(coalesce(master_project, '')) like %s
+                ))
+              )
+            order by weight
+            limit 5
+            """,
+            (key, key, key, key, like, like, like, key, key, key, key, like, like, like),
+        )
+    except Exception:
+        return None
+    if not rows:
+        return None
+    row = rows[0]
+    return (
+        str(row.get("label") or row.get("master") or row.get("area") or "").strip()
+        or None
+    )
+
+
 def seeded_broker_pick(rows: list[dict], place: str | None, limit: int, shuffle: bool) -> list[dict]:
     """Stable per place: same community keeps the same slice, another community shifts."""
     public = []
@@ -684,6 +946,8 @@ def seeded_broker_pick(rows: list[dict], place: str | None, limit: int, shuffle:
 def list_brokers(name=None, brn=None, limit: int = 8, place=None, band=None) -> list[dict]:
     """Named lookup, or a place-seeded slice of Five Star (top) / 3-4 star (mid) brokers."""
     cap = max(1, min(int(limit or 8), 10))
+    if (place and is_outside_dubai(place)) or (name and not brn and is_outside_dubai(name)):
+        return []
     if name or brn:
         rows = _broker_rows(name=name, brn=brn, limit=cap)
         if rows or not str(name or "").strip() or brn:
