@@ -462,6 +462,8 @@ def agent_projects(filters: dict, limit: int = 8, sort: str = "cheapest") -> tup
     projects = projects[:limit]
     _attach_photos(projects)
     for project in projects:
+        # The app's project page is keyed by the catalog key; the agent id is a one-way hash of it.
+        project["key"] = project["id"]
         project["id"] = _agent_id(str(project["id"]))
     return projects, total
 

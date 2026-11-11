@@ -767,6 +767,8 @@ def _transaction_turn(question, conversation_memory):
     # Text only: do not attach project rows, or the app draws property cards under the sales list.
     summary = _empty_structured_summary()
     summary["transaction_followup"] = True
+    # The sales themselves, so the app can show them by unit type and over time (data.transactions).
+    summary["transactions"] = payload.get("sales") or []
     return {
         "question": question,
         "standalone_question": question,
@@ -780,7 +782,14 @@ def _transaction_turn(question, conversation_memory):
             "documents": [],
         },
         "use_fast": True,
-        "fast_answer": _format_transactions(names, payload, label=intro, more=more and offset > 0),
+        # With sales, the app draws them from data.transactions, so the text is one lead line
+        # (spoken in voice mode); without sales, the full message explains why.
+        "fast_answer": (
+            f"Here are the {'next' if more and offset > 0 else 'recent'} sales for {intro}. "
+            f"{len(payload['sales'])} sales are listed below."
+            if payload.get("sales")
+            else _format_transactions(names, payload, label=intro, more=more and offset > 0)
+        ),
         "context": None,
         "small_talk": None,
     }
