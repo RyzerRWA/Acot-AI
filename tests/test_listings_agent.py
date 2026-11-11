@@ -33,6 +33,23 @@ class FilterTests(unittest.TestCase):
             run_tool("get_listing", {"listing_id": "1; drop table listings"})
 
 
+class MessyPlaceTests(unittest.TestCase):
+    def test_misspelt_place_is_read_as_the_known_one(self):
+        from app.listings import tools
+        with patch.object(tools, "_place_names", ["Arjan", "Dubai Marina", "Jumeirah Village Circle"]):
+            self.assertEqual(tools._closest_place("arjun"), "Arjan")
+            self.assertEqual(tools._closest_place("dubai marena"), "Dubai Marina")
+            self.assertIsNone(tools._closest_place("Emaar"))   # a developer, not a place
+            self.assertIsNone(tools._closest_place("Arjan"))   # already right: nothing to fix
+
+    def test_reposted_adverts_show_once(self):
+        from app.listings import tools
+        with patch.object(tools, "fetch", side_effect=[[], [{"total": 0}]]) as fetch, \
+                patch.object(tools, "_recorded_rents", return_value=None):
+            tools.search_listings({})
+        self.assertIn("distinct on (lower(btrim(title)), price_aed)", fetch.call_args_list[0].args[0])
+
+
 class LinkTests(unittest.TestCase):
     def test_links_and_images_never_reach_the_user(self):
         self.assertEqual(" ".join(strip_links("a ![x](https://a.b/c.jpg) b").split()), "a b")

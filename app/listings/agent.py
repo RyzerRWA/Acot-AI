@@ -27,6 +27,12 @@ MAX_TOOL_JSON = 9_000  # characters of tool output handed back to the model
 HISTORY_TURNS = 6      # earlier messages sent along with a question
 HISTORY_CHARS = 1_200  # longest earlier message sent in full
 _ID_TAG = re.compile(r"\[\[(P\d{12}|\d{1,12})\]\]")
+# Earlier answers end with "[internal note ... Shown: Hanover Square (id P758303806926); ...]".
+_EARLIER_ID = re.compile(r"\(id (P\d{12}|\d{1,12})\)")
+_NO_MATCH = re.compile(r'"matching_(?:projects|listings)":\s*0\b')
+NO_MATCH_LINE = ("NO EXACT MATCH: a search for the full request found nothing. Any results below are a fallback "
+                 "(another filter, place or rentals instead), not what was asked.")
+EARLIER_NAME = re.compile(r"(?:Shown: |; )([^;\]]+?) \(id (P\d{12}|\d{1,12})\)")
 
 
 class ListingsUnavailable(RuntimeError):
@@ -120,14 +126,22 @@ class ListingAgent:
 
         def tool(name, args):
             result = run_tool(name, args, pgvector=self.pgvector, profile=profile)
-            found.extend(result.cards)
+            out = result.output if isinstance(result.output, dict) else {}
+            # A search with no match still returns "closest" cards; speaking from those contradicts the
+            # final answer, which usually comes from a second search. Only real matches start the voice.
+            if out.get("matching_projects") != 0 and out.get("matching_listings") != 0:
+                found.extend(result.cards)
             return result
 
         def chat(msgs):
             # Records came back, so the model is about to write the answer from them: hand them over now.
             if pending and found:
                 try:
-                    pending.pop()([str(m.get("content") or "") for m in msgs if m.get("role") == "tool"])
+                    # A search that matched nothing: keep only that fact. Its "closest" and "other areas"
+                    # lists are not what the answer shows, and without the fact the voice reads the
+                    # fallback search as a match ("77 Emaar projects in Dubai Hills").
+                    outputs = [str(m.get("content") or "") for m in msgs if m.get("role") == "tool"]
+                    pending.pop()([NO_MATCH_LINE if _NO_MATCH.search(o) else o for o in outputs])
                 except Exception:
                     log.exception("on_results failed")
             return self._chat(msgs, tools)
@@ -138,11 +152,13 @@ class ListingAgent:
             ToolInputError, max_rounds=MAX_ROUNDS, max_tool_json=MAX_TOOL_JSON, log=log,
             needs_grounding=mentions_known_name)
         state = graph.invoke({"messages": messages, "seen": {}, "used": [], "tokens": 0, "rounds": 0})
+        # Ids shown in earlier answers are real too ("which one is cheapest" tags one of them).
+        earlier = set(_EARLIER_ID.findall(" ".join(str(t.get("content") or "") for t in history or [])))
         return self._finish(state.get("text", ""), state.get("seen", {}), state.get("used", []),
-                            state.get("model", ""), state.get("tokens", 0), started)
+                            state.get("model", ""), state.get("tokens", 0), started, earlier)
 
     @staticmethod
-    def _finish(text, seen, used, model, tokens, started) -> AgentResult:
+    def _finish(text, seen, used, model, tokens, started, earlier=frozenset()) -> AgentResult:
         cleaned = strip_links(text)
         cited = list(dict.fromkeys(_ID_TAG.findall(cleaned)))
         cited_ids = set(cited)
@@ -158,7 +174,8 @@ class ListingAgent:
         # Preserve the order in which the search tool returned the records,
         # rather than making card order depend on how the model mentions them.
         cards = [card for key, card in seen.items() if key in cited_ids][:10]
-        answer = _ID_TAG.sub(lambda m: m.group(0) if m.group(1) in seen else "", cleaned).strip()
+        answer = _ID_TAG.sub(lambda m: m.group(0) if m.group(1) in seen or m.group(1) in earlier else "",
+                             cleaned).strip()
         ms = int(round((time.perf_counter() - started) * 1000))
         log.info("listings: %s | %s tokens | %sms | %s",
                  ",".join(u["name"] + ("" if u["ok"] else "!") for u in used) or "no tools", tokens, ms, model)
