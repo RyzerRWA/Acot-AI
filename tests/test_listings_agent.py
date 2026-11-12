@@ -33,6 +33,23 @@ class FilterTests(unittest.TestCase):
             run_tool("get_listing", {"listing_id": "1; drop table listings"})
 
 
+class MessyPlaceTests(unittest.TestCase):
+    def test_misspelt_place_is_read_as_the_known_one(self):
+        from app.listings import tools
+        with patch.object(tools, "_place_names", ["Arjan", "Dubai Marina", "Jumeirah Village Circle"]):
+            self.assertEqual(tools._closest_place("arjun"), "Arjan")
+            self.assertEqual(tools._closest_place("dubai marena"), "Dubai Marina")
+            self.assertIsNone(tools._closest_place("Emaar"))   # a developer, not a place
+            self.assertIsNone(tools._closest_place("Arjan"))   # already right: nothing to fix
+
+    def test_reposted_adverts_show_once(self):
+        from app.listings import tools
+        with patch.object(tools, "fetch", side_effect=[[], [{"total": 0}]]) as fetch, \
+                patch.object(tools, "_recorded_rents", return_value=None):
+            tools.search_listings({})
+        self.assertIn("distinct on (lower(btrim(title)), price_aed)", fetch.call_args_list[0].args[0])
+
+
 class LinkTests(unittest.TestCase):
     def test_links_and_images_never_reach_the_user(self):
         self.assertEqual(" ".join(strip_links("a ![x](https://a.b/c.jpg) b").split()), "a b")
@@ -486,3 +503,27 @@ class SessionStoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PageContextTests(unittest.TestCase):
+    """"Ask ACOT about this" on Market insights: the page the chat came from reaches the model."""
+
+    def _system_notes(self, page):
+        from types import SimpleNamespace as NS
+        agent = ListingAgent(client=object())
+        seen = []
+
+        def chat(messages, tools):
+            seen.extend(messages)
+            return "fake", NS(usage=NS(total_tokens=1), choices=[NS(message=NS(content="ok", tool_calls=None))])
+
+        agent._chat = chat
+        agent.answer("What stands out right now?", page=page)
+        return [m["content"] for m in seen if m["role"] == "system"]
+
+    def test_market_page_adds_a_note(self):
+        self.assertTrue(any("market pulse" in note for note in self._system_notes("market")))
+
+    def test_no_page_or_unknown_page_adds_nothing(self):
+        for page in (None, "anything else"):
+            self.assertFalse(any("market pulse" in note for note in self._system_notes(page)))
