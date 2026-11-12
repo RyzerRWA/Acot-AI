@@ -1007,7 +1007,7 @@ RULES:
     "best", "more attractive", or "better investment".
 18. Base every comparison point on the supplied evidence.
 
-Return ONLY valid JSON:
+Return ONLY valid JSON. Double-quoted keys, no trailing commas, no markdown.
 
 {{
   "summary": "...",
@@ -1023,39 +1023,16 @@ Return ONLY valid JSON:
 
             response = await self.llm.generate(
                 prompt,
-                max_output_tokens=500,
+                max_output_tokens=1200,
             )
 
             if not response:
                 return None
 
-            text = str(
-                response
-            ).strip()
-
-            # Remove markdown JSON fences.
-            text = re.sub(
-                r"^```json\s*",
-                "",
-                text,
-                flags=re.IGNORECASE,
-            )
-
-            text = re.sub(
-                r"\s*```$",
-                "",
-                text,
-            )
-
-            parsed = json.loads(
-                text
-            )
-
-            if isinstance(
-                parsed,
-                dict,
-            ):
+            parsed = self._parse_llm_json(str(response))
+            if parsed is not None:
                 return parsed
+            print("AI analysis generation error: could not parse model JSON")
 
         except Exception as exc:
 
@@ -1065,6 +1042,97 @@ Return ONLY valid JSON:
             )
 
         return None
+
+    @staticmethod
+    def _parse_llm_json(text: str) -> Optional[Dict[str, Any]]:
+        """Load the analysis object even when the model wraps or slightly breaks JSON."""
+        if not text or not str(text).strip():
+            return None
+        for candidate in AIAnalysisEngine._json_candidates(str(text)):
+            parsed = AIAnalysisEngine._load_json_object(candidate)
+            if parsed is not None:
+                return parsed
+            repaired = AIAnalysisEngine._repair_json(candidate)
+            parsed = AIAnalysisEngine._load_json_object(repaired)
+            if parsed is not None:
+                return parsed
+            closed = AIAnalysisEngine._close_truncated_json(repaired)
+            parsed = AIAnalysisEngine._load_json_object(closed)
+            if parsed is not None:
+                return parsed
+        return None
+
+    @staticmethod
+    def _json_candidates(text: str) -> list[str]:
+        cleaned = text.strip()
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.I)
+        cleaned = re.sub(r"\s*```(?:\s*\w+)?\s*$", "", cleaned)
+        start = cleaned.find("{")
+        if start < 0:
+            return [cleaned] if cleaned else []
+        snippet = cleaned[start:]
+        end = snippet.rfind("}")
+        candidates = [snippet]
+        if end > 0:
+            candidates.insert(0, snippet[: end + 1])
+        return candidates
+
+    @staticmethod
+    def _load_json_object(text: str) -> Optional[Dict[str, Any]]:
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    @staticmethod
+    def _repair_json(text: str) -> str:
+        fixed = (
+            text.replace("\u201c", '"')
+            .replace("\u201d", '"')
+            .replace("\u2018", "'")
+            .replace("\u2019", "'")
+        )
+        fixed = re.sub(r",\s*([}\]])", r"\1", fixed)
+        fixed = re.sub(
+            r'([{\[,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:',
+            r'\1"\2":',
+            fixed,
+        )
+        return fixed
+
+    @staticmethod
+    def _close_truncated_json(text: str) -> str:
+        in_string = False
+        escape = False
+        quote = ""
+        stack: list[str] = []
+        for char in text:
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                elif char == quote:
+                    in_string = False
+                continue
+            if char in {'"', "'"}:
+                in_string = True
+                quote = char
+                continue
+            if char == "{":
+                stack.append("}")
+            elif char == "[":
+                stack.append("]")
+            elif stack and char == stack[-1]:
+                stack.pop()
+        closed = text
+        if in_string:
+            closed += quote or '"'
+        closed = re.sub(r",\s*$", "", closed)
+        while stack:
+            closed += stack.pop()
+        return closed
 
     # =========================================================
     # MERGE LLM DATA DESCRIPTION

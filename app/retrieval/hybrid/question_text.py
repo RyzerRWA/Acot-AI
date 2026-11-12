@@ -100,6 +100,8 @@ _DOMAIN_WORDS = (
     "community", "communities", "bedroom", "bedrooms",
     "apartment", "apartments", "price", "prices",
     "villa", "villas", "handover", "listing", "listings",
+    "agent", "agents", "broker", "brokers",
+    "transaction", "transactions",
 )
 
 _GENERIC_WORDS = {
@@ -112,12 +114,14 @@ _GENERIC_WORDS = {
     "invest", "investment", "investments", "investing", "u", "you",
     "property", "properties", "project", "projects",
     "community", "communities", "sub",
+    "agent", "agents", "broker", "brokers",
     "bedroom", "bedrooms", "bed", "beds", "room", "rooms",
     "price", "prices", "cost", "costs", "aed", "rent", "rental", "rentals",
     "apartment", "apartments", "villa", "villas", "townhouse", "townhouses",
     "listing", "listings", "unit", "units", "home", "homes",
     "starting", "under", "below", "above", "near",
     "handover", "completion", "ready",
+    "transaction", "transactions", "latest", "recent",
 }
 
 _CITIES = {
@@ -126,9 +130,9 @@ _CITIES = {
 }
 
 
-def _within_one_or_two_edits(left: str, right: str) -> bool:
-    if abs(len(left) - len(right)) > 2:
-        return False
+def _edit_distance(left: str, right: str, limit: int = 2) -> int:
+    if abs(len(left) - len(right)) > limit:
+        return limit + 1
     previous = list(range(len(right) + 1))
     for i, left_char in enumerate(left, start=1):
         current = [i]
@@ -138,34 +142,87 @@ def _within_one_or_two_edits(left: str, right: str) -> bool:
                 current[j - 1] + 1,
                 previous[j - 1] + (left_char != right_char),
             ))
-        if min(current) > 2:
-            return False
+        if min(current) > limit:
+            return limit + 1
         previous = current
-    return previous[-1] <= 2
+    return previous[-1]
+
+
+def _within_one_or_two_edits(left: str, right: str) -> bool:
+    return _edit_distance(left, right) <= 2
+
+
+def _word_stem(word: str) -> str:
+    if word.endswith("ies") and len(word) > 4:
+        return word[:-3] + "y"
+    if word.endswith("es") and len(word) > 3:
+        return word[:-2]
+    if word.endswith("s") and len(word) > 3:
+        return word[:-1]
+    return word
+
+
+_PLACE_WORD_LOCK = None
+
+
+def _locked_place_words() -> set:
+    """Tokens from real Dubai names. Never rewrite these into domain words."""
+    global _PLACE_WORD_LOCK
+    if _PLACE_WORD_LOCK is None:
+        from app.listings.tools import ALIASES
+        from app.retrieval.propai_catalog import _static_dubai_names
+
+        words = set()
+        for key, proper in ALIASES.items():
+            words.update(str(key).lower().split())
+            words.update(str(proper).lower().split())
+        for key, proper in _static_dubai_names().items():
+            words.update(str(key).lower().split())
+            words.update(str(proper).lower().split())
+        _PLACE_WORD_LOCK = {word for word in words if word.isalpha()}
+    return _PLACE_WORD_LOCK
 
 
 def _correct_domain_word(token: str) -> str:
-    if token in _DOMAIN_WORDS or len(token) < 5:
+    core, suffix = token, ""
+    stripped = token.rstrip(".,!?;:")
+    if stripped and stripped != token:
+        core, suffix = stripped, token[len(stripped):]
+    lowered = core.lower()
+    if lowered in _DOMAIN_WORDS or len(lowered) < 5:
         return token
-    stems = ("prop", "proj", "commun", "bedr", "apart", "pric")
-    if not token.startswith(stems):
+    if lowered in _locked_place_words():
         return token
-    matches = [
-        word for word in _DOMAIN_WORDS
-        if _within_one_or_two_edits(token, word)
-    ]
-    if not matches:
+    scored = []
+    for word in _DOMAIN_WORDS:
+        dist = _edit_distance(lowered, word)
+        if dist <= 2:
+            scored.append((dist, word))
+    if not scored:
         return token
-    token_plural = token.endswith("s")
+    best = min(dist for dist, _word in scored)
+    matches = [word for dist, word in scored if dist == best]
+    stems = {_word_stem(word) for word in matches}
+    if len(stems) > 1:
+        return token
+    token_plural = lowered.endswith("s")
     matches.sort(key=lambda word: (
-        abs(len(word) - len(token)),
         0 if word.endswith("s") == token_plural else 1,
+        abs(len(word) - len(lowered)),
     ))
-    return matches[0]
+    return matches[0] + suffix
 
 
 def _correct_domain_typos(text: str) -> str:
     return " ".join(_correct_domain_word(token) for token in text.split())
+
+
+def repair_typed_question(text: str) -> str:
+    """Fix mistyped domain words from known vocabulary. Does not list example typos."""
+
+    if not text:
+        return text
+    return _correct_domain_typos(text)
 
 
 _BEDROOM_WORDS = {"one": "1", "two": "2", "three": "3", "four": "4", "five": "5", "six": "6"}
@@ -446,7 +503,7 @@ def prepare_user_question(text: str) -> str:
     text = re.sub(r"[^a-z0-9,\s]", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     text = _normalize_bedrooms(text)
-    text = _correct_domain_typos(text)
+    text = repair_typed_question(text)
     # "hand over projects in 2028" → "handover projects in 2028"
     text = re.sub(r"\bhand[\s-]+over\b", "handover", text)
     text = re.sub(r"\b(?:yo|pls|lemme|wanna)\b", " ", text)
