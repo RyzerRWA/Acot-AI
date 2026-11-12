@@ -89,6 +89,67 @@ _SNAPSHOT = re.compile(
     r"latest data date|data date|last 12 months)\b",
     re.I,
 )
+_FAMILY = re.compile(r"\bfamil(?:y|ies)\b", re.I)
+_FAMILY_AREAS = re.compile(
+    r"\b(?:"
+    r"(?:which|what|best|top|good|ideal|suit(?:able)?)\b.{0,48}"
+    r"\b(?:areas?|communities|neighbourhoods?|neighborhoods?|places?)\b.{0,32}\bfamil"
+    r"|\bfamil(?:y|ies)\b.{0,32}\b(?:areas?|communities|neighbourhoods?|neighborhoods?|places?)"
+    r"|good place for (?:a )?famil"
+    r"|\bwhere\b.{0,48}\bfamil"
+    r")",
+    re.I,
+)
+_FAMILY_KIDS = re.compile(r"\b(?:kids?|children)\b", re.I)
+_FAMILY_AVOID_TOWERS = re.compile(
+    r"\b(?:not (?:just )?(?:the )?(?:busiest )?towers?|busiest towers?|"
+    r"not apartments?|apartment towers?)\b",
+    re.I,
+)
+_FAMILY_VILLAS = re.compile(r"\b(?:villas?|townhouses?|town houses?|low-?rise)\b", re.I)
+_FAMILY_NOT_STUDIOS = re.compile(r"\bnot studios?\b", re.I)
+_FAMILY_3BED = re.compile(r"\b3\s*-?\s*bed", re.I)
+_YIELD = re.compile(
+    r"\b(?:rental\s+yields?|gross\s+yields?|yields?|rois?|return on investment)\b",
+    re.I,
+)
+_READY_HOME = re.compile(
+    r"\b(?:ready(?:[\s-]?to[\s-]?(?:move|buy|live))?|completed|existing homes?)\b",
+    re.I,
+)
+_OFFPLAN = re.compile(r"\boff[\s-]?plan\b", re.I)
+_SHOW_MORE = re.compile(
+    r"^\s*(?:(?:please|kindly)\s+)?"
+    r"(?:(?:can|could|would)\s+you\s+)?"
+    r"(?:show|give|list|find|send)\s+(?:me\s+)?more"
+    r"(?:\s+(?:of\s+)?(?:these|those|them|options?|projects?|properties|"
+    r"results|listings|communities|areas?))?"
+    r"(?:\s+please)?"
+    r"\s*[.!]?\s*$",
+    re.I,
+)
+_SHOW_MORE_SHORT = re.compile(
+    r"^\s*(?:any\s+)?more"
+    r"(?:\s+(?:please|options?|projects?|properties|results|"
+    r"like\s+(?:these|this|those)))?"
+    r"\s*[.!]?\s*$",
+    re.I,
+)
+
+
+def family_area_focus(question: str | None) -> dict[str, bool]:
+    """What the family-area question actually asked for."""
+    text = question or ""
+    avoid_towers = bool(_FAMILY_AVOID_TOWERS.search(text))
+    want_villas = bool(_FAMILY_VILLAS.search(text))
+    kids = bool(_FAMILY_KIDS.search(text))
+    return {
+        "kids": kids,
+        "avoid_towers": avoid_towers,
+        "want_villas": want_villas or avoid_towers,
+        "not_studios": bool(_FAMILY_NOT_STUDIOS.search(text)),
+        "want_3bed": bool(_FAMILY_3BED.search(text)),
+    }
 
 
 def parse_budget_aed(question: str | None) -> int | None:
@@ -154,9 +215,57 @@ def _on_screen(conversation_memory) -> bool:
     return len(projects) >= 2
 
 
+def is_show_more(question: str | None) -> bool:
+    """True when the turn only asks for more of the previous search."""
+    text = (question or "").strip()
+    if not text:
+        return False
+    return bool(_SHOW_MORE.match(text) or _SHOW_MORE_SHORT.match(text))
+
+
+def prior_anchor_question(conversation_memory, current: str | None = None) -> str | None:
+    """Last real search question, skipping 'show me more' itself."""
+    seen = {(current or "").strip().lower()}
+    candidates: list[str] = []
+    for value in (
+        getattr(conversation_memory, "last_standalone_question", None),
+        getattr(conversation_memory, "last_user_question", None),
+    ):
+        if value:
+            candidates.append(str(value))
+    for turn in reversed(getattr(conversation_memory, "turns", None) or []):
+        if not isinstance(turn, dict):
+            continue
+        for key in ("standalone_question", "user_question"):
+            value = turn.get(key)
+            if value:
+                candidates.append(str(value))
+    for raw in candidates:
+        text = raw.strip()
+        key = text.lower()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        if is_show_more(text):
+            continue
+        return text
+    return None
+
+
 def classify_intent(question: str | None, conversation_memory=None) -> dict[str, Any]:
     """Return intent, optional kind, and subject. No database calls."""
     text = question or ""
+    if is_show_more(text):
+        prior = prior_anchor_question(conversation_memory, text)
+        if prior:
+            nested = classify_intent(prior, conversation_memory)
+            kind = nested.get("kind")
+            if nested.get("intent") == "recommend" and kind not in {None, "shortlist"}:
+                continued = dict(nested)
+                continued["more"] = True
+                continued["source_question"] = prior
+                return continued
+        return {"intent": "neither", "kind": "show_more", "subject": None}
     place = extract_place(text)
     if place and _SNAPSHOT.search(text) and not _PREDICT.search(text):
         return {
@@ -187,6 +296,27 @@ def classify_intent(question: str | None, conversation_memory=None) -> dict[str,
             "bedrooms": int(beds.group(1)) if beds else 1,
         }
     whole_market = (place or "").lower() in {"", "dubai"}
+    if whole_market and _FAMILY.search(text) and _FAMILY_AREAS.search(text):
+        focus = family_area_focus(text)
+        focus["no_yield"] = bool(_YIELD.search(text))
+        return {
+            "intent": "recommend",
+            "kind": "family_areas",
+            "subject": None,
+            "focus": focus,
+        }
+    if _YIELD.search(text):
+        return {
+            "intent": "recommend",
+            "kind": "yield_areas",
+            "subject": None if whole_market else place,
+        }
+    if _READY_HOME.search(text) and _OFFPLAN.search(text):
+        return {
+            "intent": "recommend",
+            "kind": "ready_offplan",
+            "subject": None if whole_market else place,
+        }
     open_city = bool(_OPEN_BEST.search(text) or (
         _SUGGEST_PICK.search(text)
         and whole_market

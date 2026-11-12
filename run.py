@@ -2190,7 +2190,7 @@ async def _prepare_acot_turn(
         choice["conversation_memory"] = conversation_memory
         return choice
 
-    from app.answers.intent_route import classify_intent
+    from app.answers.intent_route import classify_intent, prior_anchor_question
     from app.answers.intent_turns import predict_turn, recommend_data_turn
 
     route = classify_intent(question, conversation_memory)
@@ -2272,18 +2272,30 @@ async def _prepare_acot_turn(
             "small_talk": None,
         }
 
+    agent_question = question
+    if route.get("kind") == "show_more":
+        prior = prior_anchor_question(conversation_memory, question)
+        if prior:
+            agent_question = (
+                f"{prior.rstrip('.?!')}. "
+                "Show additional options for the same request, not the same list again."
+            )
     agent_turn = await _try_agent_turn(
-        question, components, timing_ms, ask_started
+        agent_question, components, timing_ms, ask_started
     )
     if agent_turn is not None:
         return agent_turn
 
     rewrite_started = time.perf_counter()
-    question_for_search = prepare_user_question(question) or question
-    standalone_question = await conversation_memory.rewrite_question(
-        question_for_search
-    )
-    timing_ms["rewrite"] = _elapsed_ms(rewrite_started)
+    question_for_search = prepare_user_question(agent_question) or agent_question
+    if route.get("kind") == "show_more" and agent_question != question:
+        standalone_question = agent_question
+        timing_ms["rewrite"] = 0
+    else:
+        standalone_question = await conversation_memory.rewrite_question(
+            question_for_search
+        )
+        timing_ms["rewrite"] = _elapsed_ms(rewrite_started)
 
     context = conversation_memory.context()
     context["current_user_question"] = question_for_search

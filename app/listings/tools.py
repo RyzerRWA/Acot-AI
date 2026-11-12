@@ -905,15 +905,38 @@ def _popular(areas: list[str]) -> dict[str, str]:
     return {a: _popular_names[a].title() for a in areas}
 
 
+def _area_stat_row(row: dict, names: dict[str, str]) -> dict:
+    return {
+        "area": names[row["area"]],
+        "official_area": row["area"],
+        "sales_12m": int(row["sales_12m"] or 0),
+        "rent_contracts": int(row.get("rent_contracts") or 0),
+        "median_sale_price_aed": None if row["median_price"] is None else int(row["median_price"]),
+        "median_price_per_sqft_aed": None if row["median_ppsf"] is None else int(row["median_ppsf"]),
+        "median_yearly_rent_aed": None if row["median_rent"] is None else int(row["median_rent"]),
+    }
+
+
 def top_areas_by_sales(limit: int = 8) -> list[dict]:
     """The areas with the most sale transactions in the last 12 months (Dubai Land Department records)."""
-    rows = fetch("select area, sales_12m, median_price, median_ppsf, median_rent from public.propai_area_stats "
+    rows = fetch("select area, sales_12m, median_price, median_ppsf, median_rent, rent_contracts "
+                 "from public.propai_area_stats "
                  "where sales_12m > 0 order by sales_12m desc limit %s", (limit,))
     names = _popular([r["area"] for r in rows])
-    return [{"area": names[r["area"]], "official_area": r["area"], "sales_12m": int(r["sales_12m"]),
-             "median_sale_price_aed": None if r["median_price"] is None else int(r["median_price"]),
-             "median_price_per_sqft_aed": None if r["median_ppsf"] is None else int(r["median_ppsf"]),
-             "median_yearly_rent_aed": None if r["median_rent"] is None else int(r["median_rent"])} for r in rows]
+    return [_area_stat_row(r, names) for r in rows]
+
+
+def top_areas_by_rent(limit: int = 8) -> list[dict]:
+    """Areas with the most recorded rental contracts, plus typical sale and rent."""
+    rows = fetch(
+        "select area, sales_12m, median_price, median_ppsf, median_rent, rent_contracts "
+        "from public.propai_area_stats "
+        "where rent_contracts > 0 and median_rent > 0 "
+        "order by rent_contracts desc limit %s",
+        (limit,),
+    )
+    names = _popular([r["area"] for r in rows])
+    return [_area_stat_row(r, names) for r in rows]
 
 
 def area_sales(raw) -> ToolResult:

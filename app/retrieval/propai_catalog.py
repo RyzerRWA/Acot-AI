@@ -141,9 +141,14 @@ def _handover(value):
     if not text:
         return None
     try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.replace(tzinfo=None)
+    if parsed.year < 1970 or parsed.year > 2100:
+        return None
+    return parsed
 
 
 def _projects_for(place: dict, limit: int = 8) -> list[dict]:
@@ -494,19 +499,21 @@ def agent_projects(filters: dict, limit: int = 8, sort: str = "cheapest") -> tup
 
     def rank(project):
         price = project.get("price") or 0
-        handover = project.get("handover_time") or datetime.max
+        handover = project.get("handover_time")
         if sort == "priciest":
             return (price <= 0, -(price or 0))
         if sort == "earliest_handover":
-            return (project.get("handover_time") is None, handover)
+            return (handover is None, handover or datetime(2099, 12, 31))
         if sort == "latest_handover":
-            missing = project.get("handover_time") is None
-            return (missing, datetime.min if missing else handover)
+            return (handover is None, handover or datetime(1970, 1, 1))
         return (price <= 0, price or 10**18)
 
     if sort == "latest_handover":
         projects.sort(
-            key=lambda project: (project.get("handover_time") is not None, project.get("handover_time") or datetime.min),
+            key=lambda project: (
+                project.get("handover_time") is not None,
+                project.get("handover_time") or datetime(1970, 1, 1),
+            ),
             reverse=True,
         )
     else:

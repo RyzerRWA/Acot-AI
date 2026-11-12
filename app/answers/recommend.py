@@ -48,18 +48,28 @@ def _handover_stamp(value) -> float | None:
     if value is None or value == "":
         return None
     if isinstance(value, (int, float)):
-        return float(value)
+        number = float(value)
+        # Unix seconds, not a calendar year. Windows rejects out-of-range stamps.
+        if number < 0 or number > 4_102_444_800:  # 1970–2100
+            return None
+        return number
+    year = getattr(value, "year", None)
+    if year is not None and (year < 1970 or year > 2100):
+        return None
     if hasattr(value, "timestamp"):
         try:
             return float(value.timestamp())
-        except Exception:
+        except (OSError, OverflowError, ValueError, TypeError):
             pass
     text = str(value).strip()
     if not text:
         return None
     try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
-    except ValueError:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.year < 1970 or parsed.year > 2100:
+            return None
+        return parsed.timestamp()
+    except (OSError, OverflowError, ValueError, TypeError):
         return None
 
 
@@ -599,7 +609,7 @@ def _handover_label(row: dict) -> str | None:
         return str(value) if value else None
     try:
         return datetime.utcfromtimestamp(stamp).strftime("%b %Y")
-    except Exception:
+    except (OSError, OverflowError, ValueError, TypeError):
         return None
 
 
@@ -639,18 +649,57 @@ def format_ranked_picks(
     return "\n".join(lines)
 
 
-def format_open_best(ranked: dict) -> str:
+_NO_BRIEF = re.compile(
+    r"\bno (?:area|budget|place)|without (?:an? )?(?:area|budget)|"
+    r"not (?:sure|decided)|haven'?t (?:picked|chosen|decided)|"
+    r"no area yet|no budget yet",
+    re.I,
+)
+_BEST_PROPERTY = re.compile(
+    r"\bbest (?:property|project)|which one is the best",
+    re.I,
+)
+_WHERE_BUY = re.compile(r"\bwhere should i (?:buy|invest|live)\b", re.I)
+
+
+def _open_buy_header(question: str | None, *, more: bool = False) -> list[str]:
+    """First lines should answer the question, not reuse one canned opener."""
+    text = question or ""
+    if more:
+        return [
+            "More communities from the same market map, still ranked by recorded sales:",
+            "",
+        ]
+    if _NO_BRIEF.search(text) or _WHERE_BUY.search(text):
+        return [
+            "If you have no area or budget yet, start from the goal — live in the home, or rent it out — rather than picking a building first.",
+            "",
+            "To map the market, these Dubai areas had the most recorded sales in the last 12 months:",
+            "",
+        ]
+    if _BEST_PROPERTY.search(text):
+        return [
+            "There isn’t a single best property in Dubai without an area and a budget.",
+            "",
+            "From recorded sales in the last 12 months, these communities are the most active right now:",
+            "",
+        ]
+    return [
+        "Without a locked area or budget, recent sales activity is a useful map of where people are buying.",
+        "",
+        "From recorded sales in the last 12 months:",
+        "",
+    ]
+
+
+def format_open_best(ranked: dict, question: str | None = None) -> str:
     items = (ranked.get("ranked") or [])[:3]
     if not items:
         return (
             "Share your budget and preferred area and I’ll match buy options from our data."
         )
-    lines = [
-        "A strong starting point in Dubai depends on budget and whether you want to live there or invest.",
-        "",
-        "From our project data, these are practical buy matches right now:",
-        "",
-    ]
+    lines = _open_buy_header(question)
+    lines[-2] = "From our project data, these are practical buy matches right now:"
     for index, item in enumerate(items, start=1):
         row = item.get("row") or item
         lines.append(_project_bullet(index, {**row, "name": item.get("name") or row.get("name")}))
@@ -659,17 +708,265 @@ def format_open_best(ranked: dict) -> str:
     return "\n".join(lines)
 
 
-def format_open_areas(areas: list[dict]) -> str:
+_FAMILY_LABELS = {
+    "springs": "The Springs",
+    "meadows": "The Meadows",
+    "dubai hills": "Dubai Hills Estate",
+}
+
+
+def _family_area_label(raw: str) -> str:
+    from app.listings.tools import ALIASES
+
+    text = " ".join(str(raw or "").split())
+    if not text:
+        return ""
+    key = text.lower()
+    if key in _FAMILY_LABELS:
+        return _FAMILY_LABELS[key]
+    if key in ALIASES:
+        return ALIASES[key]
+    for alias, proper in ALIASES.items():
+        if key == alias or key.startswith(alias + " "):
+            return proper
+    return text.title()
+
+
+def _family_share(part, whole) -> float:
+    total = _num(whole) or 0
+    if total <= 0:
+        return 0.0
+    return (_num(part) or 0) / total
+
+
+def rank_family_areas(items: list[dict], focus: dict | None = None, limit: int = 5) -> list[dict]:
+    """Ready villas beat raw 3-bed volume so new apartment launches do not win."""
+    focus = focus or {}
+    cap = max(3, min(int(limit or 5), 8))
+    rows = []
+    for item in items:
+        existing = int(item.get("existing_sales") or 0)
+        villas_ready = int(item.get("existing_villas") or 0)
+        villas = int(item.get("villa_sales") or item.get("villa_townhouse_sales") or 0)
+        family = int(item.get("existing_family_sales") or item.get("family_sales") or 0)
+        homes = int(item.get("sales_12m") or 0)
+        row = {
+            **item,
+            "existing_villas": villas_ready,
+            "villa_sales": villas,
+            "villa_townhouse_sales": villas,
+            "existing_villa_share": _family_share(villas_ready, existing),
+            "villa_share": _family_share(villas, homes),
+        }
+        rows.append(row)
+
+    avoid_towers = bool(focus.get("avoid_towers"))
+    villa_stock = bool(focus.get("want_villas") and (focus.get("want_3bed") or focus.get("not_studios")))
+
+    if avoid_towers:
+        picked = [
+            row for row in rows
+            if row["existing_villas"] >= 20 and row["existing_villa_share"] >= 0.35
+        ]
+        picked.sort(
+            key=lambda row: (row["existing_villa_share"], row["existing_villas"]),
+            reverse=True,
+        )
+        if len(picked) < 3:
+            picked = [
+                row for row in rows
+                if row["existing_villas"] >= 15 and row["existing_villa_share"] >= 0.25
+            ]
+            picked.sort(
+                key=lambda row: (row["existing_villa_share"], row["existing_villas"]),
+                reverse=True,
+            )
+    elif villa_stock:
+        picked = [
+            row for row in rows
+            if row["villa_sales"] >= 40 and row["villa_share"] >= 0.25
+        ]
+        picked.sort(
+            key=lambda row: (row["villa_sales"], int(row.get("family_sales") or 0)),
+            reverse=True,
+        )
+    else:
+        picked = [
+            row for row in rows
+            if row["existing_villas"] >= 20 and row["existing_villa_share"] >= 0.08
+        ]
+        picked.sort(
+            key=lambda row: (
+                row["existing_villas"],
+                int(row.get("existing_family_sales") or row.get("family_sales") or 0),
+            ),
+            reverse=True,
+        )
+        if len(picked) < 3:
+            picked = [
+                row for row in rows
+                if row["existing_villas"] >= 15 and row["existing_villa_share"] >= 0.08
+            ]
+            picked.sort(
+                key=lambda row: (
+                    row["existing_villas"],
+                    int(row.get("existing_family_sales") or row.get("family_sales") or 0),
+                ),
+                reverse=True,
+            )
+    return picked[:cap]
+
+
+def fetch_family_areas(limit: int = 5, focus: dict | None = None) -> list[dict]:
+    """Communities with ready villa / 3-bed sales, not land or tower volume."""
+    from app.database.postgres import fetch
+
+    try:
+        rows = fetch(
+            """
+            with s as (
+              select coalesce(nullif(btrim(master_project_prop_ai), ''), area_name_prop_ai) as area,
+                     bedrooms,
+                     property_type_en,
+                     development_status,
+                     sale_price
+              from public.propai_sales
+              where deleted_at is null
+                and coalesce(outlier_flag, '') <> 'True'
+                and sale_price > 0
+                and instance_date >= current_date - interval '12 months'
+                and (
+                  property_type_en = 'Villa'
+                  or (property_type_en = 'Unit' and property_sub_type_en = 'Flat')
+                )
+                and coalesce(nullif(btrim(master_project_prop_ai), ''), area_name_prop_ai) is not null
+            )
+            select area,
+                   count(*)::int as sales_12m,
+                   count(*) filter (where development_status = 'Existing')::int as existing_sales,
+                   count(*) filter (where property_type_en = 'Villa')::int as villa_sales,
+                   count(*) filter (
+                     where property_type_en = 'Villa' and development_status = 'Existing'
+                   )::int as existing_villas,
+                   count(*) filter (where bedrooms >= 3)::int as family_sales,
+                   count(*) filter (
+                     where bedrooms >= 3 and development_status = 'Existing'
+                   )::int as existing_family_sales,
+                   percentile_cont(0.5) within group (order by sale_price)
+                     filter (
+                       where bedrooms >= 3 and development_status = 'Existing'
+                     )::float8 as median_family_sale
+            from s
+            group by 1
+            having count(*) filter (where property_type_en = 'Villa') >= 15
+                or count(*) filter (
+                     where bedrooms >= 3 and development_status = 'Existing'
+                   ) >= 30
+            """
+        )
+    except Exception:
+        return []
+    items = []
+    for row in rows:
+        raw = row.get("area")
+        if not raw:
+            continue
+        median = row.get("median_family_sale")
+        items.append(
+            {
+                "area": _family_area_label(raw),
+                "official_area": raw,
+                "sales_12m": int(row.get("sales_12m") or 0),
+                "existing_sales": int(row.get("existing_sales") or 0),
+                "villa_sales": int(row.get("villa_sales") or 0),
+                "villa_townhouse_sales": int(row.get("villa_sales") or 0),
+                "existing_villas": int(row.get("existing_villas") or 0),
+                "family_sales": int(row.get("family_sales") or 0),
+                "existing_family_sales": int(row.get("existing_family_sales") or 0),
+                "median_family_sale": int(round(median)) if median else None,
+            }
+        )
+    return rank_family_areas(items, focus=focus, limit=limit)
+
+
+def format_family_areas(areas: list[dict], focus: dict | None = None) -> str:
     if not areas:
         return (
-            "Share your budget and preferred area and I’ll match buy options from our data."
+            "Share your budget and whether you want a villa, townhouse or apartment, "
+            "and I’ll match family-size homes from our data."
         )
-    lines = [
-        "A strong starting point in Dubai depends on budget and whether you want to live there or invest.",
-        "",
-        "From recorded sales in the last 12 months, these areas currently look strong:",
-        "",
-    ]
+    focus = focus or {}
+    if focus.get("avoid_towers"):
+        intro = (
+            "You asked for family communities, not busy apartment towers. "
+            "From ready sales in the last 12 months, these areas have a high share of villas:"
+        )
+        follow = "Want me to narrow this to a budget, or to townhouses only?"
+    elif focus.get("want_3bed") and focus.get("want_villas"):
+        intro = (
+            "These Dubai communities currently have the most 3-bedroom and villa sales in our records — "
+            "the stock families usually look for:"
+        )
+        follow = "What’s your budget, and is a villa or a townhouse the priority?"
+    elif focus.get("not_studios") or (focus.get("want_villas") and not focus.get("kids")):
+        intro = (
+            "These communities are selling villas and townhouses, not studios. "
+            "Figures are from recorded sales in the last 12 months:"
+        )
+        follow = "What budget should I use to shortlist a home?"
+    elif focus.get("kids"):
+        intro = (
+            "For a family with children, extra bedrooms and villas are the clearest signal in our sales data. "
+            "These communities lead on ready villa and 3-bedroom sales:"
+        )
+        follow = "What’s your budget, and do you want a villa or a townhouse?"
+    else:
+        intro = (
+            "Families usually need more bedrooms and more low-rise homes. "
+            "From ready sales in the last 12 months, these Dubai communities stand out on villa and 3-bedroom activity:"
+        )
+        follow = "What’s your budget, and do you want a villa, townhouse, or apartment?"
+    if focus.get("no_yield"):
+        intro = (
+            "ACOT does not have rental yield or ROI. "
+            + intro
+        )
+    lines = [intro, ""]
+    for index, area in enumerate(areas[:5], start=1):
+        name = str(area.get("area") or "This area").strip()
+        bits = []
+        ready_villas = area.get("existing_villas")
+        if ready_villas:
+            bits.append(f"{int(ready_villas):,} ready villa sales")
+        elif area.get("villa_sales") or area.get("villa_townhouse_sales"):
+            bits.append(
+                f"{int(area.get('villa_sales') or area.get('villa_townhouse_sales')):,} villa sales"
+            )
+        share = area.get("existing_villa_share")
+        if share and share >= 0.08:
+            bits.append(f"{int(round(share * 100))}% of ready sales are villas")
+        family = area.get("existing_family_sales") or area.get("family_sales")
+        if family:
+            bits.append(f"{int(family):,} ready 3+ bedroom sales")
+        price = _aed_text(area.get("median_family_sale"))
+        if price:
+            bits.append(f"typical 3+ bedroom sale around {price}")
+        lines.append(f"{index}. **{name}**")
+        if bits:
+            lines.append("   " + ". ".join(bits) + ".")
+        lines.append("")
+    lines.append("The cards below are example homes from these communities.")
+    lines.append(follow)
+    return "\n".join(lines)
+
+
+def format_open_areas(areas: list[dict], question: str | None = None, more: bool = False) -> str:
+    if not areas:
+        return (
+            "If you have no area or budget yet, tell me whether this is to live in or to rent out "
+            "and I’ll map buy options from our sales data."
+        )
+    lines = _open_buy_header(question, more=more)
     for index, area in enumerate(areas[:5], start=1):
         name = str(area.get("area") or "This area").strip()
         bits = []
@@ -687,6 +984,165 @@ def format_open_areas(areas: list[dict]) -> str:
         lines.append("")
     lines.append("The cards below are example projects from these areas.")
     lines.append("What’s your budget, and is this to live in or to rent out?")
+    return "\n".join(lines)
+
+
+def format_yield_areas(areas: list[dict], place: str | None = None) -> str:
+    """No yield %. Quote recorded rents and sales only."""
+    if not areas:
+        return (
+            "ACOT does not have rental yield or ROI. "
+            "Share an area and I’ll quote the recorded rents and sale prices we do have."
+        )
+    lines = [
+        "ACOT does not have rental yield or ROI — that needs matched rent and purchase prices on the same homes.",
+        "",
+    ]
+    if place:
+        lines.append(
+            f"From recorded rents and sales, here is what we have for {place} and other active rental areas:"
+        )
+    else:
+        lines.append(
+            "From recorded rents, these Dubai areas currently have the most rental contracts:"
+        )
+    lines.append("")
+    for index, area in enumerate(areas[:5], start=1):
+        name = str(area.get("area") or "This area").strip()
+        bits = []
+        contracts = area.get("rent_contracts")
+        if contracts:
+            bits.append(f"{int(contracts):,} recorded rental contracts")
+        rent = _aed_text(area.get("median_yearly_rent_aed") or area.get("median_rent"))
+        if rent:
+            bits.append(f"typical yearly rent around {rent}")
+        price = _aed_text(area.get("median_sale_price_aed") or area.get("median_price"))
+        if price:
+            bits.append(f"typical sale around {price}")
+        sales = area.get("sales_12m")
+        if sales:
+            bits.append(f"{int(sales):,} sales in the last 12 months")
+        lines.append(f"{index}. **{name}**")
+        if bits:
+            lines.append("   " + ". ".join(bits) + ".")
+        lines.append("")
+    lines.append("The cards below are example projects from these areas.")
+    lines.append("What’s your budget, and is this to live in or to rent out?")
+    return "\n".join(lines)
+
+
+def fetch_ready_offplan_stats(place: str | None = None) -> dict[str, dict]:
+    """Last-12-month sales split into ready vs off-plan. No yield or forecast."""
+    from app.database.postgres import fetch
+
+    clauses = [
+        "deleted_at is null",
+        "coalesce(outlier_flag, '') <> 'True'",
+        "sale_price > 0",
+        "instance_date >= current_date - interval '12 months'",
+        "coalesce(property_type_en, '') not in ('Land', 'Plot')",
+    ]
+    params: list = ["%off%plan%", "%exist%", "%ready%", "%complet%"]
+    if place:
+        clauses.append(
+            "(area_name_prop_ai ilike %s or master_project_prop_ai ilike %s)"
+        )
+        like = f"%{place}%"
+        params.extend([like, like])
+    try:
+        rows = fetch(
+            f"""
+            select
+              case
+                when development_status ilike %s then 'offplan'
+                when development_status ilike %s
+                  or development_status ilike %s
+                  or development_status ilike %s
+                  then 'ready'
+                else 'other'
+              end as band,
+              count(*)::int as sales_12m,
+              percentile_cont(0.5) within group (order by sale_price)::float8 as median_price,
+              percentile_cont(0.5) within group (
+                order by price_per_sqft
+              ) filter (where price_per_sqft > 0)::float8 as median_ppsf
+            from public.propai_sales
+            where {' and '.join(clauses)}
+            group by 1
+            """,
+            tuple(params),
+        )
+    except Exception:
+        return {}
+    out: dict[str, dict] = {}
+    for row in rows or []:
+        band = str(row.get("band") or "")
+        if band not in {"ready", "offplan"}:
+            continue
+        out[band] = {
+            "sales_12m": int(row.get("sales_12m") or 0),
+            "median_price": row.get("median_price"),
+            "median_ppsf": row.get("median_ppsf"),
+        }
+    return out
+
+
+def _status_stat_line(label: str, stats: dict | None) -> list[str]:
+    stats = stats or {}
+    bits = []
+    if stats.get("sales_12m"):
+        bits.append(f"{int(stats['sales_12m']):,} recorded sales")
+    price = _aed_text(stats.get("median_price"))
+    if price:
+        bits.append(f"typical sale around {price}")
+    psf = _num(stats.get("median_ppsf"))
+    if psf:
+        bits.append(f"about AED {int(psf):,} per sq ft")
+    lines = [f"**{label}**"]
+    if bits:
+        lines.append("   " + ". ".join(bits) + ".")
+    else:
+        lines.append("   No recorded sales in this split for the last 12 months.")
+    return lines
+
+
+def format_ready_offplan(
+    stats: dict[str, dict] | None,
+    ready_projects: list[dict],
+    offplan_projects: list[dict],
+    place: str | None = None,
+) -> str:
+    where = f" in {place}" if place else " in Dubai"
+    lines = [
+        f"Ready and off-plan are both active{where}. "
+        "Our data does not pick a winner — it depends on whether you need the home now or can wait for handover.",
+        "",
+        "From recorded sales in the last 12 months:",
+        "",
+    ]
+    lines.extend(_status_stat_line("Ready (existing homes)", (stats or {}).get("ready")))
+    lines.append("")
+    for index, row in enumerate(ready_projects[:2], start=1):
+        lines.append(_project_bullet(index, row))
+    if not ready_projects:
+        lines.append("Example ready projects are on the cards when the data has them.")
+    lines.append("")
+    lines.extend(_status_stat_line("Off-plan", (stats or {}).get("offplan")))
+    lines.append("")
+    start = len(ready_projects[:2]) + 1
+    for offset, row in enumerate(offplan_projects[:2]):
+        lines.append(_project_bullet(start + offset, row))
+    if not offplan_projects:
+        lines.append("Example off-plan projects are on the cards when the data has them.")
+    lines.append("")
+    lines.append(
+        "General guidance: ready usually means you can live in or rent it after transfer. "
+        "Off-plan usually means a payment plan and waiting until handover. "
+        "Typical terms vary by developer — check the sale contract. This is not legal or financial advice."
+    )
+    lines.append("")
+    lines.append("The cards below are example ready and off-plan projects.")
+    lines.append("What’s your budget, and do you need to move in this year?")
     return "\n".join(lines)
 
 
