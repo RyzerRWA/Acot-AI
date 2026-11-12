@@ -417,6 +417,8 @@ class QuestionUnderstandingTests(unittest.TestCase):
         self.assertFalse(m._looks_like_follow_up("one bedroom apartments under 2 million"))
         self.assertTrue(m._looks_like_follow_up("compare 1 and 2"))
         self.assertTrue(m._looks_like_follow_up("what is their price"))
+        self.assertTrue(m._looks_like_follow_up("show me more"))
+        self.assertTrue(m._looks_like_follow_up("more options"))
 
     def test_a_single_ordinal_is_resolved_without_the_model(self):
         m = self.memory

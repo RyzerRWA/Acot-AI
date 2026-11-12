@@ -211,6 +211,8 @@ class QueryPlanner:
         r"^\s*compare\s+\d+\s*(?:and|&|,)\s*\d+\b",
         r"\b(?:the\s+)?(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\b",
         r"^\s*(why|how much|what price|what rent|what about)\b",
+        r"^\s*(?:please\s+)?(?:show|give|list)\s+(?:me\s+)?more\b",
+        r"^\s*(?:any\s+)?more(?:\s+(?:please|options?|projects?|properties))?\s*[.!]?\s*$",
     )
 
     @classmethod

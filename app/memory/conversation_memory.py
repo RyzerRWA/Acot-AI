@@ -100,6 +100,7 @@ class ConversationMemory:
         # ---------------------------------------------------------
         self.last_user_question: Optional[str] = None
         self.last_standalone_question: Optional[str] = None
+        self.pending_place_choice: Optional[str] = None
 
     # =============================================================
     # BASIC HELPERS
@@ -321,9 +322,16 @@ class ConversationMemory:
         follow_up_phrases = [
             "what about",
             "how about",
+            "show me more",
+            "show more",
             "tell me more",
             "more details",
             "more information",
+            "more options",
+            "more projects",
+            "more properties",
+            "more of these",
+            "more of those",
             "give me more",
             "the project",
             "the projects",
@@ -1781,6 +1789,7 @@ Rules:
 
         self.last_user_question = None
         self.last_standalone_question = None
+        self.pending_place_choice = None
 
     # =============================================================
     # DEBUG
