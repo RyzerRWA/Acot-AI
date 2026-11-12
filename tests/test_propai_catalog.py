@@ -31,3 +31,17 @@ def test_size_filters_stay_on_the_older_project_table():
 def test_handover_parses_an_iso_date():
     parsed = _handover("2027-05-30T00:00:00")
     assert parsed is not None and parsed.year == 2027
+
+
+def test_catalog_projects_get_the_brochure_from_the_projects_table(monkeypatch):
+    """Catalog rows have no brochure; 'Send me the brochure of Sobha One' must still find it."""
+    from app.retrieval import propai_catalog
+
+    monkeypatch.setattr(
+        propai_catalog, "fetch",
+        lambda sql, params: [{"name": "sobha one", "brochure_url": "https://example.test/sobha-one.pdf"}],
+    )
+    projects = [{"name": "Sobha One", "brochure_url": None}, {"name": "Hanover Square", "brochure_url": None}]
+    propai_catalog._attach_brochures(projects)
+    assert projects[0]["brochure_url"] == "https://example.test/sobha-one.pdf"
+    assert projects[1]["brochure_url"] is None
