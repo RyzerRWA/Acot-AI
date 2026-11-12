@@ -2093,6 +2093,21 @@ async def _prepare_acot_turn(
         choice["conversation_memory"] = conversation_memory
         return choice
 
+    from app.answers.intent_route import classify_intent
+    from app.answers.intent_turns import predict_turn, recommend_data_turn
+
+    route = classify_intent(question, conversation_memory)
+    if route.get("intent") == "predict":
+        predicted = await asyncio.to_thread(
+            predict_turn, question, conversation_memory, route
+        )
+        if predicted is not None:
+            predicted["timing_ms"] = timing_ms
+            predicted["ask_started"] = ask_started
+            predicted["rag_chain"] = rag_chain
+            predicted["conversation_memory"] = conversation_memory
+            return predicted
+
     compare_shown = await asyncio.to_thread(
         _compare_shown_turn, question, conversation_memory
     )
@@ -2112,6 +2127,17 @@ async def _prepare_acot_turn(
         shortlist_turn["rag_chain"] = rag_chain
         shortlist_turn["conversation_memory"] = conversation_memory
         return shortlist_turn
+
+    if route.get("intent") == "recommend":
+        rec_turn = await asyncio.to_thread(
+            recommend_data_turn, question, conversation_memory, route
+        )
+        if rec_turn is not None:
+            rec_turn["timing_ms"] = timing_ms
+            rec_turn["ask_started"] = ask_started
+            rec_turn["rag_chain"] = rag_chain
+            rec_turn["conversation_memory"] = conversation_memory
+            return rec_turn
 
     shown_followup = _shown_project_followup(question, conversation_memory)
     if shown_followup is not None:

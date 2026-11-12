@@ -550,3 +550,227 @@ def format_compare_table(projects: list[dict], result: dict) -> str:
     ]
     intro = f"Side-by-side comparison of {', '.join(names)} on price, size, sales and rentals:"
     return intro + "\n\n" + "\n".join(rows) + "\n\n" + format_footer(result)
+
+
+def tag_project(row: dict | None) -> str:
+    """Display name only. Cards come from structured data, never from raw ids."""
+    name = str((row or {}).get("name") or "this project").strip() or "this project"
+    return f"**{name}**"
+
+
+def _aed_text(value) -> str | None:
+    number = _num(value)
+    if number is None or number <= 0:
+        return None
+    return f"AED {int(round(number)):,}"
+
+
+def _project_points(row: dict | None) -> list[str]:
+    row = row or {}
+    points = []
+    community = str(row.get("community") or row.get("area") or "").strip()
+    if community:
+        points.append(community)
+    price = _aed_text(row.get("price") or row.get("starting_price_aed") or row.get("price_aed"))
+    if price:
+        kind = str(row.get("price_kind") or "")
+        points.append(
+            f"recent sale around {price}" if kind == "recent_sale" else f"from {price}"
+        )
+    sales = _num(row.get("sales_count"), row.get("recent_sales_count"))
+    if sales:
+        points.append(f"{int(sales)} recent sales")
+    hand = _handover_label(row)
+    if hand:
+        points.append(f"handover {hand}")
+    return points
+
+
+def _project_bullet(index: int, row: dict) -> str:
+    points = _project_points(row)
+    detail = f" — {'; '.join(points)}" if points else ""
+    return f"{index}. {tag_project(row)}{detail}."
+
+
+def _handover_label(row: dict) -> str | None:
+    value = row.get("handover_time") or row.get("handover")
+    stamp = _handover_stamp(value)
+    if stamp is None:
+        return str(value) if value else None
+    try:
+        return datetime.utcfromtimestamp(stamp).strftime("%b %Y")
+    except Exception:
+        return None
+
+
+def within_months(row: dict, months: int) -> bool:
+    stamp = _handover_stamp(row.get("handover_time") or row.get("handover"))
+    if stamp is None:
+        text = str(row.get("status") or row.get("project_status") or "")
+        return bool(_READY.search(text))
+    horizon = datetime.utcnow().timestamp() + months * 30 * 24 * 3600
+    return stamp <= horizon
+
+
+def format_ranked_picks(
+    ranked: dict,
+    *,
+    intro: str,
+    relaxed: str | None = None,
+) -> str:
+    items = ranked.get("ranked") or []
+    winner = ranked.get("winner") or (items[0] if items else None)
+    shown = items[:3]
+    if not winner:
+        return intro.rstrip(",") + "."
+    why = _detail_why(winner, winner.get("why") or ranked.get("why") or [])[:2]
+    lines = [intro.rstrip(",") + ".", ""]
+    for index, item in enumerate(shown, start=1):
+        row = item.get("row") or item
+        lines.append(_project_bullet(index, {**row, "name": item.get("name") or row.get("name")}))
+    lines.append("")
+    lines.append(f"{tag_project(winner)} is the strongest match on the recorded price, size and sales activity.")
+    for point in why:
+        lines.append(f"- {point}")
+    if relaxed:
+        lines.append(relaxed)
+    else:
+        lines.append("Share a bedroom tweak or a nearby area and I’ll tighten this list.")
+    return "\n".join(lines)
+
+
+def format_open_best(ranked: dict) -> str:
+    items = (ranked.get("ranked") or [])[:3]
+    if not items:
+        return (
+            "Share your budget and preferred area and I’ll match buy options from our data."
+        )
+    lines = [
+        "A strong starting point in Dubai depends on budget and whether you want to live there or invest.",
+        "",
+        "From our project data, these are practical buy matches right now:",
+        "",
+    ]
+    for index, item in enumerate(items, start=1):
+        row = item.get("row") or item
+        lines.append(_project_bullet(index, {**row, "name": item.get("name") or row.get("name")}))
+    lines.append("")
+    lines.append("What’s your budget, and is this to live in or to rent out?")
+    return "\n".join(lines)
+
+
+def format_open_areas(areas: list[dict]) -> str:
+    if not areas:
+        return (
+            "Share your budget and preferred area and I’ll match buy options from our data."
+        )
+    lines = [
+        "A strong starting point in Dubai depends on budget and whether you want to live there or invest.",
+        "",
+        "From recorded sales in the last 12 months, these areas currently look strong:",
+        "",
+    ]
+    for index, area in enumerate(areas[:5], start=1):
+        name = str(area.get("area") or "This area").strip()
+        bits = []
+        if area.get("sales_12m"):
+            bits.append(f"{int(area['sales_12m']):,} recorded sales")
+        price = _aed_text(area.get("median_sale_price_aed") or area.get("median_price"))
+        if price:
+            bits.append(f"typical sale around {price}")
+        psf = area.get("median_price_per_sqft_aed") or area.get("median_ppsf")
+        if psf:
+            bits.append(f"about AED {int(psf):,} per sq ft")
+        lines.append(f"{index}. **{name}**")
+        if bits:
+            lines.append("   " + ". ".join(bits) + ".")
+        lines.append("")
+    lines.append("The cards below are example projects from these areas.")
+    lines.append("What’s your budget, and is this to live in or to rent out?")
+    return "\n".join(lines)
+
+
+def _bed_label(bedrooms: int | None) -> str:
+    if bedrooms is None:
+        return "home"
+    if bedrooms <= 0:
+        return "studio"
+    if bedrooms == 1:
+        return "1-bedroom"
+    return f"{int(bedrooms)}-bedroom"
+
+
+def format_afford_answer(
+    place: str,
+    budget_aed: int,
+    median: dict | None,
+    projects: list[dict],
+    nearby: list[dict],
+    bedrooms: int | None = 1,
+) -> str:
+    names = [str(row.get("name") or "").strip() for row in projects[:3] if row.get("name")]
+    areas = [str(row.get("area") or "").title() for row in nearby[:3] if row.get("area")]
+    label = _bed_label(bedrooms)
+    lines = []
+    if median and median.get("median"):
+        centre = f"AED {int(median['median']):,}"
+        lines.append(
+            f"{label.capitalize()} sales in {place} recently centre around {centre} (last 12 months)."
+        )
+        lines.append("")
+        if budget_aed >= median["median"] * 0.92:
+            lines.append(f"AED {budget_aed:,} sits in that band.")
+        else:
+            lines.append(
+                f"AED {budget_aed:,} sits below that typical {place} level, so nearby areas can be a better fit."
+            )
+        if names:
+            lines.append("Closest options we have are on the cards below.")
+        if areas and budget_aed < median["median"] * 0.92:
+            lines.append(
+                f"AED {budget_aed:,} also lines up with recorded prices in "
+                + " and ".join(areas)
+                + "."
+            )
+        lines.append("")
+        lines.append(f"Want those {label}s, or {place} homes closest to this budget?")
+        return "\n".join(lines)
+    if names:
+        return (
+            f"Here are {place} options in our data near AED {budget_aed:,}. "
+            "They are on the cards below.\n\n"
+            "Want me to filter by bedrooms?"
+        )
+    if areas:
+        return (
+            f"AED {budget_aed:,} lines up with recorded prices in "
+            + " and ".join(areas)
+            + f". I can show {label}s there now."
+        )
+    return (
+        f"Share a bedroom count or a nearby area and I’ll match options around AED {budget_aed:,}."
+    )
+
+
+def format_split_answer(studios: list[dict], villas: list[dict], budget_aed: int | None) -> str:
+    budget = f" around AED {budget_aed:,}" if budget_aed else ""
+    lines = [
+        "Those are two different searches, so here are two short lists from our data.",
+        "",
+        f"Studios{budget}:",
+    ]
+    if studios:
+        for index, row in enumerate(studios[:2], start=1):
+            lines.append(_project_bullet(index, row))
+    else:
+        lines.append("- I can go deeper on studios once you pick this list.")
+    lines.append("")
+    lines.append("4-bedroom beach villas:")
+    if villas:
+        for index, row in enumerate(villas[:2], start=1):
+            lines.append(_project_bullet(index, row))
+    else:
+        lines.append("- I can go deeper on villas once you pick this list.")
+    lines.append("")
+    lines.append("Which list should I go deeper on?")
+    return "\n".join(lines)
