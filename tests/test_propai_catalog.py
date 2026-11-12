@@ -74,3 +74,17 @@ def test_resolve_dubai_place_reads_near_miss_spellings():
     assert resolve_dubai_place("anantapur") is None
     assert resolve_dubai_place("jumera") is None
     assert known_dubai_label("jumera") is None
+
+
+def test_catalog_projects_get_the_brochure_from_the_projects_table(monkeypatch):
+    """Catalog rows have no brochure; 'Send me the brochure of Sobha One' must still find it."""
+    from app.retrieval import propai_catalog
+
+    monkeypatch.setattr(
+        propai_catalog, "fetch",
+        lambda sql, params: [{"name": "sobha one", "brochure_url": "https://example.test/sobha-one.pdf"}],
+    )
+    projects = [{"name": "Sobha One", "brochure_url": None}, {"name": "Hanover Square", "brochure_url": None}]
+    propai_catalog._attach_brochures(projects)
+    assert projects[0]["brochure_url"] == "https://example.test/sobha-one.pdf"
+    assert projects[1]["brochure_url"] is None

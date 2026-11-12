@@ -258,6 +258,8 @@ def _format_project_card(record):
             "property_finder_url"
         ),
         "source": record.get("source"),
+        # Catalog projects: opens /project-intelligence/projects/<key> in the app.
+        "key": record.get("key"),
     }
 
 
@@ -1044,6 +1046,8 @@ def build_frontend_response(
                 investment_analysis
             ),
             "comparison": (_build_comparison(structured_summary) or {}).get("sides") or [],
+            # Recorded sales (date, price, bedrooms, size, project) for "recent transactions" answers.
+            "transactions": _json_safe(structured_summary.get("transactions") or []),
         },
         "meta": {
             "counts": {

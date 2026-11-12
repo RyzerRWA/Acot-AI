@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from app.listings.tools import _find_projects, top_areas_by_sales
-from app.listings.agent import ListingAgent, ListingsUnavailable, _ID_TAG as _AGENT_TAG
+from app.listings.agent import EARLIER_NAME, ListingAgent, ListingsUnavailable, _ID_TAG as _AGENT_TAG
 from app.listings.router import is_rent_question
 from app.llm.client import LLMQueueTimeoutError
 from app.answers.spoken import MAX_FACT_CHARS, start_spoken_reply
@@ -699,8 +699,18 @@ def _transaction_subject(question, conversation_memory):
     ]
     asked = (question or "").lower()
     named = [project for project in projects if str(project["name"]).lower() in asked]
-    chosen = named or projects
-    return chosen[:8] or None
+    if named:
+        return named[:8]
+    # "Recent transactions in Dubai Marina" with JVC projects on screen means Dubai Marina, not the screen.
+    from app.retrieval.propai_catalog import agent_projects, place_named
+    place = place_named(question)
+    if place and not any(
+        place.lower() in " ".join(str(project.get(k) or "") for k in ("community", "sub_community", "area")).lower()
+        for project in projects
+    ):
+        rows, _ = agent_projects({"communities": [place]}, limit=8)
+        return rows or None
+    return projects[:8] or None
 
 
 def _sale_line(sale) -> str:
@@ -761,9 +771,11 @@ def _format_transactions(name, payload, label=None, more=False) -> str:
     return "\n".join(lines).rstrip()
 
 
-def _transaction_reply(question, answer):
+def _transaction_reply(question, answer, sales=None):
     summary = _empty_structured_summary()
     summary["transaction_followup"] = True
+    # The sales themselves, so the app can show them by unit type and over time (data.transactions).
+    summary["transactions"] = sales or []
     return {
         "question": question,
         "standalone_question": question,
@@ -863,11 +875,12 @@ def _transaction_turn(question, conversation_memory):
     return _transaction_reply(
         question,
         _format_transactions(names, payload, label=intro, more=more and offset > 0),
+        payload.get("sales") or [],
     )
 
 
 _BROKER = re.compile(
-    r"\b(?:brokers?|agents?|licensed agents?|rera agents?|real[\s-]?estate agents?|top agents?)\b",
+    r"\b(?:brokers?|agents?|agenc(?:y|ies)|licensed agents?|rera agents?|real[\s-]?estate agents?|top agents?)\b",
     re.I,
 )
 _BROKER_NATIONALITIES = (
@@ -891,7 +904,8 @@ _BROKER_FILTER_WORDS = re.compile(
 _BROKER_FILLER = re.compile(
     r"\b(?:show|me|tell|find|list|the|top|best|licensed|rera|dubai|please|who|are|is|"
     r"can|help|with|this|these|those|property|properties|project|projects|community|"
-    r"brokers?|agents?|real[\s-]?estate|for|in|at|of|only|just|from|"
+    r"brokers?|agents?|agenc(?:y|ies)|real[\s-]?estate|for|in|at|of|only|just|from|"
+    r"you|your|a|an|i|need|want|get|looking|someone|some|good|any|give|recommend|suggest|could|would|"
     r"details?|info|information|about|"
     r"sri lankan|pakistani|pakistan|filipino|emirati|egyptian|iranian|lebanese|"
     r"british|indian|india|nationality|nationalities|gender|female|male|"
@@ -1127,6 +1141,10 @@ def _broker_place(question, conversation_memory):
             flags=re.I,
         )[0].strip(" .?")
         place = " ".join(_BROKER_FILTER_WORDS.sub(" ", place).split()).strip(" .?")
+        # "the jvc" -> "Jumeirah Village Circle", so answers read properly and the search uses the full name.
+        place = re.sub(r"^(?:the|a)\s+", "", place, flags=re.I)
+        from app.listings.tools import ALIASES
+        place = ALIASES.get(place.lower(), place)
         if place:
             return place
     leftover = " ".join(_BROKER_FILLER.sub(" ", asked).split())
@@ -1163,12 +1181,11 @@ def _broker_lookup(question, conversation_memory):
     leftover = " ".join(leftover.split())
     place = _broker_place(question, conversation_memory)
     if place:
-        leftover = re.sub(
-            rf"\b{re.escape(place)}\b",
-            " ",
-            leftover,
-            flags=re.I,
-        )
+        # Word by word: "the" is already gone from the leftover, so "the jvc" as a phrase would not match.
+        from app.listings.tools import ALIASES
+        short = {key for key, full in ALIASES.items() if full.lower() == place.lower()}  # "jvc" for JVC
+        for word in set(re.findall(r"[a-z0-9]+", place.lower())) | {place.lower()} | short:
+            leftover = re.sub(rf"\b{re.escape(word)}\b", " ", leftover, flags=re.I)
         leftover = " ".join(leftover.split())
     if re.fullmatch(r"\d{3,12}", leftover or ""):
         return None, leftover
@@ -1304,6 +1321,72 @@ def _outside_coverage_reply(question, asked=None):
     return _broker_reply(question, answer)
 
 
+# "What communities do you have?" / "full list of communities": the whole list from the data, not a top 10.
+# Tolerates common typos (communintes, comunities); skips questions that narrow it (best, near, under...).
+_COMMUNITY = r"com+u?n+\w{0,3}t(?:y|ies|ie|es|is|s)?"
+_COMMUNITY_LIST = re.compile(
+    rf"\b(?:full|complete|entire|whole)\s+list\b.*\b{_COMMUNITY}\b"
+    rf"|\b(?:all|every)\s+(?:the\s+)?{_COMMUNITY}\b"
+    rf"|\blist\s+(?:of\s+)?(?:all\s+)?(?:the\s+)?{_COMMUNITY}\b"
+    rf"|\b{_COMMUNITY}\s+(?:do\s+)?(?:we|you|acot)\s+(?:have|cover|support|got)\b",
+    re.I,
+)
+_COMMUNITY_NARROWED = re.compile(
+    r"\b(?:best|top|cheap\w*|afford\w*|family|families|near|nearby|under|below|above|with|for|luxury|safe\w*|compare)\b",
+    re.I,
+)
+
+
+def _community_list_turn(question):
+    text = question or ""
+    if not _COMMUNITY_LIST.search(text) or _COMMUNITY_NARROWED.search(text):
+        return None
+    from app.database.postgres import fetch
+    try:
+        rentals = fetch("select btrim(community) as name, count(*)::int as n from listings "
+                        "where coalesce(btrim(community), '') <> '' group by 1")
+        projects = fetch("select btrim(community) as name, count(*)::int as n from projects "
+                         "where coalesce(btrim(community), '') <> '' group by 1")
+    except Exception:
+        return None
+    rows: dict[str, dict] = {}
+    for kind, found in (("rentals", rentals), ("projects", projects)):
+        for row in found:
+            # Rentals say "Jumeirah Village Circle (JVC)", projects "Jumeirah Village Circle": one community.
+            key = re.sub(r"\s*\([^)]*\)", "", row["name"]).strip().lower()
+            entry = rows.setdefault(key, {"name": row["name"], "rentals": 0, "projects": 0})
+            entry[kind] += row["n"]
+    if not rows:
+        return None
+    ordered = sorted(rows.values(), key=lambda r: (-r["rentals"], -r["projects"], r["name"]))
+    lines = [
+        f"We have {len(ordered)} communities with rental listings or new projects. Here is the full list, busiest first:",
+        "",
+        "| Community | Rentals listed | New projects |",
+        "|---|---|---|",
+    ]
+    for row in ordered:
+        lines.append(f"| {row['name']} | {row['rentals'] or '-'} | {row['projects'] or '-'} |")
+    lines += ["", "Ask about any of them for prices, rents or projects, for example \"Tell me about Dubai Marina\"."]
+    return {
+        "question": question,
+        "standalone_question": question,
+        "question_type": "general",
+        "structured_summary": _empty_structured_summary(),
+        "documents": [],
+        "investment_analysis": None,
+        "retrieval_result": {
+            "question_type": "general",
+            "structured_data": {"community": [], "projects": [], "sub_communities": []},
+            "documents": [],
+        },
+        "use_fast": True,
+        "fast_answer": "\n".join(lines),
+        "context": None,
+        "small_talk": None,
+    }
+
+
 def _broker_turn(question, conversation_memory):
     question = repair_typed_question(question)
     if not _is_broker_question(question, conversation_memory):
@@ -1365,6 +1448,9 @@ def _broker_turn(question, conversation_memory):
         )
     else:
         answer = _format_brokers(rows, label=place)
+    # The app shows each agent as a licence card, so the text keeps only its lead line (no second list).
+    if rows:
+        answer = answer.split("\n\n", 1)[0]
     return _broker_reply(question, answer, rows)
 
 
@@ -1759,7 +1845,7 @@ async def _try_agent_turn(question, components, timing_ms, ask_started):
     await llm._acquire_slot()
     try:
         result = await asyncio.to_thread(
-            agent.answer, question, list(history), None, profile, _agent_results_hook.get()
+            agent.answer, question, list(history), None, profile, _agent_results_hook.get(), components.get("page")
         )
     except LLMQueueTimeoutError:
         raise
@@ -1789,7 +1875,10 @@ async def _try_agent_turn(question, components, timing_ms, ask_started):
             labels[card["listing_id"]] = card.get("title") or "this rental"
 
     # [[id]] tags become the project or rental name; the card is in the response data.
-    answer = _AGENT_TAG.sub(lambda m: labels.get(m.group(1), ""), result.answer)
+    # Follow-ups ("which one is cheapest") tag items from earlier answers; their names are in those notes.
+    known = {key: name for turn in history for name, key in EARLIER_NAME.findall(str(turn.get("content") or ""))}
+    known.update(labels)
+    answer = _AGENT_TAG.sub(lambda m: known.get(m.group(1), ""), result.answer)
     answer = _collapse_doubled_names(answer, set(labels.values()))
     answer = _drop_repeated_name_lines(answer, set(labels.values()))
     answer = re.sub(r"[ \t]{2,}", " ", answer).strip()
@@ -2045,6 +2134,14 @@ async def _prepare_acot_turn(
         transaction_turn["rag_chain"] = rag_chain
         transaction_turn["conversation_memory"] = conversation_memory
         return transaction_turn
+
+    community_list = await asyncio.to_thread(_community_list_turn, question)
+    if community_list is not None:
+        community_list["timing_ms"] = timing_ms
+        community_list["ask_started"] = ask_started
+        community_list["rag_chain"] = rag_chain
+        community_list["conversation_memory"] = conversation_memory
+        return community_list
 
     broker_turn = await asyncio.to_thread(
         _broker_turn, question, conversation_memory

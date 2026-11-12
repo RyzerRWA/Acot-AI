@@ -1010,8 +1010,10 @@ def test_broker_turn_lists_top_brokers(monkeypatch):
     turn = _broker_turn("Show me brokers", None)
     assert turn is not None
     assert turn["use_fast"] is True
-    assert "Amal Khan" in turn["fast_answer"]
-    assert "Sara Nair" in turn["fast_answer"]
+    # The agents go to the app as licence cards; the text is only the lead line, so they are not listed twice.
+    names = [row["name"] for row in turn["structured_summary"]["brokers"]]
+    assert "Amal Khan" in names and "Sara Nair" in names
+    assert "Amal Khan" not in turn["fast_answer"]
     assert "broker" not in turn["fast_answer"].lower()
     assert "licensed agents" in turn["fast_answer"].lower()
     assert 1 <= len(turn["structured_summary"]["brokers"]) <= 8
@@ -1410,3 +1412,70 @@ def test_tools_for_keeps_search_brokers_on_broker_questions():
     rent = {tool["function"]["name"] for tool in tools_for("apartments for rent in marina")}
     assert "search_brokers" not in rent
     assert "search_listings" in rent
+
+
+def test_transactions_for_a_named_place_ignore_the_projects_on_screen(monkeypatch):
+    """'Recent transactions in Dubai Marina' with JVC projects on screen must not answer for JVC."""
+    import app.retrieval.propai_catalog as catalog
+
+    class _Memory:
+        active_candidates = [
+            {"name": "HANOVER SQUARE", "entity_type": "project", "community": "Jumeirah Village Circle"},
+        ]
+
+    marina = [{"name": "Marina Diamond", "community": "Dubai Marina"}]
+    monkeypatch.setattr(catalog, "place_named", lambda text: "Dubai Marina" if "marina" in text.lower() else None)
+    monkeypatch.setattr(catalog, "agent_projects", lambda filters, limit=8: (marina, 1))
+
+    assert _transaction_subject("Show me the recent transactions in the dubai marina", _Memory()) == marina
+    # No place named: the projects on screen, as before.
+    on_screen = _transaction_subject("Show me the recent transactions", _Memory())
+    assert on_screen and on_screen[0]["name"] == "HANOVER SQUARE"
+    # A named project on screen wins over a place.
+    named = _transaction_subject("Recent transactions for Hanover Square in Dubai Marina", _Memory())
+    assert named and named[0]["name"] == "HANOVER SQUARE"
+
+
+def test_full_community_list_is_answered_from_the_data(monkeypatch):
+    """'Full list of communities' gets every community (not a top 10), even with a typo."""
+    import app.database.postgres as postgres
+    from run import _community_list_turn
+
+    def fake_fetch(sql, *args):
+        if "from listings" in sql:
+            return [{"name": "Jumeirah Village Circle (JVC)", "n": 259}, {"name": "Dubai Marina", "n": 122}]
+        return [{"name": "Jumeirah Village Circle", "n": 5}, {"name": "Dubai Creek Harbour", "n": 4}]
+
+    monkeypatch.setattr(postgres, "fetch", fake_fetch)
+    answer = _community_list_turn("i need full list of the communintes")["fast_answer"]
+    assert answer.startswith("We have 3 communities")
+    assert "| Jumeirah Village Circle (JVC) | 259 | 5 |" in answer
+    assert "| Dubai Creek Harbour | - | 4 |" in answer
+    assert _community_list_turn("what are the communties we have") is not None
+    # Questions that narrow the list go to the normal answer.
+    assert _community_list_turn("best communities for families") is None
+    assert _community_list_turn("Tell me about Dubai Marina") is None
+
+
+
+def test_broker_question_with_a_place_is_not_read_as_a_name(monkeypatch):
+    """'can you find me a broker for the jvc' asks for JVC agents, not an agent named 'you a jvc'."""
+    seen = []
+
+    def fake_list(**kwargs):
+        seen.append(kwargs)
+        return _broker_rows()[: kwargs.get("limit", 8)]
+
+    monkeypatch.setattr("app.retrieval.propai_catalog.list_brokers", fake_list)
+    turn = _broker_turn("can you find me a broker for the jvc", None)
+    assert seen[0].get("name") is None
+    assert seen[0].get("place") == "Jumeirah Village Circle"
+    assert turn["fast_answer"] == "Here are licensed agents for Jumeirah Village Circle."
+
+
+def test_agency_question_goes_to_the_broker_cards():
+    # "tell me top agency JVC" used to fall through to the model, which listed every agent as text above the cards.
+    import run
+
+    assert run._BROKER.search("tell me top agency JVC")
+    assert run._BROKER.search("best real estate agencies in Dubai Marina")

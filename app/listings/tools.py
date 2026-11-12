@@ -285,7 +285,10 @@ def search_listings(raw) -> ToolResult:
         raise ToolInputError(f"sort must be one of: {', '.join(SORTS)}.")
     limit = int(round(_num(a, "limit", 1, 10) or 5))
     where, params = _where(f)
-    rows = fetch(f"select {COLUMNS} from listings where {where} order by {SORTS[sort]} limit %s", (*params, limit))
+    # The same advert is often reposted many times (same title and rent); show each once.
+    rows = fetch(f"select {COLUMNS} from (select distinct on (lower(btrim(title)), price_aed) * from listings "
+                 f"where {where} order by lower(btrim(title)), price_aed, listing_id) t "
+                 f"order by {SORTS[sort]} limit %s", (*params, limit))
     total = fetch(f"select count(*)::int as total from listings where {where}", tuple(params))[0]["total"]
     cards = [_card(r) for r in rows]
     output = {"matching_listings": total, "showing": len(cards), "sorted_by": sort,
@@ -493,6 +496,8 @@ def _project_for_model(row: dict) -> dict:
         "status": row.get("project_status") or row.get("status"),
         "has_brochure": bool(row.get("brochure_url")),
         "price_kind": row.get("price_kind") or "starting",
+        # The key above says "starting" for both kinds; this is the wording to put before the price.
+        "price_label": "recent sale price" if row.get("price_kind") == "recent_sale" else "from",
     }
 
 
@@ -533,8 +538,53 @@ def mentions_known_name(text: str) -> bool:
     return any(re.search(rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])", lowered) for name in _known_names)
 
 
+_place_names: list[str] | None = None
+
+
+def _closest_place(text: str) -> str | None:
+    """A known community for a misspelt one ("arjun" -> "Arjan"), or None when nothing is close."""
+    import difflib
+    global _place_names
+    if _place_names is None:
+        try:
+            rows = list(fetch("select distinct btrim(community) as n from projects where community is not null"))
+            rows += list(fetch("select distinct btrim(label) as n from propai_places where level in ('area', 'master')"))
+        except Exception:
+            return None  # no database: leave the name as typed
+        _place_names = sorted({r["n"] for r in rows if r.get("n")})
+    lowered = {name.lower(): name for name in _place_names}
+    hit = difflib.get_close_matches((text or "").lower().strip(), list(lowered), n=1, cutoff=0.8)
+    return lowered[hit[0]] if hit and hit[0] != (text or "").lower().strip() else None
+
+
 def search_projects(raw) -> ToolResult:
+    """Project search that also reads a misspelt place the way the user meant it."""
     a = _obj(raw)
+    result = _search_projects(a)
+    if result.output.get("matching_projects"):
+        return result
+    # Nothing found: a typo'd community, or a place sent as a developer ("arjun projects").
+    fixed, read_as = dict(a), {}
+    for key in ("communities", "developers"):
+        for value in _strings(a, key) or []:
+            place = _closest_place(ALIASES.get(value.lower(), value))
+            if place:
+                read_as[value] = place
+                fixed[key] = [v for v in (fixed.get(key) or []) if v != value]
+                fixed["communities"] = [*(fixed.get("communities") or []), place]
+    if not read_as:
+        return result
+    retry = _search_projects(fixed)
+    if not retry.output.get("matching_projects"):
+        return result
+    retry.output["read_as"] = read_as
+    retry.output["read_as_note"] = ("The user's place name matched nothing as typed. It was read as the place "
+                                    "shown in read_as. This is a match, not a no-match: never say \"couldn't find\"; "
+                                    "open with \"Showing results for Arjan:\" (the read_as place) and answer.")
+    return retry
+
+
+def _search_projects(a: dict) -> ToolResult:
     f = _project_filters(a)
     sort = str(a.get("sort") or "cheapest")
     if sort not in PROJECT_SORTS:

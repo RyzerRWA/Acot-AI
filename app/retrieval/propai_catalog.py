@@ -81,6 +81,30 @@ def _photos(value) -> list[str]:
     return kept
 
 
+def _attach_brochures(projects: list[dict]) -> None:
+    """Catalog rows have no brochures; the listings projects table does. Match by name ("Sobha One")."""
+    names = [str(project.get("name") or "").strip().lower() for project in projects if project.get("name")]
+    if not names:
+        return
+    try:
+        rows = fetch(
+            """
+            select distinct on (lower(btrim(name))) lower(btrim(name)) as name, brochure_url
+            from projects
+            where coalesce(brochure_url, '') <> '' and lower(btrim(name)) = any(%s)
+            order by lower(btrim(name)), id
+            """,
+            (names,),
+        )
+    except Exception:
+        return
+    found = {row["name"]: row["brochure_url"] for row in rows}
+    for project in projects:
+        url = found.get(str(project.get("name") or "").strip().lower())
+        if url and not project.get("brochure_url"):
+            project["brochure_url"] = url
+
+
 def _attach_photos(projects: list[dict]) -> None:
     """Use the copied JPEGs. The links stored on the project row expire after one hour."""
     keys = [str(project["id"]) for project in projects if project.get("id")]
@@ -201,6 +225,7 @@ def _projects_for(place: dict, limit: int = 8) -> list[dict]:
         })
     _add_sale_facts(projects)
     _attach_photos(projects)
+    _attach_brochures(projects)
     return projects
 
 
@@ -337,6 +362,26 @@ def _official_areas(values) -> list[str]:
     return found or [name.upper() for name in names]
 
 
+_PLACE_LABELS: list[str] | None = None
+
+
+def place_named(text: str) -> str | None:
+    """The community or area a question names ("in Dubai Marina", "JVC"), longest match first; None if none."""
+    global _PLACE_LABELS
+    if _PLACE_LABELS is None:
+        try:
+            rows = fetch("select distinct lower(btrim(label)) as n from propai_places where level in ('area', 'master')")
+        except Exception:
+            return None  # no database: do not guess
+        labels = {row["n"] for row in rows if row.get("n") and len(row["n"]) >= 4}
+        _PLACE_LABELS = sorted(labels | set(ALIASES), key=len, reverse=True)
+    lowered = (text or "").lower()
+    for label in _PLACE_LABELS:
+        if re.search(rf"(?<![a-z0-9]){re.escape(label)}(?![a-z0-9])", lowered):
+            return ALIASES.get(label) or label.title()
+    return None
+
+
 def agent_projects(filters: dict, limit: int = 8, sort: str = "cheapest") -> tuple[list[dict], int]:
     """New-data projects in the old project-row shape. Empty when a filter the new rows cannot answer is set."""
     if filters.get("min_size") or filters.get("max_size") or filters.get("property_types"):
@@ -468,7 +513,10 @@ def agent_projects(filters: dict, limit: int = 8, sort: str = "cheapest") -> tup
         projects.sort(key=rank)
     projects = projects[:limit]
     _attach_photos(projects)
+    _attach_brochures(projects)
     for project in projects:
+        # The app's project page is keyed by the catalog key; the agent id is a one-way hash of it.
+        project["key"] = project["id"]
         project["id"] = _agent_id(str(project["id"]))
     return projects, total
 
