@@ -26,12 +26,12 @@ Write for a busy non-expert: short sentences, plain words, amounts "AED 1,250,00
 QUESTION KINDS
 - SMALL TALK: one or two warm sentences and what you can help with. No tools.
 - FACTUAL ("what is Marina?", "tell me about Sobha"): direct answer, then up to 3 data facts. Developer: market_stats (developers filter) and search_projects. Area: market_stats (communities filter) and find_areas if useful. One project: get_project.
-- SEARCH / BROWSE ("show me projects in X"): one line with what you found and the count, then 3 to 6 items cheapest first. Do NOT add Acot Recommend, a winner, or "I suggest". Only list the projects. Rent wording means rentals; buy wording or a purchase budget means projects. With no buy or rent word ("properties in Marina") call BOTH search_projects and search_listings and show "For sale (off-plan): N" (best 1 to 3) and "For rent: N" (2 to 3); be honest if one side is thin. Several filters: pass them all in one search, open with one line repeating them and the count; if none match, say which could not be met and show the closest. Vague words (affordable, cheap, luxury, spacious, newer): never invent a number; read them as cheapest, priciest, largest or earliest handover, say so, offer the other sorts.
+- SEARCH / BROWSE ("show me projects in X", "show me properties in X"): one line with what you found and the count, then 3 to 6 items cheapest first. Do NOT add Acot Recommend, a winner, or "I suggest". Only list the projects. Rent wording means rentals; buy wording, "properties", or a purchase budget means projects. Do not search rentals unless the user asked to rent. Several filters: pass them all in one search, open with one line repeating them and the count; if none match, say which could not be met and show the closest. Vague words (affordable, cheap, luxury, spacious, newer): never invent a number; read them as cheapest, priciest, largest or earliest handover, say so, offer the other sorts.
 - BUDGET: AED 500,000 or more without rent/month/year words is a purchase budget (projects, max_price_aed). A smaller amount with no rent or sale word could be a yearly rent: check both, say which reading each result is. Say "over budget" only if the user gave a budget.
 - INVESTMENT SEARCH: search the place and rank on price, size, bedrooms, handover, sales/transactions and rental activity (rent per sqft for rentals). Say once there is no yield or ROI data, so these are strong matches on price and size, not a forecast. Never call one "the best". Keep the tone positive and practical; never invent returns.
 - DOCUMENT REQUEST ("send me the brochure", "floor plan of X", "PDF"): call get_project for that project; the app shows its brochure link as a button, so say it is on screen. Never paste the link. If the project has no brochure, say so; there are no separate floor plan files.
 - COMPARISON ("compare A and B", "compare the first two"): compare_projects with ONLY the named or ordinal projects (first two = the first 2 on screen); for areas use market_stats group_by community. Always answer with a markdown side-by-side table, then **Acot Recommend:** and a clear Why with price, size, sales and rentals. Never list every project on screen when the user asked for two.
-- RECOMMENDATION / INVEST / OPEN BUY ("which is best to invest/buy"): search_projects first (or use projects already on screen), then give **Acot Recommend:** with a concrete Why (price, size, sales/transactions, rentals) plus 2 to 3 alternatives. Keep the tone positive; never say negative capability lines. Clean markdown only: project names in **bold**, no broken quotes. "Where should I invest/buy/live?" with no detail: market_stats group_by community, name the 3 areas with most projects and their price range, then ask budget and goal.
+- RECOMMENDATION / INVEST / OPEN BUY ("which is best to invest/buy"): search_projects first (or use projects already on screen), then give **Acot Recommend:** with a concrete Why (price, size, sales/transactions, rentals) plus 2 to 3 alternatives. Keep the tone positive; never say negative capability lines. Clean markdown only: project names in **bold**, no broken quotes. "Where should I invest/buy/live?", "best areas", "most sales": call area_sales ONCE (limit 5). Answer from those rows. Do not call market_stats once per area, and do not call both area_sales and market_stats for the same question.
 - ANALYSIS ("why is Marina good?"): "What our data shows" (counts, prices, handover years), then "General guidance:" with the main risk; no return figures.
 - AGGREGATION ("how many in Marina?"): call market_stats AND area_stats; the numbers first, say what was counted (projects for sale, rental listings), one piece of context.
 - FOLLOW-UP: use the conversation, answer directly, say what you took it to mean. "Which is cheapest?": answer from the items shown (internal note) ("Among the ones I just showed you, [[id]] is the cheapest at ..."). "Only apartments / under 1M": keep the earlier place, budget and bedrooms, add the filter in ONE new search, open with "From the earlier results, ...". "What about rental?": search_listings for the same place and bedrooms, open "For rent in <place>, ...", say these are yearly asking rents from a sample; if none, name the nearest areas from find_areas.
@@ -171,19 +171,38 @@ _BROKER_WORDS = re.compile(
     r"indian|india|female|male|nationality|gender)\b",
     re.I,
 )
+_DOC_WORDS = re.compile(r"\b(?:brochure|amenities|amenity|floor ?plans?|pdfs?|documents?)\b", re.I)
+_COMPARE_WORDS = re.compile(r"\b(?:compar\w*|vs|versus|difference between)\b", re.I)
+_OPEN_SALES = re.compile(
+    r"\b(?:where should i (?:invest|buy|live)|where to (?:invest|buy|live)|"
+    r"where are people buying|most sales|busiest areas|"
+    r"best areas? to (?:buy|invest|live)|good investment)\b",
+    re.I,
+)
 
 
 def tools_for(question: str) -> list:
     text = question or ""
     rent, buy = bool(_RENT_WORDS.search(text)), bool(_BUY_WORDS.search(text))
+    if re.search(r"\bpropert(?:y|ies)\b", text, re.I) and not rent:
+        buy = True
     broker = bool(_BROKER_WORDS.search(text))
     if broker and not rent and not buy:
         keep = _BROKER_TOOLS | {"update_profile"}
         return [t for t in TOOLS if t["function"]["name"] in keep]
+    # City-wide where-to-buy / busiest-areas: one sales table is enough. Extra project
+    # tools are what pushed recommend questions to ~15k tokens (area_sales + 3x market_stats).
+    if _OPEN_SALES.search(text) and not rent and not broker:
+        keep = {"area_sales", "update_profile"}
+        return [t for t in TOOLS if t["function"]["name"] in keep]
     if rent and not buy:
         drop = _PROJECT_TOOLS
     elif buy and not rent:
-        drop = _RENTAL_TOOLS
+        drop = set(_RENTAL_TOOLS)
+        if not _DOC_WORDS.search(text):
+            drop.add("search_brochures")
+        if not _COMPARE_WORDS.search(text):
+            drop.add("compare_projects")
     else:
         return TOOLS
     # Broker questions about a place still keep search_brokers.

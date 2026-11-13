@@ -16,14 +16,22 @@ _BEDS = re.compile(r"\b(\d+)\s*[- ]?\s*(?:bed(?:room)?s?|br)\b", re.I)
 
 _WHY_LABELS = {
     "lower price": "Attractive price among these options",
+    "budget fit": "Close to the budget you gave",
     "more space": "Larger recorded size",
     "more bedrooms": "Wider bedroom range",
     "bedroom fit": "Strong bedroom fit for your request",
     "earlier handover": "Earlier handover timing",
+    "latest recorded sale": "Most recent recorded sale among these options",
     "readiness": "Strong readiness / availability status",
     "more recent sales activity": "Strong recent sales and transaction activity",
     "active rental market": "Active rental market for this project",
 }
+
+# Recommend quotes the last year of DLD sales, not a 20-year-old completion date.
+_RECENT_SALES_INTERVAL = "12 months"
+_BUDGET_FLOOR = 0.6
+RECOMMEND_POOL = 40
+RECOMMEND_SHOW = 6
 
 
 def wanted_bedrooms(question: str | None) -> int | None:
@@ -73,6 +81,24 @@ def _handover_stamp(value) -> float | None:
         return None
 
 
+def _is_future_stamp(stamp: float | None) -> bool:
+    if stamp is None:
+        return False
+    try:
+        return datetime.fromtimestamp(stamp) > datetime.now()
+    except (OSError, OverflowError, ValueError, TypeError):
+        return False
+
+
+def _month_year(stamp: float | None) -> str | None:
+    if stamp is None:
+        return None
+    try:
+        return datetime.fromtimestamp(stamp).strftime("%b %Y")
+    except (OSError, OverflowError, ValueError, TypeError):
+        return None
+
+
 def _status_rank(status) -> int | None:
     text = str(status or "").strip()
     if not text:
@@ -89,12 +115,14 @@ def features(row: dict) -> dict[str, Any]:
     price = _num(row.get("price"), row.get("price_aed"), row.get("starting_price_aed"))
     if price is not None and price <= 0:
         price = None
-    beds = _num(row.get("beds"), row.get("bedroom_min"))
-    bed_max = _num(row.get("bedroom_max"))
-    if beds is None and bed_max is not None:
-        beds = bed_max
-    elif beds is not None and bed_max is not None:
-        beds = (beds + bed_max) / 2
+    bed_min = _num(row.get("bedroom_min"), row.get("beds"))
+    bed_max = _num(row.get("bedroom_max"), bed_min)
+    if bed_min is not None and bed_max is not None and bed_min == bed_max:
+        beds = bed_min
+    elif bed_min is not None and bed_max is not None:
+        beds = (bed_min + bed_max) / 2
+    else:
+        beds = bed_min if bed_min is not None else bed_max
     size = _num(row.get("size"), row.get("size_sqft"), row.get("size_min"))
     size_max = _num(row.get("size_max"))
     if size is None and size_max is not None:
@@ -106,8 +134,11 @@ def features(row: dict) -> dict[str, Any]:
         "name": row.get("name") or row.get("title") or "Option",
         "price": price,
         "beds": beds,
+        "bed_min": bed_min,
+        "bed_max": bed_max,
         "size": size,
         "handover": _handover_stamp(row.get("handover_time") or row.get("handover")),
+        "last_sale": _handover_stamp(row.get("last_sold_on") or row.get("last_sale")),
         "status_rank": _status_rank(row.get("project_status") or row.get("status")),
         "sales_count": _num(row.get("sales_count"), row.get("recent_sales_count")),
         "rent_count": _num(row.get("rent_count"), row.get("rental_count")),
@@ -140,18 +171,20 @@ def attach_market_activity(projects: list[dict]) -> None:
         _num(project.get("size"), project.get("size_sqft"), project.get("size_min"), project.get("size_max")) is None
         for project in projects
     )
-    if need_sales or need_size:
+    need_sold = any(project.get("last_sold_on") is None and project.get("last_sale") is None for project in projects)
+    if need_sales or need_size or need_sold:
         try:
             rows = fetch(
-                """
+                f"""
                 select upper(project_name_prop_ai) as name,
                        count(*)::int as n,
+                       max(instance_date) as last_sale,
                        percentile_cont(0.5) within group (
                            order by procedure_area_sqft
                        ) filter (where procedure_area_sqft > 0) as median_size
                 from propai_sales
                 where deleted_at is null and sale_price > 0
-                  and instance_date >= current_date - interval '24 months'
+                  and instance_date >= current_date - interval '{_RECENT_SALES_INTERVAL}'
                   and upper(project_name_prop_ai) = any(%s)
                 group by 1
                 """,
@@ -167,6 +200,8 @@ def attach_market_activity(projects: list[dict]) -> None:
                 continue
             if project.get("sales_count") is None and project.get("recent_sales_count") is None:
                 project["sales_count"] = int(row["n"] or 0)
+            if project.get("last_sold_on") is None and project.get("last_sale") is None and row.get("last_sale"):
+                project["last_sold_on"] = row["last_sale"]
             if need_size and _num(project.get("size"), project.get("size_sqft"), project.get("size_min")) is None:
                 if row.get("median_size"):
                     project["size_sqft"] = int(round(float(row["median_size"])))
@@ -218,19 +253,182 @@ def _rank_key(values: list[float | None], lower_is_better: bool) -> list[float |
     return [None if value is None else points[value] for value in values]
 
 
-def _bed_fit_scores(beds: list[float | None], wanted: int | None) -> list[float | None]:
-    if wanted is None:
-        return _rank_key(beds, lower_is_better=False)
+def _budget_fit_scores(prices: list[float | None], budget: int | None) -> list[float | None]:
+    """1.0 at the budget, 0 at 60% of it, weak above it."""
+    if not budget or budget <= 0:
+        return [None] * len(prices)
+    span = 1.0 - _BUDGET_FLOOR
     scores = []
-    for value in beds:
-        if value is None:
+    for price in prices:
+        if price is None or price <= 0:
             scores.append(None)
+            continue
+        ratio = price / budget
+        if ratio <= 1:
+            scores.append(max(0.0, min(1.0, (ratio - _BUDGET_FLOOR) / span)))
         else:
-            gap = abs(value - wanted)
-            scores.append(max(0.0, 1.0 - gap / max(wanted, 1)))
-    if sum(1 for score in scores if score is not None) < 2:
-        return [None] * len(beds)
+            scores.append(max(0.0, 1.0 - (ratio - 1.0) * 2))
+    if sum(1 for score in scores if score is not None) < 1:
+        return [None] * len(prices)
     return scores
+
+
+def _bed_fit_scores(items: list[dict], wanted: int | None) -> list[float | None]:
+    """Wanted bedroom count inside the project's min–max is a full match."""
+    if wanted is None:
+        return _rank_key([item.get("beds") for item in items], lower_is_better=False)
+    scores = []
+    for item in items:
+        lo = item.get("bed_min")
+        hi = item.get("bed_max")
+        if lo is None and hi is None:
+            scores.append(None)
+            continue
+        lo = lo if lo is not None else hi
+        hi = hi if hi is not None else lo
+        if lo <= wanted <= hi:
+            scores.append(1.0)
+        else:
+            gap = min(abs(wanted - lo), abs(wanted - hi))
+            scores.append(max(0.0, 1.0 - gap / max(wanted, 1)))
+    known = [score for score in scores if score is not None]
+    if len(known) < 2 or len(set(known)) < 2:
+        return [None] * len(items)
+    return scores
+
+
+def _factor_phrase(names: list[str] | None) -> str:
+    labels = [name for name in (names or []) if name]
+    if not labels:
+        return "the recorded details"
+    if len(labels) == 1:
+        return labels[0]
+    if len(labels) == 2:
+        return f"{labels[0]} and {labels[1]}"
+    return ", ".join(labels[:-1]) + f", and {labels[-1]}"
+
+
+def _sale_project_rows(rows: list[dict], place: str, bedrooms: int | None) -> list[dict]:
+    """Turn grouped sale rows into project cards, with that bedroom's median price."""
+    if not rows:
+        return []
+    names = [str(row.get("name") or "").strip() for row in rows if row.get("name")]
+    catalog: dict[str, dict] = {}
+    try:
+        from app.database.postgres import fetch
+        from app.retrieval.propai_catalog import _agent_id, _handover
+
+        found = fetch(
+            """
+            select distinct on (upper(name))
+                   key, name, developer, area, master_project, offplan_status, end_date
+            from propai_projects
+            where upper(name) = any(%s)
+            order by upper(name), (developer is not null) desc, name
+            """,
+            ([name.upper() for name in names],),
+        )
+        catalog = {str(row["name"]).upper(): row for row in found if row.get("name")}
+    except Exception:
+        _agent_id = None
+        _handover = None
+    projects = []
+    for row in rows:
+        name = str(row.get("name") or "").strip()
+        if not name or row.get("price") is None:
+            continue
+        source = catalog.get(name.upper()) or {}
+        key = source.get("key")
+        beds = None if bedrooms is None else int(bedrooms)
+        projects.append({
+            "id": _agent_id(str(key)) if key and _agent_id else name,
+            "key": key,
+            "name": source.get("name") or name.title(),
+            "developer_name": source.get("developer"),
+            "community": source.get("master_project") or source.get("area") or place,
+            "sub_community": source.get("area"),
+            "city": "Dubai",
+            "price": int(round(float(row["price"]))),
+            "price_kind": "recent_sale",
+            "bedroom_min": beds,
+            "bedroom_max": beds,
+            "sales_count": int(row.get("sales") or 0),
+            "status": source.get("offplan_status"),
+            "project_status": source.get("offplan_status"),
+            "handover_time": _handover(source.get("end_date")) if _handover else None,
+            "last_sold_on": row.get("last_sale"),
+            "source": "propai",
+        })
+    return projects
+
+
+def fetch_recommend_projects(
+    place: str,
+    bedrooms: int | None = None,
+    budget: int | None = None,
+    limit: int = RECOMMEND_POOL,
+) -> tuple[list[dict], list[dict]]:
+    """Projects with recorded sales for this place and bedroom, near the budget when given.
+
+    The first list is inside about 60–100% of the budget (about 30–50 candidates).
+    The second is the closest recorded sales when that band is empty.
+    """
+    from app.answers.predict import _sales_place_filter
+    from app.database.postgres import fetch
+
+    lock, lock_params = _sales_place_filter(place)
+    if lock == "false":
+        return [], []
+    where = [
+        "deleted_at is null",
+        "coalesce(outlier_flag, '') <> 'True'",
+        "sale_price > 0",
+        f"instance_date >= current_date - interval '{_RECENT_SALES_INTERVAL}'",
+        "coalesce(project_name_prop_ai, '') <> ''",
+        lock,
+    ]
+    params: list[Any] = list(lock_params)
+    if bedrooms is not None:
+        where.append("bedrooms between %s - 0.2 and %s + 0.2")
+        params.extend([int(bedrooms), int(bedrooms)])
+    base = f"""
+        select project_name_prop_ai as name,
+               count(*)::int as sales,
+               percentile_cont(0.5) within group (order by sale_price)::float8 as price,
+               max(instance_date) as last_sale
+        from public.propai_sales
+        where {' and '.join(where)}
+        group by 1
+    """
+    target = int(budget or 0)
+    try:
+        if budget:
+            band = fetch(
+                base + """
+                having percentile_cont(0.5) within group (order by sale_price) between %s and %s
+                order by abs(percentile_cont(0.5) within group (order by sale_price) - %s),
+                         count(*) desc
+                limit %s
+                """,
+                tuple([*params, int(budget * _BUDGET_FLOOR), int(budget), target, int(limit)]),
+            )
+            matches = _sale_project_rows(band or [], place, bedrooms)
+            if matches:
+                return matches, []
+        closest = fetch(
+            base + """
+            order by abs(percentile_cont(0.5) within group (order by sale_price) - %s),
+                     count(*) desc
+            limit %s
+            """,
+            tuple([*params, target, int(limit)]),
+        )
+    except Exception:
+        return [], []
+    rows = _sale_project_rows(closest or [], place, bedrooms)
+    if budget:
+        return [], rows
+    return rows, []
 
 
 def _why_line(factor: str) -> str:
@@ -241,6 +439,7 @@ def rank_projects(
     projects: list[dict],
     *,
     wanted_beds: int | None = None,
+    budget_aed: int | None = None,
     attach_sales: bool = True,
 ) -> dict[str, Any]:
     """Rank projects. Returns ranked list with scores and a recommendation payload."""
@@ -248,36 +447,53 @@ def rank_projects(
     if attach_sales:
         attach_market_activity(rows)
     items = [features(row) for row in rows]
+    for item in items:
+        item["wanted_beds"] = wanted_beds
     if len(items) < 2:
         winner = items[0] if items else None
         return {
             "ranked": items,
             "can_rank": False,
+            "used_factors": [],
             "winner": winner,
             "alternatives": [],
             "why": [],
-            "notes": ["Share one more project to compare side by side."],
+            "notes": ["Limited data: share one more project to compare side by side."],
             "recommendation": None if not winner else {
                 "name": winner["name"],
                 "id": winner.get("id"),
                 "why": ["A solid option from the recorded project data."],
-                "notes": [],
+                "notes": ["Limited data: share one more project to compare side by side."],
             },
         }
 
-    price_pts = _rank_key([item["price"] for item in items], lower_is_better=True)
+    prices = [item["price"] for item in items]
+    budget_pts = _budget_fit_scores(prices, budget_aed)
+    price_pts = (
+        budget_pts
+        if budget_aed and any(point is not None for point in budget_pts)
+        else _rank_key(prices, lower_is_better=True)
+    )
+    price_factor = "budget fit" if budget_aed and price_pts is budget_pts else "lower price"
     size_pts = _rank_key([item["size"] for item in items], lower_is_better=False)
-    bed_pts = _bed_fit_scores([item["beds"] for item in items], wanted_beds)
-    hand_pts = _rank_key([item["handover"] for item in items], lower_is_better=True)
+    bed_pts = _bed_fit_scores(items, wanted_beds)
+    # Past completion dates are old stock, not a reason to rank a tower first.
+    future_handovers = [
+        item["handover"] if _is_future_stamp(item.get("handover")) else None
+        for item in items
+    ]
+    hand_pts = _rank_key(future_handovers, lower_is_better=True)
+    last_sale_pts = _rank_key([item.get("last_sale") for item in items], lower_is_better=False)
     status_pts = _rank_key([item["status_rank"] for item in items], lower_is_better=False)
     sales_pts = _rank_key([item["sales_count"] for item in items], lower_is_better=False)
     rent_pts = _rank_key([item["rent_count"] for item in items], lower_is_better=False)
 
     factor_sets = {
-        "lower price": price_pts,
+        price_factor: price_pts,
         "more space": size_pts,
         "bedroom fit" if wanted_beds is not None else "more bedrooms": bed_pts,
         "earlier handover": hand_pts,
+        "latest recorded sale": last_sale_pts,
         "readiness": status_pts,
         "more recent sales activity": sales_pts,
         "active rental market": rent_pts,
@@ -295,33 +511,36 @@ def rank_projects(
             point = points[index]
             if point is None:
                 continue
-            parts.append(point)
+            weight = 3 if name == "budget fit" else 1
+            parts.extend([point] * weight)
             if point >= 0.75:
                 why.append(name)
-        item["score"] = round(100 * (sum(parts) / len(parts))) if parts else 50
+        item["score"] = (sum(parts) / len(parts)) if parts else 0
         item["why"] = why
         item["factor_count"] = len(parts)
 
     items.sort(key=lambda item: (-(item.get("score") or 0), item["name"]))
     if not can_rank:
+        limited = (
+            f"Limited data: ranked on {_factor_phrase(active_factors)}."
+            if active_factors else
+            "Limited data: too few recorded factors to rank these options."
+        )
         return {
             "ranked": items,
             "can_rank": False,
+            "used_factors": active_factors,
             "winner": items[0] if items else None,
             "alternatives": items[1:4],
-            "why": [],
-            "notes": [
-                "These options are close on the recorded details — useful next step is to compare handover and layout preference."
-            ],
+            "why": active_factors,
+            "notes": [limited],
             "recommendation": {
                 "name": items[0]["name"] if items else None,
                 "id": items[0].get("id") if items else None,
-                "why": ["A practical starting point from the projects in view."],
-                "notes": [
-                    "These options are close on the recorded details — useful next step is to compare handover and layout preference."
-                ],
+                "why": active_factors or ["A practical starting point from the projects in view."],
+                "notes": [limited],
                 "alternatives": [
-                    {"name": item["name"], "id": item.get("id"), "score": item.get("score")}
+                    {"name": item["name"], "id": item.get("id")}
                     for item in items[1:4]
                 ],
             },
@@ -334,9 +553,10 @@ def rank_projects(
         return {
             "ranked": items,
             "can_rank": True,
+            "used_factors": active_factors,
             "winner": None,
             "alternatives": tied,
-            "why": [],
+            "why": active_factors,
             "notes": [
                 f"{names[0]} and {names[1]} both look strong — choose by the layout and community feel you prefer."
             ],
@@ -344,7 +564,7 @@ def rank_projects(
                 "name": None,
                 "tied": names,
                 "why": [
-                    "Both lead on a balanced mix of price, size, sales activity and rental activity."
+                    f"Both lead on {_factor_phrase(active_factors)}."
                 ],
                 "notes": [
                     f"{names[0]} and {names[1]} both look strong — choose by the layout and community feel you prefer."
@@ -365,6 +585,7 @@ def rank_projects(
     return {
         "ranked": items,
         "can_rank": True,
+        "used_factors": active_factors,
         "winner": best,
         "alternatives": alts,
         "why": why,
@@ -372,11 +593,10 @@ def rank_projects(
         "recommendation": {
             "name": best["name"],
             "id": best.get("id"),
-            "score": best.get("score"),
             "why": why,
             "notes": notes,
             "alternatives": [
-                {"name": item["name"], "id": item.get("id"), "score": item.get("score")}
+                {"name": item["name"], "id": item.get("id")}
                 for item in alts
             ],
         },
@@ -388,24 +608,30 @@ def _detail_why(item: dict | None, factors: list[str]) -> list[str]:
     item = item or {}
     lines = []
     for factor in factors[:5]:
-        if factor == "lower price" and item.get("price"):
+        if factor == "budget fit" and item.get("price"):
+            lines.append(f"Close to your budget at AED {int(item['price']):,}")
+        elif factor == "lower price" and item.get("price"):
             lines.append(f"Attractive recent price at AED {int(item['price']):,}")
         elif factor == "more space" and item.get("size"):
             lines.append(f"Larger recorded size around {int(item['size']):,} sqft")
-        elif factor in {"more bedrooms", "bedroom fit"} and item.get("beds") is not None:
-            beds = item["beds"]
-            if beds == 0:
-                lines.append("Useful studio layout in the recorded range")
-            elif beds == 1:
-                lines.append("Solid 1-bedroom fit in the recorded range")
+        elif factor in {"more bedrooms", "bedroom fit"}:
+            wanted = item.get("wanted_beds")
+            if wanted == 0:
+                lines.append("Fits the studio request")
+            elif wanted == 1:
+                lines.append("Fits the 1-bedroom request")
+            elif wanted:
+                lines.append(f"Fits the {int(wanted)}-bedroom request")
+            elif item.get("beds") is not None:
+                lines.append(f"Bedroom range includes {item['beds']:g} bedrooms")
             else:
-                lines.append(f"Flexible bedroom range around {beds:g} bedrooms")
-        elif factor == "earlier handover" and item.get("handover"):
-            try:
-                stamp = datetime.utcfromtimestamp(item["handover"]).strftime("%b %Y")
-            except Exception:
-                stamp = "an earlier date"
+                lines.append(_why_line(factor))
+        elif factor == "earlier handover" and item.get("handover") and _is_future_stamp(item.get("handover")):
+            stamp = _month_year(item["handover"]) or "an earlier date"
             lines.append(f"Earlier handover timing ({stamp})")
+        elif factor == "latest recorded sale" and item.get("last_sale"):
+            stamp = _month_year(item["last_sale"]) or "this year"
+            lines.append(f"Latest recorded sale {stamp}")
         elif factor == "more recent sales activity" and item.get("sales_count"):
             lines.append(
                 f"Strong sales and transaction activity ({int(item['sales_count'])} recent sales)"
@@ -418,8 +644,6 @@ def _detail_why(item: dict | None, factors: list[str]) -> list[str]:
             lines.append("Strong readiness / availability status")
         else:
             lines.append(_why_line(factor))
-    if not lines:
-        lines.append("Strong balance of price, size, sales activity and rental activity")
     return lines
 
 
@@ -451,10 +675,13 @@ def format_footer(result: dict, *, intro: str | None = None) -> str:
         return "\n".join(lines)
 
     lines.append(f"**Acot Recommend:** {name}")
-    lines.append("**Why this is the strongest match:**")
+    lines.append("**Why this is the strongest match:**" if result.get("can_rank") else "**Why:**")
     why = rec.get("why") or result.get("why") or []
     for item in _detail_why(winner, why):
         lines.append(f"- {item}")
+    for note in rec.get("notes") or result.get("notes") or []:
+        if str(note).lower().startswith("limited data"):
+            lines.append(f"- {note}")
     alts = rec.get("alternatives") or []
     if alts:
         alt_names = ", ".join(
@@ -473,7 +700,9 @@ def format_shortlist(result: dict, *, question: str | None = None, assumptions: 
         lines.append(assumptions)
         lines.append("")
     lines.append(
-        "Best matches for investing and buying, based on price, size, sales and rentals:"
+        "Best matches for investing and buying, based on "
+        + _factor_phrase(result.get("used_factors"))
+        + ":"
     )
     lines.append("")
     for index, item in enumerate(ranked[:12], start=1):
@@ -499,12 +728,12 @@ def format_shortlist(result: dict, *, question: str | None = None, assumptions: 
 def format_compare_table(projects: list[dict], result: dict) -> str:
     """Side-by-side style text for named compare when not using structured snapshots."""
     items = result.get("ranked") or [features(row) for row in projects]
-    by_name = {str(item["name"]).lower(): item for item in items}
     ordered = []
     for row in projects:
-        key = str(row.get("name") or "").lower()
-        if key in by_name and by_name[key] not in ordered:
-            ordered.append(by_name[key])
+        for item in items:
+            if item.get("row") is row and item not in ordered:
+                ordered.append(item)
+                break
     for item in items:
         if item not in ordered:
             ordered.append(item)
@@ -518,8 +747,13 @@ def format_compare_table(projects: list[dict], result: dict) -> str:
     def price_cell(item):
         if item.get("price") is None:
             return "—"
-        kind = item.get("price_kind") or ""
-        label = "recent sale" if kind == "recent_sale" else "price"
+        kind = str(item.get("price_kind") or "")
+        if kind == "recent_sale":
+            label = "recent sale"
+        elif kind in {"yearly rent", "rent"}:
+            label = "yearly rent"
+        else:
+            label = "price"
         return f"AED {int(item['price']):,} ({label})"
 
     def beds_cell(item):
@@ -536,15 +770,16 @@ def format_compare_table(projects: list[dict], result: dict) -> str:
         stamp = item.get("handover")
         if stamp is None:
             return "—"
-        try:
-            return datetime.utcfromtimestamp(stamp).strftime("%b %Y")
-        except Exception:
-            return "—"
+        return _month_year(stamp) or "—"
 
     def count_cell(item, key):
         value = item.get(key)
         return "—" if value is None else str(int(value))
 
+    rentals = bool(ordered) and all(
+        str(item.get("price_kind") or "") in {"yearly rent", "rent"}
+        for item in ordered
+    )
     rows = [
         header,
         sep,
@@ -553,12 +788,47 @@ def format_compare_table(projects: list[dict], result: dict) -> str:
             cell(f"{int(item['size']):,} sqft" if item.get("size") else "—") for item in ordered
         ) + " |",
         "| Bedrooms | " + " | ".join(cell(beds_cell(item)) for item in ordered) + " |",
-        "| Recent sales | " + " | ".join(cell(count_cell(item, "sales_count")) for item in ordered) + " |",
-        "| Rental contracts | " + " | ".join(cell(count_cell(item, "rent_count")) for item in ordered) + " |",
-        "| Handover | " + " | ".join(cell(hand_cell(item)) for item in ordered) + " |",
-        "| Score | " + " | ".join(cell(f"{item.get('score', 50)}%") for item in ordered) + " |",
     ]
-    intro = f"Side-by-side comparison of {', '.join(names)} on price, size, sales and rentals:"
+    show_activity = (not rentals) or any(
+        item.get("sales_count") is not None or item.get("rent_count") is not None
+        for item in ordered
+    )
+    if show_activity and not rentals:
+        rows.append(
+            "| Recent sales | " + " | ".join(cell(count_cell(item, "sales_count")) for item in ordered) + " |"
+        )
+        rows.append(
+            "| Rental contracts | " + " | ".join(cell(count_cell(item, "rent_count")) for item in ordered) + " |"
+        )
+    elif any(item.get("sales_count") is not None for item in ordered):
+        rows.append(
+            "| Recent sales | " + " | ".join(cell(count_cell(item, "sales_count")) for item in ordered) + " |"
+        )
+    if any(item.get("rent_count") is not None for item in ordered) and rentals:
+        rows.append(
+            "| Rental contracts | " + " | ".join(cell(count_cell(item, "rent_count")) for item in ordered) + " |"
+        )
+    if (not rentals) or any(item.get("handover") is not None for item in ordered):
+        rows.append(
+            "| Handover | " + " | ".join(cell(hand_cell(item)) for item in ordered) + " |"
+        )
+    scores = [float(item.get("score") or 0) for item in ordered]
+    low, high = (min(scores), max(scores)) if scores else (0, 0)
+    if not scores or high == low:
+        score_cells = ["50%"] * len(ordered)
+    else:
+        score_cells = [f"{round(100 * (score - low) / (high - low))}%" for score in scores]
+    rows.append("| Score | " + " | ".join(cell(value) for value in score_cells) + " |")
+    if rentals:
+        intro = (
+            f"Side-by-side comparison of {', '.join(names)} on "
+            + _factor_phrase(result.get("used_factors"))
+            + ":"
+        )
+    else:
+        intro = (
+            f"Side-by-side comparison of {', '.join(names)} on price, size, sales and rentals:"
+        )
     return intro + "\n\n" + "\n".join(rows) + "\n\n" + format_footer(result)
 
 
@@ -589,9 +859,12 @@ def _project_points(row: dict | None) -> list[str]:
         )
     sales = _num(row.get("sales_count"), row.get("recent_sales_count"))
     if sales:
-        points.append(f"{int(sales)} recent sales")
+        points.append(f"{int(sales)} sales in the last 12 months")
+    sold = _handover_label({"handover_time": row.get("last_sold_on") or row.get("last_sale")})
+    if sold:
+        points.append(f"latest recorded sale {sold}")
     hand = _handover_label(row)
-    if hand:
+    if hand and _is_future_stamp(_handover_stamp(row.get("handover_time") or row.get("handover"))):
         points.append(f"handover {hand}")
     return points
 
@@ -607,10 +880,7 @@ def _handover_label(row: dict) -> str | None:
     stamp = _handover_stamp(value)
     if stamp is None:
         return str(value) if value else None
-    try:
-        return datetime.utcfromtimestamp(stamp).strftime("%b %Y")
-    except (OSError, OverflowError, ValueError, TypeError):
-        return None
+    return _month_year(stamp)
 
 
 def within_months(row: dict, months: int) -> bool:
@@ -639,7 +909,10 @@ def format_ranked_picks(
         row = item.get("row") or item
         lines.append(_project_bullet(index, {**row, "name": item.get("name") or row.get("name")}))
     lines.append("")
-    lines.append(f"{tag_project(winner)} is the strongest match on the recorded price, size and sales activity.")
+    phrase = _factor_phrase(ranked.get("used_factors") or winner.get("why") or ranked.get("why"))
+    lines.append(f"{tag_project(winner)} is the strongest match on {phrase}.")
+    if not ranked.get("can_rank"):
+        lines.append("Limited data — only a few recorded factors differ between these options.")
     for point in why:
         lines.append(f"- {point}")
     if relaxed:

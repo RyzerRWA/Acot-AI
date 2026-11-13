@@ -13,6 +13,7 @@ from run import (
     _build_comparison,
     _build_fast_structured_answer,
     _broker_band,
+    _broker_place,
     _broker_turn,
     _classify_small_talk,
     _detect_response_type,
@@ -136,6 +137,23 @@ def test_investment_answer_with_projects_shows_cards():
     assert _detect_response_type(
         question, "investment", _summary(projects=[])
     ) == "investment_analysis"
+
+
+def test_snapshot_fact_with_projects_shows_cards():
+    question = "what about Arabian Ranches only — typical 3-bed and 4-bed sale?"
+    summary = _summary()
+    assert _detect_response_type(question, "fact", summary) == "project_list"
+    assert _detect_response_type(question, "search", summary) == "project_list"
+    response = build_frontend_response(
+        question=question,
+        standalone_question=question,
+        answer="Arabian Ranches, recorded sales by bedroom",
+        question_type="search",
+        structured_summary=summary,
+        documents=[],
+    )
+    assert response["response_type"] == "project_list"
+    assert response["data"]["projects"]
 
 
 def test_agent_comparison_shows_comparison_even_without_compare_words():
@@ -697,6 +715,130 @@ def test_compare_all_projects_uses_every_candidate_in_a_table():
     assert "Creek Beach - Summer" in turn["fast_answer"]
     assert "Creek Beach - Savanna-Cedar-Mangrove" in turn["fast_answer"]
     assert "**Acot Recommend:**" in turn["fast_answer"]
+
+
+def _deira_studio_cards(entity_type="listing"):
+    return [
+        {
+            "entity_type": entity_type,
+            "listing_id": listing_id,
+            "title": title,
+            "price_aed": price,
+            "size_sqft": size,
+            "rent_frequency": "yearly",
+            "beds": 0,
+        }
+        for listing_id, title, price, size in (
+            ("11", "Large Studio Layout | High Exposure | Vacant", 22_000, 258),
+            ("12", "Affordable Studio Apartment in Deira for Executives", 23_000, 130),
+            ("13", "BEST DEAL - STUDIO ONLY 23K IN 12 PAYMENTS", 23_000, 152),
+            ("14", "Large Studio Layout | High Exposure | Vacant", 26_000, 224),
+            ("15", "One Month Rent Free-Studio Flat Available", 27_000, 355),
+        )
+    ]
+
+
+def test_compare_all_apartments_ranks_on_screen_listings():
+    class _Memory:
+        active_candidates = _deira_studio_cards("property")
+
+    question = "compare all apartments and tell me the best"
+    turn = _compare_shown_turn(question, _Memory())
+    assert turn is not None
+    listings = turn["structured_summary"]["listings"]
+    assert len(listings) == 5
+    assert turn["structured_summary"]["projects"] == []
+    assert turn["structured_summary"]["comparison"] is True
+    assert turn["use_fast"] is True
+    assert "| Factor |" in turn["fast_answer"]
+    assert "**Acot Recommend:**" in turn["fast_answer"]
+    assert "22,000" in turn["fast_answer"]
+    assert "27,000" in turn["fast_answer"]
+    assert "No relevant evidence" not in turn["fast_answer"]
+    # Duplicate advert titles stay as two rows instead of collapsing.
+    assert turn["fast_answer"].count("Large Studio Layout") >= 2
+    assert _shortlist_recommend_turn(question, _Memory()) is None
+
+    view = _detect_response_type(
+        question,
+        turn["question_type"],
+        turn["structured_summary"],
+    )
+    assert view in {"listing_list", "comparison"}
+
+
+def test_compare_all_and_best_to_live_uses_rental_cards():
+    class _Memory:
+        active_candidates = _deira_studio_cards("listing")
+
+    turn = _compare_shown_turn(
+        "compare all and tell the best to live",
+        _Memory(),
+    )
+    assert turn is not None
+    assert len(turn["structured_summary"]["listings"]) == 5
+    assert "yearly rent" in turn["fast_answer"]
+    assert "Recent sales" not in turn["fast_answer"]
+
+
+def test_listing_compare_cards_show_baths_size_and_type():
+    from app.memory.conversation_memory import ConversationMemory
+
+    compact = ConversationMemory._compact_listing({
+        "listing_id": "42",
+        "title": "LARGE ONE BEDROOM FOR FAMILY ONLY 38K",
+        "price_aed": 38_000,
+        "size_sqft": {"min": 850, "max": 850},
+        "baths": 2,
+        "beds": 1,
+        "property_type": "Apartment",
+        "community": "International City",
+        "rent_frequency": "yearly",
+    })
+    assert compact["baths"] == 2
+    assert compact["size_sqft"] == 850
+    assert compact["property_type"] == "Apartment"
+
+    response = build_frontend_response(
+        question="compare all apartments",
+        standalone_question="compare all apartments",
+        answer="Compared.",
+        question_type="comparison",
+        structured_summary={
+            "listings": [compact],
+            "projects": [],
+            "comparison": True,
+        },
+        documents=[],
+    )
+    listing = response["data"]["listings"][0]
+    assert listing["baths"] == 2
+    assert listing["size_sqft"] == 850
+    assert listing["property_type"] == "Apartment"
+    assert not isinstance(listing["size_sqft"], dict)
+
+    missing = ConversationMemory._compact_listing({
+        "listing_id": "11",
+        "title": "Large Studio Layout | High Exposure | Vacant",
+        "price_aed": 22_000,
+        "size_sqft": 258,
+        "beds": 0,
+    })
+    blank = build_frontend_response(
+        question="compare all apartments",
+        standalone_question="compare all apartments",
+        answer="Compared.",
+        question_type="comparison",
+        structured_summary={
+            "listings": [missing],
+            "projects": [],
+            "comparison": True,
+        },
+        documents=[],
+    )["data"]["listings"][0]
+    assert blank["baths"] is None
+    assert blank["property_type"] is None
+    assert blank["size_sqft"] == 258
 
 
 def test_more_transactions_uses_the_next_page():
@@ -1281,6 +1423,62 @@ def test_broker_followup_uses_the_community_on_screen(monkeypatch):
     assert "not exclusive" not in text.lower()
 
 
+def test_broker_followup_after_yield_areas_uses_first_area(monkeypatch):
+    class _Memory:
+        active_candidates = [
+            {
+                "name": "Marina Gate",
+                "entity_type": "project",
+                "community": "Dubai Marina",
+            },
+            {
+                "name": "Bay Square",
+                "entity_type": "project",
+                "community": "Business Bay",
+            },
+        ]
+
+    captured = {}
+
+    def fake_list(**kwargs):
+        captured.update(kwargs)
+        return _broker_rows()[: kwargs.get("limit", 5)]
+
+    monkeypatch.setattr("app.retrieval.propai_catalog.list_brokers", fake_list)
+    question = "Tell me the top agents for these projects"
+    assert _broker_place(question, _Memory()) == "Dubai Marina"
+    turn = _broker_turn(question, _Memory())
+    assert turn is not None
+    assert "I can only show licensed agents in Dubai" not in turn["fast_answer"]
+    assert "Here are licensed agents for Dubai Marina." in turn["fast_answer"]
+    assert captured.get("place") == "Dubai Marina"
+
+    chips = _followup_questions({
+        "question": "Which Dubai areas have the best rental yield?",
+        "question_type": "search",
+        "structured_summary": {
+            "community": [
+                {
+                    "name": "Dubai Marina",
+                    "official_area": "MARSA DUBAI",
+                    "signals": {"rent_contracts": 4200},
+                },
+                {
+                    "name": "Business Bay",
+                    "official_area": "BUSINESS BAY",
+                    "signals": {"rent_contracts": 3100},
+                },
+            ],
+            "projects": [
+                {"name": "Marina Gate", "community": "Dubai Marina"},
+                {"name": "Bay Square", "community": "Business Bay"},
+            ],
+            "listings": [],
+        },
+    })
+    assert chips[0] == "Tell me the top agents for Dubai Marina"
+
+
 def test_project_search_offers_broker_followup():
     chips = _followup_questions({
         "question": "Show me projects in Jumeirah Village Circle",
@@ -1412,6 +1610,27 @@ def test_tools_for_keeps_search_brokers_on_broker_questions():
     rent = {tool["function"]["name"] for tool in tools_for("apartments for rent in marina")}
     assert "search_brokers" not in rent
     assert "search_listings" in rent
+
+
+def test_property_browse_uses_project_tools_not_rentals():
+    from app.listings.prompt import tools_for
+
+    names = {tool["function"]["name"] for tool in tools_for("Show me properties in Dubai Marina")}
+    assert "search_projects" in names
+    assert "search_listings" not in names
+    assert "find_areas" not in names
+
+
+def test_tools_for_open_buy_does_not_send_market_stats_stack():
+    from app.listings.prompt import tools_for
+
+    names = {tool["function"]["name"] for tool in tools_for("Where should I live in Dubai?")}
+    assert names == {"area_sales", "update_profile"}
+    buy = {tool["function"]["name"] for tool in tools_for("off-plan projects to buy in JVC")}
+    assert "search_projects" in buy
+    assert "search_brochures" not in buy
+    assert "compare_projects" not in buy
+    assert "area_sales" in buy
 
 
 def test_transactions_for_a_named_place_ignore_the_projects_on_screen(monkeypatch):

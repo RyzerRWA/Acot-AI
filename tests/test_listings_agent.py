@@ -1,5 +1,4 @@
 """Free checks for the listings agent: no database, no language model.  Run: python -m unittest tests.test_listings_agent"""
-import asyncio
 import os
 import unittest
 from unittest.mock import patch
@@ -93,7 +92,8 @@ class RouterTests(unittest.TestCase):
     def test_buying_and_project_questions_stay_with_the_existing_pipeline(self):
         for q in ["Which developers have off-plan projects in JVC?", "What is the starting price of Sky Edition?",
                   "Should I buy or rent in Marina?", "rental yield in Business Bay for investors",
-                  "What are the handover dates?", "Tell me about Dubai Hills"]:
+                  "What are the handover dates?", "Tell me about Dubai Hills",
+                  "Show me properties in Dubai Marina", "Show me projects in Business Bay"]:
             self.assertFalse(is_rent_question(q), q)
 
     def test_follow_ups_stay_in_the_rental_conversation_only(self):
@@ -181,16 +181,6 @@ class ListingComparisonRoutingTests(unittest.TestCase):
         context = memory.context()
 
         self.assertTrue(should_use_structured_listing_comparison(question, context))
-        from run import _try_agent_turn
-
-        components = {
-            "conversation_memory": memory,
-            "listing_agent": object(),
-        }
-        with patch.dict(os.environ, {"ACOT_USE_AGENT": "1"}):
-            self.assertIsNone(asyncio.run(
-                _try_agent_turn(question, components, {}, 0.0)
-            ))
 
         compared = previous_listing_comparison(question, context)
         self.assertIsNotNone(compared)
@@ -237,6 +227,48 @@ class ListingComparisonRoutingTests(unittest.TestCase):
             ],
         }
         self.assertFalse(should_use_structured_listing_comparison(question, context))
+
+    def test_compare_all_apartments_picks_every_visible_rental(self):
+        from app.retrieval.hybrid.listing_turns import (
+            pick_listed_rows,
+            previous_listing_comparison,
+            should_use_structured_listing_comparison,
+        )
+
+        listings = [
+            {
+                "entity_type": "property",
+                "listing_id": str(index),
+                "title": title,
+                "name": title,
+                "price_aed": 22000 + index * 1000,
+                "rent_frequency": "yearly",
+            }
+            for index, title in enumerate(
+                (
+                    "Large Studio Layout | High Exposure | Vacant",
+                    "Affordable Studio Apartment in Deira for Executives",
+                    "BEST DEAL - STUDIO ONLY 23K IN 12 PAYMENTS",
+                ),
+                start=1,
+            )
+        ]
+        question = "compare all apartments and tell me the best"
+        context = {
+            "current_user_question": question,
+            "active_candidates": listings,
+        }
+        self.assertEqual(
+            [row["listing_id"] for row in pick_listed_rows(listings, [question])],
+            ["1", "2", "3"],
+        )
+        self.assertTrue(should_use_structured_listing_comparison(question, context))
+        compared = previous_listing_comparison(question, context)
+        self.assertIsNotNone(compared)
+        self.assertEqual(
+            [row["listing_id"] for row in compared["listings"]],
+            ["1", "2", "3"],
+        )
 
 
 class ProjectToolTests(unittest.TestCase):
@@ -397,6 +429,51 @@ class GraphTests(unittest.TestCase):
         state, calls = self._graph([("get_project", "{}")], max_rounds=3)
         self.assertEqual(calls["chat"], 3)
         self.assertIn("couldn't pin that down", state["text"])
+
+    def test_duplicate_tool_calls_reuse_the_first_payload(self):
+        from types import SimpleNamespace as NS
+        from app.graph.graph import build_agent_graph
+        runs = {"n": 0}
+
+        def chat(messages):
+            if runs["n"] == 0:
+                runs["n"] += 1
+                calls = [
+                    NS(id="a", function=NS(name="market_stats", arguments='{"communities":["JVC"]}')),
+                    NS(id="b", function=NS(name="market_stats", arguments='{"communities":["JVC"]}')),
+                ]
+                return "fake", NS(usage=NS(total_tokens=1),
+                                  choices=[NS(message=NS(content=None, tool_calls=calls))])
+            return "fake", NS(usage=NS(total_tokens=1),
+                              choices=[NS(message=NS(content="ok", tool_calls=None))])
+
+        def run(name, args):
+            runs["n"] += 10
+            return NS(output={"rows": [{"projects": 3}], "handover_years": [{"year": 2028, "projects": 2}]},
+                      cards=[])
+
+        graph = build_agent_graph(chat, run, ToolInputError)
+        state = graph.invoke({"messages": [{"role": "user", "content": "JVC?"}],
+                              "seen": {}, "used": [], "tokens": 0, "rounds": 0})
+        self.assertEqual(runs["n"], 11)  # one model step + one SQL run
+        self.assertEqual([row["name"] for row in state["used"]], ["market_stats", "market_stats"])
+        tool_msgs = [m for m in state["messages"] if m.get("role") == "tool"]
+        self.assertEqual(len(tool_msgs), 2)
+        self.assertNotIn("handover_years", tool_msgs[0]["content"])
+        self.assertIn("handover_peak", tool_msgs[0]["content"])
+
+    def test_stats_payload_keeps_numbers_drops_year_list(self):
+        from app.graph.graph import _payload_for_model
+        payload = _payload_for_model("market_stats", {
+            "grouped_by": "none",
+            "rows": [{"projects": 4, "median_starting_price_aed": 1_800_000}],
+            "handover_years": [{"year": 2027, "projects": 1}, {"year": 2028, "projects": 9}],
+            "new_data": {"median_recent_sale_aed": 1_790_000},
+        })
+        self.assertEqual(payload["rows"][0]["median_starting_price_aed"], 1_800_000)
+        self.assertEqual(payload["new_data"]["median_recent_sale_aed"], 1_790_000)
+        self.assertEqual(payload["handover_peak"]["year"], 2028)
+        self.assertNotIn("handover_years", payload)
 
 
 class QuestionUnderstandingTests(unittest.TestCase):

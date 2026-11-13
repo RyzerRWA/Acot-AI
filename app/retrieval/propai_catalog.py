@@ -15,6 +15,13 @@ from datetime import datetime
 
 from app.database.postgres import fetch
 from app.listings.tools import ALIASES
+from app.retrieval.place_lock import (
+    asked_keys,
+    contains_place_sql,
+    drop_numbered_siblings,
+    is_numbered_sibling,
+    sales_place_sql,
+)
 from app.retrieval.propai_vector_search import search_places
 
 MIN_SCORE = 0.55
@@ -349,22 +356,34 @@ def _official_areas(values) -> list[str]:
     names = _expanded(values)
     if not names:
         return []
-    likes = _likes(names)
+    clause, extra = contains_place_sql(["label", "area", "master"], names)
     try:
         rows = fetch(
-            """
-            select distinct upper(area) as area
+            f"""
+            select distinct upper(area) as area, label, master
             from propai_places
             where level in ('area', 'master')
               and area is not null
-              and (label ilike any(%s::text[]) or area ilike any(%s::text[]) or master ilike any(%s::text[]))
+              and {clause}
             """,
-            (likes, likes, likes),
+            tuple(extra),
         )
     except Exception:
-        return [name.upper() for name in names]
-    found = [row["area"] for row in rows if row.get("area")]
-    return found or [name.upper() for name in names]
+        return asked_keys(names)
+    found = []
+    for row in rows or []:
+        area = row.get("area")
+        if not area:
+            continue
+        if any(
+            is_numbered_sibling(name, str(row.get("label") or ""))
+            or is_numbered_sibling(name, str(row.get("master") or ""))
+            for name in names
+        ):
+            continue
+        if area not in found:
+            found.append(area)
+    return found or asked_keys(names)
 
 
 _PLACE_LABELS: list[str] | None = None
@@ -397,9 +416,9 @@ def agent_projects(filters: dict, limit: int = 8, sort: str = "cheapest") -> tup
         params.append(filters["key"])
     communities = _expanded(filters.get("communities"))
     if communities:
-        likes = _likes(communities)
-        parts.append("(master_project ilike any(%s::text[]) or area ilike any(%s::text[]) or name ilike any(%s::text[]))")
-        params += [likes, likes, likes]
+        clause, extra = contains_place_sql(["master_project", "area", "name"], communities)
+        parts.append(clause)
+        params.extend(extra)
     developers = [str(name).strip() for name in (filters.get("developers") or []) if str(name).strip()]
     if developers:
         parts.append("developer ilike any(%s::text[])")
@@ -473,6 +492,9 @@ def agent_projects(filters: dict, limit: int = 8, sort: str = "cheapest") -> tup
             "brochure_url": None,
         })
     _add_sale_facts(projects)
+    if communities:
+        projects = drop_numbered_siblings(projects, communities)
+        total = len(projects)
     bedrooms = filters.get("bedrooms")
     if bedrooms is not None:
         wanted = int(bedrooms)
@@ -599,13 +621,12 @@ def latest_sales(place=None, limit: int = 8, offset: int = 0) -> dict:
     params: list = []
     text = str(place or "").strip()
     if text:
-        likes = _likes(_expanded([text]))
-        parts.append(
-            "(area_name_prop_ai ilike any(%s::text[]) "
-            "or master_project_prop_ai ilike any(%s::text[]) "
-            "or project_name_prop_ai ilike any(%s::text[]))"
+        clause, extra = contains_place_sql(
+            ["area_name_prop_ai", "master_project_prop_ai", "project_name_prop_ai"],
+            _expanded([text]),
         )
-        params.extend([likes, likes, likes])
+        parts.append(clause)
+        params.extend(extra)
     rows = fetch(
         f"""
         select project_name_prop_ai as project,
@@ -655,16 +676,17 @@ def agent_by_id(agent_id: str) -> dict | None:
 
 def rent_summary(areas, beds_min=None, beds_max=None) -> dict | None:
     """Median registered rent for a place. None when the question did not name a place."""
-    official = _official_areas(areas)
-    if not official:
+    asked = _expanded(areas)
+    if not asked:
         return None
+    lock, lock_params = sales_place_sql(asked, _official_areas(asked))
     clauses = [
         "deleted_at is null",
         "annual_amount > 0",
         "contract_start_date >= date '2025-09-01'",
-        "(upper(area_name_prop_ai) = any(%s) or upper(master_project_prop_ai) = any(%s))",
+        lock,
     ]
-    params: list = [official, official]
+    params: list = list(lock_params)
     if beds_min is not None:
         clauses.append("bedrooms >= %s")
         params.append(beds_min)
@@ -1036,30 +1058,32 @@ def list_brokers(name=None, brn=None, limit: int = 8, place=None, band=None) -> 
 
 def sale_summary(communities) -> dict | None:
     """Project count and median recent sale for a place in the new data."""
-    official = _official_areas(communities)
-    names = list(dict.fromkeys(official + [name.upper() for name in _expanded(communities)]))
-    if not names:
+    asked = _expanded(communities)
+    if not asked:
         return None
+    official = _official_areas(asked)
+    project_lock, project_params = contains_place_sql(["master_project", "area", "name"], asked)
+    sales_lock, sales_params = sales_place_sql(asked, official)
     try:
         projects = fetch(
-            """
+            f"""
             select count(*)::int as n
             from propai_projects
             where coalesce(name, '') <> ''
-              and (upper(master_project) = any(%s) or upper(area) = any(%s))
+              and {project_lock}
             """,
-            (names, names),
+            tuple(project_params),
         )[0]["n"]
         sales = fetch(
-            """
+            f"""
             select count(*)::int as n,
                    percentile_cont(0.5) within group (order by sale_price)::bigint as median
             from propai_sales
             where deleted_at is null and sale_price > 0
               and instance_date >= current_date - interval '24 months'
-              and (upper(area_name_prop_ai) = any(%s) or upper(master_project_prop_ai) = any(%s))
+              and {sales_lock}
             """,
-            (names, names),
+            tuple(sales_params),
         )[0]
     except Exception:
         return None

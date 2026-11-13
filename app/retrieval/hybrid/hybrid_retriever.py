@@ -1580,6 +1580,36 @@ class HybridRetriever:
             print("Filtered project lookup error:", exc)
             return []
 
+    def _place_projects(self, community_name: str):
+        """Projects in one community.
+
+        Prop-AI holds the live area list. The older projects table is only
+        the fallback when that area has no Prop-AI rows.
+        """
+        label = (community_name or "").strip()
+        if not label:
+            return None
+        try:
+            from app.retrieval.propai_catalog import agent_projects
+
+            rows, total = agent_projects(
+                {"communities": [label]},
+                limit=10,
+                sort="cheapest",
+            )
+        except Exception as exc:
+            print("Prop-AI place lookup error:", exc)
+            rows, total = [], 0
+        if rows:
+            result = self._project_result(rows)
+            result["project_total"] = total or len(rows)
+            result["catalog_place"] = label
+            return result
+        projects = self._filtered_projects(community_name=label)
+        if not projects:
+            return None
+        return self._project_result(projects)
+
     def _project_result(self, projects, ambiguous_label=None):
         result = {
             "communities": [],
@@ -1632,15 +1662,15 @@ class HybridRetriever:
             stem = (shape.get("stem") or "").strip()
             if stem and not shape.get("starts_with") and not shape.get("developer"):
                 closest = self._closest_named_community(stem)
-                if closest:
-                    place_projects = self._filtered_projects(community_name=closest)
-                    if place_projects:
-                        shape["kind"] = "community"
-                        shape["community"] = closest
-                        return self._project_result(place_projects)
+            if closest:
+                place_projects = self._place_projects(closest)
+                if place_projects:
                     shape["kind"] = "community"
                     shape["community"] = closest
-                    return None
+                    return place_projects
+                shape["kind"] = "community"
+                shape["community"] = closest
+                return None
 
             return self._project_result(projects)
 
@@ -1675,10 +1705,7 @@ class HybridRetriever:
             )
             if not community_name or re.fullmatch(r"20\d{2}", community_name):
                 return None
-            projects = self._filtered_projects(community_name=community_name)
-            if not projects:
-                return None
-            return self._project_result(projects)
+            return self._place_projects(community_name)
 
         if kind == "project" and shape.get("browse"):
             phrase = shape.get("name") or ""

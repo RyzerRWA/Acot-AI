@@ -7,6 +7,16 @@ from app.retrieval.hybrid.question_text import comparison_pair
 from app.retrieval.postgres.listing_retriever import ListingRetriever
 
 
+def is_shown_listing(item: dict) -> bool:
+    """True for on-screen rental cards, including property-typed listing rows."""
+    kind = str(item.get("entity_type") or "").lower()
+    if kind == "listing":
+        return True
+    if kind == "project":
+        return False
+    return bool(item.get("listing_id") or item.get("rent_frequency") or item.get("title"))
+
+
 def retrieve_listings(db, question: str, filters: Dict[str, Any]) -> Dict[str, Any]:
     """Search rental listings and keep project records out of the answer."""
 
@@ -323,10 +333,9 @@ def shown_listing_followup(
     for item in candidates:
         if not isinstance(item, dict):
             continue
-        kind = str(item.get("entity_type") or "").lower()
-        if kind == "listing":
+        if is_shown_listing(item):
             listings.append(item)
-        elif kind == "project":
+        elif str(item.get("entity_type") or "").lower() == "project":
             projects.append(item)
     rows = listings or projects
     if not rows:
@@ -538,7 +547,7 @@ def previous_listing_comparison(
         item
         for item in candidates
         if isinstance(item, dict)
-        and str(item.get("entity_type") or "").lower() == "listing"
+        and is_shown_listing(item)
         and (item.get("name") or item.get("title"))
     ]
 
@@ -694,7 +703,7 @@ def should_use_structured_listing_comparison(
         item
         for item in candidates
         if isinstance(item, dict)
-        and str(item.get("entity_type") or "").lower() == "listing"
+        and is_shown_listing(item)
         and (item.get("name") or item.get("title"))
     ]
     if len(listings) < 2:
@@ -839,7 +848,8 @@ def pick_listed_rows(listings, texts):
     if any(
         re.search(
             r"\b(?:these|those|them|both|above|shown|previous|rentals?|"
-            r"listings?|options?|first|top|ones?)\b",
+            r"listings?|apartments?|options?|first|top|ones?|"
+            r"all|every|each|compare|comparison|best|recommend)\b",
             text or "",
             flags=re.IGNORECASE,
         )

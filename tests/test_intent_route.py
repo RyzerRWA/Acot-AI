@@ -1,5 +1,5 @@
-from app.answers.intent_route import classify_intent, is_show_more, parse_budget_aed
-from app.answers.predict import format_trend_answer
+from app.answers.intent_route import classify_intent, is_show_more, parse_bedrooms, parse_budget_aed
+from app.answers.predict import format_snapshot_answer, format_trend_answer
 from app.answers.recommend import (
     format_afford_answer,
     format_family_areas,
@@ -66,6 +66,75 @@ def test_classify_predict_business_bay_in_sentence():
 def test_classify_properties_browse_is_neither():
     route = classify_intent("Properties in Business Bay.")
     assert route["intent"] == "neither"
+
+
+def test_classify_arabian_ranches_typical_beds_is_snapshot():
+    route = classify_intent(
+        "what about Arabian Ranches only — typical 3-bed and 4-bed sale?"
+    )
+    assert route["intent"] == "predict"
+    assert route["kind"] == "snapshot"
+    assert route["subject"] == "Arabian Ranches"
+    assert route["bedrooms"] == [3, 4]
+    assert parse_bedrooms(
+        "what about Arabian Ranches only — typical 3-bed and 4-bed sale?"
+    ) == [3, 4]
+
+
+def test_classify_show_properties_in_arabian_ranches_is_browse():
+    route = classify_intent("Show me properties in Arabian Ranches")
+    assert route["intent"] == "neither"
+    assert route["subject"] == "Arabian Ranches"
+
+
+def test_snapshot_answer_quotes_separate_bedroom_medians():
+    text = format_snapshot_answer(
+        "Arabian Ranches",
+        {"median_sale": 1_051_650},
+        [{"name": "Alma"}],
+        [
+            {"bedrooms": 3, "median": 2_400_000, "sales": 40, "as_of": "2026-10-01"},
+            {"bedrooms": 4, "median": 3_100_000, "sales": 22, "as_of": "2026-10-01"},
+        ],
+    )
+    _no_ids(text)
+    assert "2,400,000" in text
+    assert "3,100,000" in text
+    assert "1,051,650" not in text
+    assert "couldn't find" not in text.lower()
+    assert "yield" not in text.lower()
+    assert "cards below" in text.lower()
+
+
+def test_predict_turn_uses_bedroom_medians(monkeypatch):
+    monkeypatch.setattr(intent_turns, "fetch_place_trend", lambda place: {"median_sale": 1_051_650})
+    monkeypatch.setattr(
+        intent_turns,
+        "fetch_bedroom_median",
+        lambda place, beds: {
+            3: {"bedrooms": 3, "median": 2_400_000, "sales": 40, "as_of": "2026-10-01"},
+            4: {"bedrooms": 4, "median": 3_100_000, "sales": 22, "as_of": "2026-10-01"},
+        }.get(beds),
+    )
+    monkeypatch.setattr(
+        intent_turns,
+        "_search",
+        lambda filters, limit=6, skip_names=None: (
+            [{"id": "P1", "name": "Alma", "community": "Arabian Ranches"}],
+            [],
+        ),
+    )
+    turn = intent_turns.predict_turn(
+        "what about Arabian Ranches only — typical 3-bed and 4-bed sale?"
+    )
+    assert turn["use_fast"] is True
+    _no_ids(turn["fast_answer"])
+    assert "2,400,000" in turn["fast_answer"]
+    assert "3,100,000" in turn["fast_answer"]
+    assert "1,051,650" not in turn["fast_answer"]
+    assert "couldn't find" not in turn["fast_answer"].lower()
+    assert turn["structured_summary"]["projects"][0]["name"] == "Alma"
+    assert turn["question_type"] == "search"
 
 
 def test_classify_family_areas():
@@ -222,11 +291,61 @@ def test_classify_where_should_i_buy_is_open_best():
     assert route["kind"] == "open_best"
 
 
+def test_classify_open_buy_styles_stay_on_sql_recommend():
+    for question in (
+        "Where should I buy in Dubai if I have no area yet and no budget?",
+        "Where should I live in Dubai?",
+        "Best areas to buy in Dubai",
+        "Which area has the most sales?",
+        "Is Dubai a good investment based on the available data?",
+        "Where are people buying?",
+    ):
+        route = classify_intent(question)
+        assert route["intent"] == "recommend", question
+        assert route["kind"] == "open_best", question
+
+
+def test_classify_best_properties_in_a_place_stays_filtered():
+    route = classify_intent("show me the best properties in Jumeirah Village Circle?")
+    assert route["intent"] == "recommend"
+    assert route["kind"] == "filtered"
+    assert route["subject"] == "Jumeirah Village Circle"
+
+
+def test_classify_where_should_i_buy_stays_open_best_with_cards_on_screen():
+    class _Memory:
+        active_candidates = [
+            {"name": "A", "entity_type": "project"},
+            {"name": "B", "entity_type": "project"},
+        ]
+
+    route = classify_intent(
+        "Where should I buy in Dubai if I have no area yet and no budget?",
+        _Memory(),
+    )
+    assert route["intent"] == "recommend"
+    assert route["kind"] == "open_best"
+
+
 def test_classify_ready_or_offplan_is_not_open_best():
     route = classify_intent("Should I buy ready or off-plan in Dubai?")
     assert route["intent"] == "recommend"
     assert route["kind"] == "ready_offplan"
     assert route["subject"] is None
+
+
+def test_apartment_for_two_members_is_a_one_bedroom_recommend():
+    route = classify_intent("Which apartment is suitable for 2 members")
+    assert route["intent"] == "recommend"
+    assert route["kind"] == "filtered"
+    assert route["bedrooms"] == 1
+    assert route["household"] == 2
+    assert route["subject"] is None
+    persons = classify_intent("Show me the best apartments for 2 persons")
+    assert persons["intent"] == "recommend"
+    assert persons["kind"] == "filtered"
+    assert persons["bedrooms"] == 1
+    assert persons["household"] == 2
 
 
 def test_classify_filtered_jvc_buy():
@@ -529,27 +648,28 @@ def test_show_more_skips_projects_already_on_screen(monkeypatch):
     prior = "I want a 3-bedroom in JVC for a family of 4 to buy around AED 1.8M."
     memory = _Memory(prior, ["Hanover Square", "Diamond Views 1"])
 
-    def fake_search(filters, limit=6, skip_names=None):
+    def fake_pool(filters, skip_names=None, limit=6):
         skip = {str(name).lower() for name in (skip_names or set())}
         assert filters.get("communities")
         assert filters.get("bedrooms") == 3
         assert filters.get("max_price") == 1_800_000
         rows = [
-            {"id": "P1", "name": "Hanover Square", "price": 430_000},
-            {"id": "P2", "name": "Diamond Views 1", "price": 555_000},
-            {"id": "P3", "name": "Later Match", "price": 1_650_000, "bedroom_min": 3},
-            {"id": "P4", "name": "Another Match", "price": 1_720_000, "bedroom_min": 3},
+            {"id": "P1", "name": "Hanover Square", "price": 430_000, "bedroom_min": 3, "bedroom_max": 3},
+            {"id": "P2", "name": "Diamond Views 1", "price": 555_000, "bedroom_min": 3, "bedroom_max": 3},
+            {"id": "P3", "name": "Later Match", "price": 1_650_000, "bedroom_min": 3, "bedroom_max": 3, "sales_count": 8},
+            {"id": "P4", "name": "Another Match", "price": 1_720_000, "bedroom_min": 3, "bedroom_max": 3, "sales_count": 14},
         ]
         kept = [row for row in rows if row["name"].lower() not in skip]
         return kept, []
 
-    monkeypatch.setattr(intent_turns, "_search", fake_search)
+    monkeypatch.setattr(intent_turns, "_recommend_pool", fake_pool)
     turn = intent_turns.recommend_data_turn("show me more", memory)
     assert turn is not None
     names = [row["name"] for row in turn["structured_summary"]["projects"]]
     assert "Hanover Square" not in names
     assert "Diamond Views 1" not in names
     assert "Later Match" in names
+    assert names[0] == "Another Match"
     assert "specify" not in turn["fast_answer"].lower()
     assert "Jumeirah Village Circle" in turn["fast_answer"]
     assert turn["standalone_question"] == prior

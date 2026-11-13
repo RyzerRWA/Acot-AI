@@ -988,6 +988,25 @@ class EntityResolver:
             )
 
             if sub_match:
+                # "Dubai Marina" is the community. A longer name such as
+                # "Dubai Marina Mall" must not win unless the user said it.
+                community_match = self._resolve_community(
+                    unique_phrases,
+                    communities,
+                )
+                sub_name = self.normalize(sub_match.get("name") or "")
+                phrase = self.normalize(sub_match.get("matched_phrase") or "")
+                asked_sub = bool(sub_name) and sub_name in self.normalize(question or "")
+                if (
+                    community_match
+                    and community_match.get("score", 0) >= 0.99
+                    and phrase
+                    and phrase != sub_name
+                    and not asked_sub
+                ):
+                    sub_match = None
+
+            if sub_match:
 
                 record = sub_match["record"]
 

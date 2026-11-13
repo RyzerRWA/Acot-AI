@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 
 from openai import OpenAI
 
-from app.core.config import AICREDITS_API_KEY, AICREDITS_BASE_URL
+from app.core.config import AICREDITS_API_KEY, AICREDITS_BASE_URL, llm_chat_extras
 from app.graph.graph import build_agent_graph
 from app.listings.prompt import SYSTEM_PROMPT, TOOLS, tools_for
 from app.listings.tools import ToolInputError, mentions_known_name, run_tool
@@ -82,7 +82,8 @@ class ListingAgent:
                 except Exception as exc:
                     log.warning("LangSmith tracing is not available: %s", exc)
         self.client = client
-        primary = os.getenv("AICREDITS_MODEL", "openai/gpt-4o-mini")
+        #primary = os.getenv("AICREDITS_MODEL", "openai/gpt-4o-mini")
+        primary = os.getenv("AICREDITS_MODEL", "openai/gpt-6-luna")
         fallbacks = [m.strip() for m in os.getenv("AICREDITS_FALLBACK_MODELS", "").split(",") if m.strip()]
         self.models = [primary, *fallbacks]
 
@@ -93,7 +94,7 @@ class ListingAgent:
             try:
                 response = self.client.chat.completions.create(
                     model=model, messages=messages, tools=tools or TOOLS, tool_choice="auto",
-                    temperature=0.2, max_tokens=600)
+                    temperature=0.2, max_tokens=600, **llm_chat_extras(model))
                 return model, response
             except Exception as exc:  # network, rate limit, provider error
                 last = f"{model}: {exc}"

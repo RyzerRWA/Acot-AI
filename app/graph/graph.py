@@ -23,6 +23,8 @@ _TAG = re.compile(r"\[\[\d{1,12}\]\]")
 _NUMBER = re.compile(r"(\d[\d,]*(?:\.\d+)?)\s*(million|thousand|mn|m|k)?\b", re.I)
 _SCALE = {"million": 1e6, "mn": 1e6, "m": 1e6, "thousand": 1e3, "k": 1e3}
 MIN_CHECKED = 10_000   # only money-sized figures are checked; years, bedrooms and small counts are not
+# Stats tools are number tables; the full 9,000-char dump is what inflated recommend turns.
+_TOOL_JSON_CAP = {"market_stats": 2_500, "area_sales": 1_500, "area_stats": 2_500}
 
 
 class AgentState(TypedDict, total=False):
@@ -37,6 +39,7 @@ class AgentState(TypedDict, total=False):
     retried: bool
     retry: bool
     unsupported: list
+    tool_cache: dict     # same tool+args reuse the first payload instead of sending it twice
 
 
 def _compact(value):
@@ -46,6 +49,22 @@ def _compact(value):
     if isinstance(value, list):
         return [_compact(v) for v in value]
     return value
+
+
+def _payload_for_model(name: str, output):
+    """Same numbers the SQL path uses; drop repeated notes and year-by-year lists the answer never quotes."""
+    payload = _compact(output)
+    if name == "market_stats" and isinstance(payload, dict):
+        years = payload.pop("handover_years", None) or []
+        if years:
+            payload["handover_peak"] = max(years, key=lambda row: row.get("projects") or 0)
+        rows = payload.get("rows")
+        if isinstance(rows, list) and len(rows) > 8:
+            payload["rows"] = rows[:8]
+        payload["note"] = "Starting prices. Prefer new_data when present. No yield or ROI."
+    elif name == "area_sales" and isinstance(payload, dict):
+        payload.pop("note", None)
+    return payload
 
 
 def _numbers(text: str, scale: bool = True) -> list[float]:
@@ -122,24 +141,49 @@ def build_agent_graph(
                 log.exception("tool %s failed", name)
             return call_id, name, {"error": "That lookup failed."}, [], False
 
+    def _call_key(name, arguments):
+        try:
+            return (name, json.dumps(json.loads(arguments or "{}"), sort_keys=True, separators=(",", ":")))
+        except (TypeError, ValueError):
+            return (name, arguments or "{}")
+
     def tools_node(state: AgentState) -> dict:
         messages, seen, used = list(state["messages"]), dict(state.get("seen", {})), list(state.get("used", []))
         calls = list(state["calls"] or [])
+        prior = dict(state.get("tool_cache") or {})
+        first_id = {}
+        unique = []
+        for item in calls:
+            call_id, name, arguments = item
+            key = _call_key(name, arguments)
+            if key in prior or key in first_id:
+                continue
+            first_id[key] = call_id
+            unique.append(item)
         # Same outputs as sequential; run independent tool calls together to cut wait time.
-        if len(calls) <= 1:
-            results = [_run_one(*calls[0])] if calls else []
+        if len(unique) <= 1:
+            fresh = [_run_one(*unique[0])] if unique else []
         else:
-            workers = min(len(calls), 4)
+            workers = min(len(unique), 4)
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                results = list(pool.map(lambda item: _run_one(*item), calls))
-        for call_id, name, output, cards, ok in results:
+                fresh = list(pool.map(lambda item: _run_one(*item), unique))
+        by_id = {row[0]: row for row in fresh}
+        for call_id, name, arguments in calls:
+            key = _call_key(name, arguments)
+            if key in prior:
+                output, cards, ok = prior[key]["output"], prior[key]["cards"], True
+            else:
+                source_id = first_id[key]
+                _, name, output, cards, ok = by_id[source_id]
+                prior[key] = {"output": output, "cards": cards}
             used.append({"name": name, "ok": ok})
             for card in cards:
                 seen[card["listing_id"]] = card
+            cap = _TOOL_JSON_CAP.get(name, max_tool_json)
             messages.append({"role": "tool", "tool_call_id": call_id,
-                             "content": json.dumps(_compact(output), default=str,
-                                                   separators=(",", ":"))[:max_tool_json]})
-        return {"messages": messages, "seen": seen, "used": used, "calls": []}
+                             "content": json.dumps(_payload_for_model(name, output), default=str,
+                                                   separators=(",", ":"))[:cap]})
+        return {"messages": messages, "seen": seen, "used": used, "calls": [], "tool_cache": prior}
 
     def give_up_node(state: AgentState) -> dict:
         return {"text": GIVE_UP, "calls": []}

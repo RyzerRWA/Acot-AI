@@ -16,9 +16,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from app.listings.router import is_rent_question
 from app.listings.tools import _find_projects, top_areas_by_sales
 from app.listings.agent import EARLIER_NAME, ListingAgent, ListingsUnavailable, _ID_TAG as _AGENT_TAG
-from app.listings.router import is_rent_question
 from app.llm.client import LLMQueueTimeoutError
 from app.answers.spoken import MAX_FACT_CHARS, start_spoken_reply
 from app.subscription.token_usage import add_tokens
@@ -916,6 +916,12 @@ _BROKER_PLACE = re.compile(
     r"\b(?:for|in|at)\s+(.+?)$",
     re.I,
 )
+_BROKER_POINTER = re.compile(
+    r"\b(?:this|these|those|that|them|here|above|shown)\b|"
+    r"\b(?:projects?|propert(?:y|ies)|areas?|ones?|options?|listings?|"
+    r"communities?|places?)\b",
+    re.I,
+)
 
 
 def _broker_identity_filters(question):
@@ -1128,6 +1134,34 @@ def _place_choice_turn(question, place, conversation_memory):
     }
 
 
+def _on_screen_broker_place(conversation_memory):
+    """First area or project already on screen, so agent follow-ups stay on the last answer."""
+    items = getattr(conversation_memory, "active_candidates", None) or []
+    communities = []
+    names = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("entity_type") or "project").lower()
+        name = str(item.get("name") or item.get("title") or "").strip()
+        community = str(
+            item.get("community") or item.get("official_area") or ""
+        ).strip()
+        if kind == "community":
+            if name and name not in communities:
+                communities.append(name)
+            continue
+        if community and community not in communities:
+            communities.append(community)
+        if kind in {"project", "listing"} and name:
+            names.append(name)
+    if communities:
+        return communities[0]
+    if len(names) == 1:
+        return names[0]
+    return None
+
+
 def _broker_place(question, conversation_memory):
     """Community or project a broker follow-up refers to."""
     asked = (question or "").strip()
@@ -1143,35 +1177,19 @@ def _broker_place(question, conversation_memory):
         place = " ".join(_BROKER_FILTER_WORDS.sub(" ", place).split()).strip(" .?")
         # "the jvc" -> "Jumeirah Village Circle", so answers read properly and the search uses the full name.
         place = re.sub(r"^(?:the|a)\s+", "", place, flags=re.I)
-        from app.listings.tools import ALIASES
-        place = ALIASES.get(place.lower(), place)
-        if place:
-            return place
+        # "these projects" / "those areas" points at the last answer, not a new place.
+        pointed = " ".join(_BROKER_POINTER.sub(" ", place).split()).strip(" .?")
+        if pointed:
+            from app.listings.tools import ALIASES
+            return ALIASES.get(pointed.lower(), pointed)
     leftover = " ".join(_BROKER_FILLER.sub(" ", asked).split())
     leftover = " ".join(_BROKER_FILTER_WORDS.sub(" ", leftover).split()).strip(" .?")
+    leftover = " ".join(_BROKER_POINTER.sub(" ", leftover).split()).strip(" .?")
     if leftover:
         from app.retrieval.propai_catalog import is_outside_dubai, known_dubai_label
         if is_outside_dubai(leftover) or known_dubai_label(leftover):
             return leftover
-    items = getattr(conversation_memory, "active_candidates", None) or []
-    communities = []
-    names = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        if str(item.get("entity_type") or "project").lower() != "project":
-            continue
-        community = str(item.get("community") or "").strip()
-        name = str(item.get("name") or "").strip()
-        if community and community not in communities:
-            communities.append(community)
-        if name:
-            names.append(name)
-    if len(communities) == 1:
-        return communities[0]
-    if len(names) == 1:
-        return names[0]
-    return None
+    return _on_screen_broker_place(conversation_memory)
 
 
 def _broker_lookup(question, conversation_memory):
@@ -1461,9 +1479,11 @@ _SHORTLIST_RECOMMEND = re.compile(
     r"which (?:of these |ones? |of those )?(?:should|would) i|"
     r"what should i (?:pick|choose|buy)|"
     r"which property is best|"
-    r"best (?:property|project) to (?:invest|buy)|"
+    r"best (?:property|project|apartment|option) to (?:invest|buy|live)|"
+    r"best to live|"
+    r"tell(?: me)? (?:which |the )?best|"
     r"recommend (?:one|one of these|the best|among these)|"
-    r"best (?:one|option|pick|project)(?:\s+of these)?|"
+    r"best (?:one|option|pick|project|apartment)(?:\s+of these)?|"
     r"pick (?:one|for me)|"
     r"which of these (?:do you )?recommend"
     r")\b",
@@ -1471,6 +1491,10 @@ _SHORTLIST_RECOMMEND = re.compile(
 )
 _COMPARE_WORD = re.compile(r"\bcompar(?:e|ison|ing)\b", re.I)
 _COMPARE_ALL = re.compile(r"\b(?:all|every|each)\b", re.I)
+_SHOWN_RENTALS = re.compile(
+    r"\b(?:apartments?|rentals?|listings?|studios?|to live)\b",
+    re.I,
+)
 _COMPARE_FIRST_N = re.compile(
     r"\b(?:first|top)\s+(two|three|four|both|2|3|4)\b|\b(?:both|the two)\b",
     re.I,
@@ -1486,7 +1510,69 @@ def _active_projects(conversation_memory) -> list[dict]:
         if isinstance(item, dict)
         and str(item.get("entity_type") or "project").lower() == "project"
         and item.get("name")
+        and not _is_listing_row(item)
     ]
+
+
+def _is_listing_row(item: dict) -> bool:
+    kind = str(item.get("entity_type") or "").lower()
+    if kind == "listing":
+        return True
+    if kind == "project":
+        return False
+    return bool(item.get("listing_id") or item.get("rent_frequency") or item.get("title"))
+
+
+def _active_listings(conversation_memory) -> list[dict]:
+    items = getattr(conversation_memory, "active_candidates", None) or []
+    rows = []
+    for item in items:
+        if not isinstance(item, dict) or not _is_listing_row(item):
+            continue
+        if item.get("name") or item.get("title"):
+            rows.append(item)
+    return rows
+
+
+def _rankable_listing(item: dict) -> dict:
+    beds = item.get("beds")
+    rent = item.get("rent_frequency") or item.get("price_kind")
+    size = item.get("size_sqft") or item.get("size")
+    if isinstance(size, dict):
+        size = size.get("min") if size.get("min") is not None else size.get("max")
+    property_type = item.get("property_type")
+    if not property_type:
+        types = item.get("property_types") or []
+        if isinstance(types, list):
+            property_type = next((value for value in types if value), None)
+        elif types:
+            property_type = types
+    return {
+        **item,
+        "id": item.get("id") or item.get("listing_id"),
+        "name": item.get("name") or item.get("title"),
+        "price": item.get("price") or item.get("price_aed"),
+        "price_kind": item.get("price_kind") or ("yearly rent" if rent else "price"),
+        "size_sqft": size,
+        "baths": item.get("baths") if item.get("baths") is not None else item.get("bathrooms"),
+        "property_type": property_type,
+        "bedroom_min": item.get("bedroom_min") if item.get("bedroom_min") is not None else beds,
+        "bedroom_max": item.get("bedroom_max") if item.get("bedroom_max") is not None else beds,
+        "entity_type": "listing",
+    }
+
+
+def _shown_compare_rows(question, conversation_memory) -> tuple[str, list[dict]]:
+    projects = _active_projects(conversation_memory)
+    listings = _active_listings(conversation_memory)
+    rent_ask = bool(_SHOWN_RENTALS.search(question or ""))
+    if listings and (rent_ask or len(projects) < 2):
+        return "listing", [_rankable_listing(row) for row in listings]
+    if len(projects) >= 2:
+        return "project", projects
+    if len(listings) >= 2:
+        return "listing", [_rankable_listing(row) for row in listings]
+    return "", []
 
 
 def _shown_compare_limit(question: str) -> int | None:
@@ -1504,24 +1590,34 @@ def _shown_compare_limit(question: str) -> int | None:
 
 
 def _compare_shown_turn(question, conversation_memory):
-    """Compare N (or all) on-screen projects in a table + Acot Recommend."""
+    """Compare N (or all) on-screen projects or rentals in a table + Acot Recommend."""
     limit = _shown_compare_limit(question)
     if not limit:
         return None
     if _TRANSACTION.search(question or ""):
         return None
-    available = _active_projects(conversation_memory)
-    projects = available[:limit]
-    if len(projects) < 2:
+    kind, available = _shown_compare_rows(question, conversation_memory)
+    rows = available[:limit]
+    if len(rows) < 2:
         return None
     from app.answers.recommend import format_compare_table, rank_projects, wanted_bedrooms
 
-    ranked = rank_projects(projects, wanted_beds=wanted_bedrooms(question))
-    answer = format_compare_table(projects, ranked)
+    ranked = rank_projects(
+        rows,
+        wanted_beds=wanted_bedrooms(question),
+        attach_sales=(kind == "project"),
+    )
+    answer = format_compare_table(rows, ranked)
     summary = _empty_structured_summary()
     # Cards show the compared set; memory keeps the fuller shortlist via preserve logic.
-    summary["projects"] = projects
-    summary["project_total"] = len(projects)
+    if kind == "listing":
+        summary["listings"] = rows
+        summary["listing_total"] = len(rows)
+        data = {"community": [], "projects": [], "sub_communities": [], "listings": rows}
+    else:
+        summary["projects"] = rows
+        summary["project_total"] = len(rows)
+        data = {"community": [], "projects": rows, "sub_communities": []}
     summary["recommendation"] = ranked.get("recommendation")
     summary["comparison"] = True
     return {
@@ -1533,11 +1629,7 @@ def _compare_shown_turn(question, conversation_memory):
         "investment_analysis": None,
         "retrieval_result": {
             "question_type": "comparison",
-            "structured_data": {
-                "community": [],
-                "projects": projects,
-                "sub_communities": [],
-            },
+            "structured_data": data,
             "documents": [],
         },
         "use_fast": True,
@@ -1548,20 +1640,24 @@ def _compare_shown_turn(question, conversation_memory):
 
 
 def _shortlist_recommend_turn(question, conversation_memory):
-    """Rank projects already on screen and return Acot Recommend."""
+    """Rank projects or rentals already on screen and return Acot Recommend."""
     if _shown_compare_limit(question):
         return None
     if not _SHORTLIST_RECOMMEND.search(question or ""):
         return None
     if _TRANSACTION.search(question or ""):
         return None
-    projects = _active_projects(conversation_memory)
-    if len(projects) < 2:
+    kind, available = _shown_compare_rows(question, conversation_memory)
+    if len(available) < 2:
         return None
     from app.answers.recommend import format_shortlist, rank_projects, wanted_bedrooms
 
-    selected = projects[:_COMPARE_ALL_LIMIT]
-    ranked = rank_projects(selected, wanted_beds=wanted_bedrooms(question))
+    selected = available[:_COMPARE_ALL_LIMIT]
+    ranked = rank_projects(
+        selected,
+        wanted_beds=wanted_bedrooms(question),
+        attach_sales=(kind == "project"),
+    )
     # Compare-style "which is best" with many options still gets a table when asked to compare.
     if _COMPARE_WORD.search(question or ""):
         from app.answers.recommend import format_compare_table
@@ -1569,15 +1665,21 @@ def _shortlist_recommend_turn(question, conversation_memory):
     else:
         answer = format_shortlist(ranked, question=question)
     summary = _empty_structured_summary()
-    by_name = {str(item.get("name") or "").lower(): item for item in selected}
     ordered = []
     for item in ranked.get("ranked") or []:
-        row = by_name.get(str(item.get("name") or "").lower())
-        if row and row not in ordered:
+        row = item.get("row")
+        if row is not None and row not in ordered:
             ordered.append(row)
-    summary["projects"] = ordered
-    summary["project_total"] = len(ordered)
+    if kind == "listing":
+        summary["listings"] = ordered
+        summary["listing_total"] = len(ordered)
+        data = {"community": [], "projects": [], "sub_communities": [], "listings": ordered}
+    else:
+        summary["projects"] = ordered
+        summary["project_total"] = len(ordered)
+        data = {"community": [], "projects": ordered, "sub_communities": []}
     summary["recommendation"] = ranked.get("recommendation")
+    summary["comparison"] = True
     return {
         "question": question,
         "standalone_question": question,
@@ -1587,11 +1689,7 @@ def _shortlist_recommend_turn(question, conversation_memory):
         "investment_analysis": None,
         "retrieval_result": {
             "question_type": "comparison",
-            "structured_data": {
-                "community": [],
-                "projects": summary["projects"],
-                "sub_communities": [],
-            },
+            "structured_data": data,
             "documents": [],
         },
         "use_fast": True,
@@ -1812,10 +1910,8 @@ async def _try_agent_turn(question, components, timing_ms, ask_started):
         return None
 
     conversation_memory = components.get("conversation_memory")
-    if conversation_memory and should_use_structured_listing_comparison(
-        question,
-        conversation_memory.context(),
-    ):
+    # "Show me properties in Dubai Marina" is a project list, not an agent search.
+    if re.search(r"\b(?:propert(?:y|ies)|projects?)\b", question or "", re.I) and not is_rent_question(question):
         return None
 
     agent = components["listing_agent"]
@@ -2773,6 +2869,13 @@ def _followup_questions(prepared):
             and item.get("name")
         ]
     place = _followup_place(prepared)
+    ranked_areas = [
+        row
+        for row in (summary.get("community") or [])
+        if isinstance(row, dict)
+        and str(row.get("name") or "").strip()
+        and (row.get("signals") or row.get("ranking") or row.get("focus") in {"ranking", "investment"})
+    ]
 
     if listings or asks_for_listings(question):
         chips = _listing_followup_chips(place, listings)
@@ -2780,6 +2883,29 @@ def _followup_questions(prepared):
             chips = [chip for chip in chips if not _BROKER.search(chip)]
             return _unused_followups(prepared, chips)
         return _unused_followups(prepared, chips, pinned=chips[0] if chips else None)
+
+    if ranked_areas:
+        first = str(ranked_areas[0].get("name") or "").strip()
+        broker_chip = _broker_followup_chip(place=first)
+        chips = [broker_chip]
+        if len(projects) >= 2:
+            chips.extend(chip for topic, chip in _PROJECT_FOLLOWUPS if topic != "brokers")
+        elif len(projects) == 1:
+            name = projects[0].get("name") or "this project"
+            chips.extend([
+                _TRANSACTION_FOLLOWUP,
+                f"What is the starting price of {name}?",
+                f"What is the handover date of {name}?",
+            ])
+        else:
+            chips.extend([
+                f"Show me properties in {first}",
+                f"What are typical rents in {first}?",
+            ])
+        if broker_done:
+            chips = [chip for chip in chips if chip != broker_chip]
+            return _unused_followups(prepared, chips)
+        return _unused_followups(prepared, chips, pinned=broker_chip)
 
     if len(projects) == 1:
         name = projects[0].get("name") or "this project"

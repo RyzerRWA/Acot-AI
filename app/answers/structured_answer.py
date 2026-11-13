@@ -177,31 +177,42 @@ def _format_listing_card(record):
     else:
         price_label = price_text
 
-    size = _json_safe(record.get("size_sqft"))
+    size = _record_number(record, "size_sqft", "size")
+    baths = _record_number(record, "baths", "bathrooms")
     property_type = record.get("property_type")
+    if not property_type:
+        types = record.get("property_types") or []
+        if isinstance(types, str):
+            property_type = types
+        elif isinstance(types, list):
+            property_type = next((item for item in types if item), None)
 
     return {
-        "id": record.get("listing_id"),
-        "name": record.get("title"),
+        "id": record.get("listing_id") or record.get("id"),
+        "listing_id": record.get("listing_id") or record.get("id"),
+        "name": record.get("title") or record.get("name"),
+        "title": record.get("title") or record.get("name"),
         "developer": record.get("agency_name"),
         "community": record.get("community"),
         "sub_community": record.get("sub_community"),
         "price": _json_safe(price),
         "price_label": price_label,
+        "annual_rent_aed": _json_safe(price),
         "rent_frequency": frequency or None,
+        "beds": _json_safe(beds),
+        "baths": _json_safe(baths),
         "bedrooms": {
             "min": _json_safe(beds),
             "max": _json_safe(beds),
             "label": bedroom_label,
         },
-        "size_sqft": {
-            "min": size,
-            "max": size,
-        },
+        "size_sqft": _json_safe(size),
+        "property_type": property_type,
         "property_types": [property_type] if property_type else [],
         "status": record.get("furnishing") or record.get("completion_status"),
         "photos": _listing_photo_urls(record),
-        "property_finder_url": record.get("url"),
+        "cover_photo": record.get("cover_photo"),
+        "property_finder_url": record.get("url") or record.get("property_finder_url"),
     }
 
 
@@ -925,6 +936,9 @@ def _detect_response_type(
             return "investment_analysis"
 
     # The agent marks a turn as a comparison when it used compare_projects.
+    if question_type == "comparison" and len(listings) >= 2 and not (projects or []):
+        return "listing_list"
+
     if question_type == "comparison" and len(projects) >= 2:
         return "project_comparison"
 
@@ -943,7 +957,7 @@ def _detect_response_type(
     ) and len(projects) >= 2:
         return "project_comparison"
 
-    if question_type in {"search", "investment"} and projects:
+    if question_type in {"search", "investment", "fact", "prediction"} and projects:
         return "project_list"
 
     if sub_communities:
@@ -1710,28 +1724,21 @@ def _unique_field(projects, key):
 def _price_range_clause(projects):
     prices = []
     for project in projects:
-        value = project.get("price")
-        if value is None:
+        text = _format_aed(project.get("price"))
+        if not text:
             continue
-        try:
-            if isinstance(value, str):
-                value = value.replace("AED", "").replace(",", "").strip()
-            number = float(value)
-        except (TypeError, ValueError):
-            continue
-        prices.append(number)
+        prices.append(float(text.replace("AED", "").replace(",", "").strip()))
 
     if not prices:
         return ""
 
-    low = min(prices)
-    high = max(prices)
+    low = _format_aed(min(prices))
+    high = _format_aed(max(prices))
+    if not low or not high:
+        return ""
     if low == high:
-        return f", with a starting price of {_format_aed(low)}"
-    return (
-        f", with starting prices from {_format_aed(low)} "
-        f"to {_format_aed(high)}"
-    )
+        return f", with a starting price of {low}"
+    return f", with starting prices from {low} to {high}"
 
 
 def _browse_intro(projects, ambiguous_label=None):

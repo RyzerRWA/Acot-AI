@@ -15,6 +15,24 @@ class Catalog(EntityResolver):
         return []
 
 
+def test_exact_community_beats_a_longer_sub_community_name():
+    class Places(EntityResolver):
+        def _catalog(self):
+            return [{"id": 1, "name": "Dubai Marina", "city": "Dubai"}], []
+
+        def _listing_sub_communities(self):
+            return [{"name": "Dubai Marina Mall", "community": "Dubai Marina"}]
+
+    resolver = Places(object())
+    area = resolver.resolve("Show me properties in Dubai Marina").to_dict()
+    assert area["entity_type"] == "community"
+    assert area["name"] == "Dubai Marina"
+
+    mall = resolver.resolve("Show me properties in Dubai Marina Mall").to_dict()
+    assert mall["entity_type"] == "sub_community"
+    assert mall["name"] == "Dubai Marina Mall"
+
+
 def test_spoken_question_with_fillers_needs_the_planner_name():
     resolver = Catalog(object())
     question = "So, uh, explain about Dawn by benatti."  # speech-to-text misheard "Binghatti"

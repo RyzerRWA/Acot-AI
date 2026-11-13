@@ -1214,7 +1214,19 @@ Rules:
 
         size = item.get("size_sqft")
         if isinstance(size, dict):
-            size = size.get("min")
+            size = size.get("min") if size.get("min") is not None else size.get("max")
+
+        baths = item.get("baths")
+        if baths is None:
+            baths = item.get("bathrooms")
+
+        property_type = item.get("property_type")
+        if not property_type:
+            types = item.get("property_types") or []
+            if isinstance(types, str):
+                property_type = types
+            elif isinstance(types, list):
+                property_type = next((value for value in types if value), None)
 
         cover = item.get("cover_photo")
         photos = item.get("photos")
@@ -1233,11 +1245,13 @@ Rules:
             ),
             "rent_frequency": item.get("rent_frequency"),
             "beds": beds,
-            "property_type": item.get("property_type"),
+            "baths": baths,
+            "property_type": property_type,
             "size_sqft": size,
             "cover_photo": cover,
             "url": item.get("url") or item.get("property_finder_url"),
             "community": item.get("community"),
+            "sub_community": item.get("sub_community"),
         }
 
     def _extract_candidates(

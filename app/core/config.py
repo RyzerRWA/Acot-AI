@@ -15,3 +15,11 @@ GEMINI_OPENAI_BASE_URL = (
 
 LLM_API_KEY = AICREDITS_API_KEY or GEMINI_API_KEY
 LLM_BASE_URL = AICREDITS_BASE_URL if AICREDITS_API_KEY else GEMINI_OPENAI_BASE_URL
+
+
+def llm_chat_extras(model: str) -> dict:
+    """GPT-6 Luna reasons by default. Chat Completions tools only work with reasoning off."""
+    name = (model or "").lower()
+    if any(tag in name for tag in ("gpt-6", "luna", "gpt-5", "o3", "o4")):
+        return {"reasoning_effort": "none"}
+    return {}

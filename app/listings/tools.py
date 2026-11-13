@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.database.postgres import fetch
+from app.retrieval.place_lock import contains_place_sql, is_numbered_sibling
 
 MIN_SQFT = 100  # sizes outside this range are data errors (a studio claiming 4,000,000 sqft)
 MAX_SQFT = 50_000
@@ -29,6 +30,7 @@ ALIASES = {
     "downtown": "Downtown Dubai",
     "palm": "Palm Jumeirah",
     "dubai hills": "Dubai Hills Estate",
+    "arabian ranches": "Arabian Ranches",
     "creek": "Dubai Creek Harbour",
     "barsha": "Al Barsha",
     "sports city": "Dubai Sports City",
@@ -134,9 +136,9 @@ def _where(f: dict) -> tuple[str, list]:
     parts, params = ["true"], []
     if f.get("areas"):
         names = [n for a in f["areas"] for n in (a, ALIASES.get(a.lower())) if n]
-        parts.append("(community ILIKE ANY(%s::text[]) OR sub_community ILIKE ANY(%s::text[]) "
-                     "OR location ILIKE ANY(%s::text[]))")
-        params += [_like(names)] * 3
+        clause, extra = contains_place_sql(["community", "sub_community", "location"], names)
+        parts.append(clause)
+        params.extend(extra)
     for key, clause in (("beds_min", "beds >= %s"), ("beds_max", "beds <= %s"), ("baths_min", "baths >= %s"),
                         ("min_annual_rent", "price_aed >= %s"), ("max_annual_rent", "price_aed <= %s"),
                         ("min_size_sqft", "size_sqft >= %s"), ("max_size_sqft", "size_sqft <= %s")):
@@ -244,18 +246,29 @@ def find_areas(raw) -> ToolResult:
     text = str(a.get("text") or "").strip()[:80]
     if not text:
         raise ToolInputError("text is required.")
-    patterns = _like([n for n in (text, ALIASES.get(text.lower())) if n])
+    names = [n for n in (text, ALIASES.get(text.lower())) if n]
+    patterns = _like(names)
+    lock, lock_params = contains_place_sql(["community", "sub_community", "location"], names)
     areas = fetch("select community, count(*)::int as listings from listings where community ILIKE ANY(%s::text[]) "
                   "group by community order by listings desc limit 10", (patterns,))
+    areas = [row for row in areas if not is_numbered_sibling(text, row.get("community") or "")]
     subs = fetch("select sub_community, community, count(*)::int as listings from listings "
                  "where sub_community ILIKE ANY(%s::text[]) group by sub_community, community "
                  "order by listings desc limit 10", (patterns,))
+    subs = [
+        row for row in subs
+        if not is_numbered_sibling(text, row.get("community") or "")
+        and not is_numbered_sibling(text, row.get("sub_community") or "")
+    ]
     buildings = fetch("select regexp_replace(location, '^.*>\\s*', '') as building, community, count(*)::int as listings "
                       "from listings where location ILIKE ANY(%s::text[]) group by 1, community "
                       "order by listings desc limit 10", (patterns,))
-    total = fetch("select count(*)::int as total from listings where community ILIKE ANY(%s::text[]) "
-                  "or sub_community ILIKE ANY(%s::text[]) or location ILIKE ANY(%s::text[])", (patterns,) * 3)[0]["total"]
-    places = _new_places(patterns)
+    buildings = [row for row in buildings if not is_numbered_sibling(text, row.get("community") or "")]
+    total = fetch(f"select count(*)::int as total from listings where {lock}", tuple(lock_params))[0]["total"]
+    places = [
+        row for row in _new_places(patterns)
+        if not is_numbered_sibling(text, row.get("label") or "")
+    ]
     if not (areas or subs or buildings):
         if places:
             return ToolResult({
@@ -438,8 +451,9 @@ def _project_where(f: dict) -> tuple[str, list]:
     parts, params = ["true"], []
     if f.get("communities"):
         names = [n for c in f["communities"] for n in (c, ALIASES.get(c.lower())) if n]
-        parts.append("(community ILIKE ANY(%s::text[]) OR sub_community ILIKE ANY(%s::text[]))")
-        params += [_like(names)] * 2
+        clause, extra = contains_place_sql(["community", "sub_community"], names)
+        parts.append(clause)
+        params.extend(extra)
     if f.get("developers"):
         parts.append("developer_name ILIKE ANY(%s::text[])")
         params.append(_like(f["developers"]))

@@ -36,9 +36,16 @@ _AFFORD = re.compile(
 
 _OPEN_BEST = re.compile(
     r"\b(?:"
-    r"best (?:property|project)(?: in dubai)?|"
-    r"which (?:one |of these )?(?:is |are )?(?:the )?best property|"
-    r"tell me which one is the best"
+    r"best (?:propert(?:y|ies)|projects?)(?: in dubai)?|"
+    r"which (?:one |of these )?(?:is |are )?(?:the )?best propert|"
+    r"tell me which one is the best|"
+    r"best areas?(?: to (?:buy|invest|live))?|"
+    r"where (?:should|can) i (?:invest|buy|live|look)|"
+    r"where to (?:invest|buy|live)|"
+    r"where are people buying|"
+    r"which area has the most sales|"
+    r"busiest areas|"
+    r"good investment"
     r")\b",
     re.I,
 )
@@ -56,7 +63,8 @@ _SHORTLIST = re.compile(
 
 _SUGGEST_PICK = re.compile(
     r"\b(?:recommend|suggest)\b.{0,40}\b(?:one|best|buy|invest|property|project)\b|"
-    r"\b(?:should i buy|worth buying|good buy|where should i (?:invest|buy))\b",
+    r"\b(?:should i buy|worth buying|good buy|where should i (?:invest|buy|live))\b|"
+    r"\b(?:show me (?:the )?best (?:propert|project)|best (?:propert(?:y|ies)|projects))",
     re.I,
 )
 
@@ -64,6 +72,19 @@ _WANT_FILTER = re.compile(
     r"\b(?:i want|i need|looking for|i'?m looking)\b",
     re.I,
 )
+_HOME = re.compile(r"\b(?:apartments?|flats?|homes?|propert(?:y|ies)|units?)\b", re.I)
+_HOUSEHOLD = re.compile(
+    r"\bfamily of\s+(a couple|couple|one|two|three|four|five|six|seven|eight|\d+)\b"
+    r"|\b(?:for|with)\s+(a couple|couple|one|two|three|four|five|six|seven|eight|\d+)\s+"
+    r"(?:members?|people|persons?|adults?)\b"
+    r"|\b(a couple|couple|one|two|three|four|five|six|seven|eight|\d+)\s+"
+    r"(?:members?|people|persons?|adults?)\b",
+    re.I,
+)
+_HOUSEHOLD_WORDS = {
+    "a couple": 2, "couple": 2, "one": 1, "two": 2, "three": 3, "four": 4,
+    "five": 5, "six": 6, "seven": 7, "eight": 8,
+}
 
 _BUY = re.compile(r"\b(?:buy|buying|to buy|purchase|off-?plan|for sale)\b", re.I)
 _RENT = re.compile(r"\b(?:rent|rental|to rent|yearly rent)\b", re.I)
@@ -85,6 +106,7 @@ _STATS = re.compile(
 )
 _SNAPSHOT = re.compile(
     r"\b(?:median sale|median price|average price|avg price|"
+    r"typical.{0,48}\bsales?\b|"
     r"price per sq|per sq ?ft|sq ?ft|"
     r"latest data date|data date|last 12 months)\b",
     re.I,
@@ -177,12 +199,25 @@ def parse_months(question: str | None) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def parse_bedrooms(question: str | None) -> list[int]:
+    """Every bedroom count named in the question, in order, unique."""
+    found: list[int] = []
+    for match in _BED.finditer(question or ""):
+        beds = int(match.group(1))
+        if 0 <= beds <= 10 and beds not in found:
+            found.append(beds)
+    return found
+
+
 def extract_place(question: str | None) -> str | None:
     text = question or ""
     lowered = text.lower()
     for key in sorted(ALIASES, key=len, reverse=True):
-        if re.search(rf"(?<![a-z0-9]){re.escape(key)}(?![a-z0-9])", lowered):
-            return ALIASES[key]
+        if not re.search(rf"(?<![a-z0-9]){re.escape(key)}(?![a-z0-9])", lowered):
+            continue
+        if re.search(rf"(?<![a-z0-9]){re.escape(key)}[\s-]+(?:[0-9]+|ii|iii|iv)\b", lowered):
+            continue
+        return ALIASES[key]
     from app.retrieval.propai_catalog import _static_dubai_names
 
     hits = []
@@ -252,6 +287,26 @@ def prior_anchor_question(conversation_memory, current: str | None = None) -> st
     return None
 
 
+def household_size(question: str | None) -> int | None:
+    """People named in the question, such as '2 members' or 'family of 4'."""
+    match = _HOUSEHOLD.search(question or "")
+    if not match:
+        return None
+    raw = next(group for group in match.groups() if group).lower().strip()
+    if raw in _HOUSEHOLD_WORDS:
+        return _HOUSEHOLD_WORDS[raw]
+    return int(raw)
+
+
+def bedrooms_for_household(count: int | None) -> int | None:
+    """Studio for 1 person, 1 bedroom for 2, then one more bedroom per two people."""
+    if count is None or count < 1:
+        return None
+    if count == 1:
+        return 0
+    return min(4, (count + 1) // 2)
+
+
 def classify_intent(question: str | None, conversation_memory=None) -> dict[str, Any]:
     """Return intent, optional kind, and subject. No database calls."""
     text = question or ""
@@ -268,11 +323,15 @@ def classify_intent(question: str | None, conversation_memory=None) -> dict[str,
         return {"intent": "neither", "kind": "show_more", "subject": None}
     place = extract_place(text)
     if place and _SNAPSHOT.search(text) and not _PREDICT.search(text):
-        return {
+        route = {
             "intent": "predict",
             "kind": "snapshot",
             "subject": place,
         }
+        beds = parse_bedrooms(text)
+        if beds:
+            route["bedrooms"] = beds
+        return route
     if _PREDICT.search(text) and not _STATS.search(text):
         return {
             "intent": "predict",
@@ -317,13 +376,31 @@ def classify_intent(question: str | None, conversation_memory=None) -> dict[str,
             "kind": "ready_offplan",
             "subject": None if whole_market else place,
         }
-    open_city = bool(_OPEN_BEST.search(text) or (
-        _SUGGEST_PICK.search(text)
+    people = household_size(text)
+    home_for_people = (
+        people is not None
+        and not (bool(_RENT.search(text)) and not _BUY.search(text))
+        and _HOME.search(text)
+        and not _FAMILY_AREAS.search(text)
+        and not _BED.search(text)
+    )
+    if home_for_people:
+        return {
+            "intent": "recommend",
+            "kind": "filtered",
+            "subject": None if whole_market else place,
+            "budget_aed": parse_budget_aed(text),
+            "bedrooms": bedrooms_for_household(people),
+            "household": people,
+        }
+    open_city = bool(
+        (_OPEN_BEST.search(text) or _SUGGEST_PICK.search(text))
         and whole_market
         and not _BED.search(text)
         and parse_budget_aed(text) is None
-    ))
-    if open_city and not _on_screen(conversation_memory):
+    )
+    # Cards on screen only divert a "which of these" shortlist, not a new city-wide where-to-buy.
+    if open_city and not (_on_screen(conversation_memory) and _SHORTLIST.search(text)):
         return {
             "intent": "recommend",
             "kind": "open_best",

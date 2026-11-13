@@ -16,6 +16,19 @@ def _change_pct(now, before) -> float | None:
 def _place_keys(place: str) -> list[str]:
     keys = [place]
     try:
+        from app.listings.tools import ALIASES
+
+        alias = ALIASES.get((place or "").lower())
+        if alias:
+            keys.append(alias)
+    except Exception:
+        pass
+    return list(dict.fromkeys(key for key in keys if key))
+
+
+def _official_keys(place: str) -> list[str]:
+    keys = list(_place_keys(place))
+    try:
         from app.answers.area_comparison import official_area
 
         official = official_area(place)
@@ -23,17 +36,23 @@ def _place_keys(place: str) -> list[str]:
             keys.append(official)
     except Exception:
         pass
-    return list(dict.fromkeys(keys))
+    return list(dict.fromkeys(key for key in keys if key))
+
+
+def _sales_place_filter(place: str) -> tuple[str, list]:
+    from app.retrieval.place_lock import sales_place_sql
+
+    return sales_place_sql(_place_keys(place), _official_keys(place))
 
 
 def fetch_place_trend(place: str) -> dict[str, Any] | None:
     """Median sale, AED/sq ft, YoY %, latest date for a Dubai place."""
-    names = [key.upper() for key in _place_keys(place) if key]
-    if not names:
+    lock, lock_params = _sales_place_filter(place)
+    if lock == "false":
         return None
     try:
         rows = fetch(
-            """
+            f"""
             with s as (
               select instance_date, sale_price, price_per_sqft
               from public.propai_sales
@@ -41,10 +60,7 @@ def fetch_place_trend(place: str) -> dict[str, Any] | None:
                 and coalesce(outlier_flag, '') <> 'True'
                 and sale_price > 0
                 and instance_date between current_date - interval '24 months' and current_date
-                and (
-                  upper(area_name_prop_ai) = any(%s)
-                  or upper(master_project_prop_ai) = any(%s)
-                )
+                and {lock}
             ),
             cur as (select * from s where instance_date >= current_date - interval '12 months'),
             prev as (select * from s where instance_date < current_date - interval '12 months')
@@ -60,7 +76,7 @@ def fetch_place_trend(place: str) -> dict[str, Any] | None:
                  from prev where price_per_sqft > 0) as prev_psf,
               (select max(instance_date) from cur) as as_of
             """,
-            (names, names),
+            tuple(lock_params),
         )
     except Exception:
         return None
@@ -85,12 +101,12 @@ def fetch_place_trend(place: str) -> dict[str, Any] | None:
 
 
 def fetch_bedroom_median(place: str, bedrooms: int) -> dict[str, Any] | None:
-    names = [key.upper() for key in _place_keys(place) if key]
-    if not names:
+    lock, lock_params = _sales_place_filter(place)
+    if lock == "false":
         return None
     try:
         rows = fetch(
-            """
+            f"""
             select count(*)::int as n,
                    percentile_cont(0.5) within group (order by sale_price)::float8 as median,
                    max(instance_date) as as_of
@@ -100,12 +116,9 @@ def fetch_bedroom_median(place: str, bedrooms: int) -> dict[str, Any] | None:
               and sale_price > 0
               and instance_date >= current_date - interval '12 months'
               and bedrooms between %s - 0.2 and %s + 0.2
-              and (
-                upper(area_name_prop_ai) = any(%s)
-                or upper(master_project_prop_ai) = any(%s)
-              )
+              and {lock}
             """,
-            (bedrooms, bedrooms, names, names),
+            (bedrooms, bedrooms, *lock_params),
         )
     except Exception:
         return None
@@ -160,9 +173,45 @@ def _aed(value) -> str:
     return f"AED {int(value):,}"
 
 
-def format_snapshot_answer(place: str, trend: dict | None, projects: list[dict] | None = None) -> str:
+def _bed_label(bedrooms: int) -> str:
+    if bedrooms <= 0:
+        return "studio"
+    if bedrooms == 1:
+        return "1-bedroom"
+    return f"{int(bedrooms)}-bedroom"
+
+
+def format_snapshot_answer(
+    place: str,
+    trend: dict | None,
+    projects: list[dict] | None = None,
+    bedroom_stats: list[dict] | None = None,
+) -> str:
     """Median sale, AED/sq ft, and data date for a named place. Never invent."""
     names = [str(row.get("name") or "").strip() for row in (projects or []) if row.get("name")][:3]
+    stats = [row for row in (bedroom_stats or []) if isinstance(row, dict)]
+    if stats:
+        lines = [f"{place}, recorded sales by bedroom (last 12 months):", ""]
+        for row in stats:
+            beds = int(row.get("bedrooms") or 0)
+            label = _bed_label(beds)
+            if row.get("median"):
+                line = f"- {label}: median sale {_aed(row['median'])}"
+                extra = []
+                if row.get("sales"):
+                    extra.append(f"{int(row['sales']):,} sales")
+                pretty = _pretty_date(row.get("as_of"))
+                if pretty:
+                    extra.append(f"through {pretty}")
+                if extra:
+                    line += f" ({', '.join(extra)})"
+                lines.append(line)
+            else:
+                lines.append(f"- {label}: no recorded sales in this set.")
+        if names:
+            lines.append("")
+            lines.append("Example projects from this area are on the cards below.")
+        return "\n".join(lines)
     if trend and (trend.get("median_sale") or trend.get("psf")):
         pretty = _pretty_date(trend.get("as_of"))
         lines = [f"{place}, last 12 months of recorded sales" + (f" (data through {pretty})" if pretty else "") + ":"]
