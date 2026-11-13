@@ -1845,7 +1845,8 @@ async def _try_agent_turn(question, components, timing_ms, ask_started):
     await llm._acquire_slot()
     try:
         result = await asyncio.to_thread(
-            agent.answer, question, list(history), None, profile, _agent_results_hook.get(), components.get("page")
+            agent.answer, question, list(history), None, profile, _agent_results_hook.get(),
+            components.get("page"), components.get("audience"),
         )
     except LLMQueueTimeoutError:
         raise

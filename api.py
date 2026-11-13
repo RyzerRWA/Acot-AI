@@ -126,8 +126,10 @@ class AskRequest(BaseModel):
     mode: Literal["text", "voice"] = "text"
     # Voice mode: the language of the spoken reply, whatever the user speaks. None: follow the question.
     language: Literal["en", "hi"] | None = None
-    # The app page the chat was started from ("Ask ACOT about this"), e.g. "market". Fixed values only.
-    page: Literal["market"] | None = None
+    # The app page the chat was started from ("Ask ACOT about this"). Fixed values only.
+    page: Literal["market", "agent"] | None = None
+    # Who the answer is for. Brokers get supply-side talking points, never "you should buy".
+    audience: Literal["buyer", "broker"] = "buyer"
 
 
 def _apply_user_name(components, name):
@@ -518,6 +520,7 @@ async def ask_endpoint(request: AskRequest):
         _apply_profile(components, request.profile)
         _apply_user_name(components, request.user_name)
         components["page"] = request.page
+        components["audience"] = request.audience
 
         # ----------------------------------------------------
         # Run existing ACOT pipeline
@@ -624,6 +627,7 @@ async def ask_stream_endpoint(request: AskRequest):
             _apply_user_name(components, request.user_name)
             # Per question: the session lives on, but the context can be removed in the app.
             components["page"] = request.page
+            components["audience"] = request.audience
 
             chat_tokens = 0
 
