@@ -38,6 +38,19 @@ PAGE_CONTEXT = {
                "12 months, from Dubai Land Department records. Read vague questions (\"what stands out\", \"which "
                "areas\", \"is it a good time\") as about the Dubai sales market over the last 12 months, and use "
                "area_sales for them. A question that names something else wins."),
+    "agent": ("You are answering a licensed Dubai broker inside ACOT. They already know the market basics. "
+              "Prefer what sells, who it suits, objections, payment-plan talking points, and how to pitch to a client. "
+              "Never tell the broker what they personally should buy."),
+}
+
+AUDIENCE_CONTEXT = {
+    "broker": (
+        "Audience: a Dubai real-estate broker (not a buyer). Write as their market companion. "
+        "Use supply-side language: what sells, who it suits, common objections, payment plans, handover risk. "
+        "Never say \"you should buy\", \"worth buying for you\", or give personal investment advice to the broker. "
+        "You may say which buyer profiles a project or area fits. Quote only figures from tools. "
+        "Do not discuss commission."
+    ),
 }
 EARLIER_NAME = re.compile(r"(?:Shown: |; )([^;\]]+?) \(id (P\d{12}|\d{1,12})\)")
 
@@ -102,13 +115,17 @@ class ListingAgent:
         raise ListingsUnavailable(last)
 
     def answer(self, question: str, history: list[dict] | None = None, listing_id: str | None = None,
-               profile: dict | None = None, on_results=None, page: str | None = None) -> AgentResult:
+               profile: dict | None = None, on_results=None, page: str | None = None,
+               audience: str | None = None) -> AgentResult:
         """profile: what is known about the user. The update_profile tool writes into this same dict.
         on_results(tool_outputs): called once, from this thread, as soon as a search has returned records
-        and before the model writes its answer, so voice mode can start speaking early."""
+        and before the model writes its answer, so voice mode can start speaking early.
+        audience: \"buyer\" (default) or \"broker\" for the agent companion."""
         started = time.perf_counter()
         profile = {} if profile is None else profile
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        if audience in AUDIENCE_CONTEXT:
+            messages.append({"role": "system", "content": AUDIENCE_CONTEXT[audience]})
         if profile:
             messages.append({"role": "system", "content":
                              "What is known about this user (from their own earlier messages or the app). Use it to "
