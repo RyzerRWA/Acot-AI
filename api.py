@@ -142,12 +142,20 @@ def _apply_user_name(components, name):
 
 def _apply_profile(components, profile):
     """Merge an app-supplied user profile into the session. Invalid values are ignored, never fatal."""
+    # Companion is per-question (Nest CRM/claim/intro payload). Always clear the previous
+    # turn's companion first — otherwise "hi" reuses the last claim answer.
+    session_profile = components.setdefault("profile", {})
+    session_profile.pop("companion", None)
+
     if not profile:
         return
+    companion = profile.get("companion") if isinstance(profile, dict) else None
     try:
-        components.setdefault("profile", {}).update(clean_profile(profile))
+        session_profile.update(clean_profile(profile))
     except ToolInputError:
         pass
+    if isinstance(companion, dict) and companion.get("kind"):
+        session_profile["companion"] = companion
 
 
 # ============================================================
