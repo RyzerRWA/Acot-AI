@@ -171,6 +171,7 @@ def test_propai_browse_says_recent_sale_not_starting_price():
     assert "I found 128 projects in Dubai Land Residence Complex" in answer
     assert "Recent sale AED 750,146" in answer
     assert "Starting price" not in answer
+    assert "Let me know if you need more details on any of these projects!" in answer
 
 
 def test_browse_more_says_here_are_more():
@@ -1440,6 +1441,37 @@ def test_broker_followup_keeps_agent_intent(monkeypatch):
     assert "licensed agents" in turn["fast_answer"].lower()
     assert _broker_turn("show me apartments in dubai marina", _Memory()) is None
     assert _broker_turn("show me projects in dubai marina", _Memory()) is None
+
+
+def test_bedroom_followup_keeps_on_screen_place():
+    from run import _inherit_place_for_home_browse, _propai_sql_browse
+    from app.answers.intent_route import is_incomplete_home_browse
+
+    class _Memory:
+        last_user_question = "Show me projects in Jumeirah Village Circle."
+        last_standalone_question = "Show me projects in Jumeirah Village Circle."
+        turns = [{"user_question": "Show me projects in Jumeirah Village Circle."}]
+        active_candidates = [
+            {
+                "name": "Serenz by Danube",
+                "entity_type": "project",
+                "community": "Jumeirah Village Circle",
+            }
+        ]
+
+    follow = "show me two-bedroom apartments"
+    assert is_incomplete_home_browse(follow)
+    rewritten = _inherit_place_for_home_browse(
+        follow,
+        _Memory(),
+        "Show me projects in Jumeirah Village Circle.",
+    )
+    assert "jumeirah village circle" in rewritten.lower()
+    assert "2 bedroom" in rewritten.lower()
+    assert _propai_sql_browse(rewritten, _Memory()) is True
+    assert _inherit_place_for_home_browse(
+        "show me two-bedroom apartments", None, None
+    ) == "show me two-bedroom apartments"
 
 
 def test_top_agents_for_these_projects_uses_on_screen_community(monkeypatch):

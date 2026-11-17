@@ -1715,6 +1715,12 @@ def _build_fast_structured_answer(
             for record in communities:
                 lines.append(f"- {record.get('name') or 'Unknown community'}")
 
+        if projects:
+            lines.append("")
+            lines.append(
+                "Let me know if you need more details on any of these projects!"
+            )
+
         return "\n".join(lines)
 
     if sub_communities:

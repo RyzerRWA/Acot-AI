@@ -1189,6 +1189,29 @@ def _place_choice_turn(question, place, conversation_memory):
     }
 
 
+def _inherit_place_for_home_browse(question, conversation_memory, prior=None):
+    """Attach the last Dubai place when the user only names beds/type.
+
+    After "projects in JVC", "show me two-bedroom apartments" must become
+    "Show me 2 bedroom apartments in Jumeirah Village Circle" for SQL browse.
+    """
+    if not is_incomplete_home_browse(question):
+        return question
+    locked = extract_place(question)
+    if not locked or locked.lower() == "dubai":
+        locked = extract_place(prior) if prior else None
+    if not locked or str(locked).lower() == "dubai":
+        locked = _on_screen_broker_place(conversation_memory)
+    if not locked or str(locked).lower() == "dubai":
+        return question
+    beds = parse_bedrooms(question)
+    bed_label = f"{beds[0]} bedroom " if beds else ""
+    home = "apartments" if re.search(
+        r"\b(?:apartments?|flats?)\b", question or "", re.I
+    ) else "projects"
+    return f"Show me {bed_label}{home} in {locked}"
+
+
 def _on_screen_broker_place(conversation_memory):
     """First area or project already on screen, so agent follow-ups stay on the last answer."""
     items = getattr(conversation_memory, "active_candidates", None) or []
@@ -2608,6 +2631,9 @@ async def _prepare_acot_turn_inner(
                 and not is_incomplete_home_browse(question)
             ):
                 question = f"Show me {bed_label}{home} in {place}"
+
+    # "show me two-bedroom apartments" after a JVC browse → keep that place on SQL.
+    question = _inherit_place_for_home_browse(question, conversation_memory, prior)
 
     # Agents for on-screen projects must beat agent-first (which often ignores cards).
     broker_first = await asyncio.to_thread(
