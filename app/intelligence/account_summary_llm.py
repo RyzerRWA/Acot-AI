@@ -138,12 +138,18 @@ OUTPUT FORMAT:
 Return ONLY a JSON object, no markdown fences and no commentary.
 
 {{
-  "summary": "one natural paragraph describing the user's main real-estate interests and research behavior",
+  "summary": "one short sentence for a broker, saying what the buyer is looking for",
   "acot_score": <number between 0 and {max_score:g}>,
   "key_insights": ["4 to 6 concise points describing the strongest observed interests"]
 }}
 
 RULES:
+- "summary" is read by a property broker deciding whether to contact this buyer. Write ONE sentence of
+  at most 25 words naming what they are looking for: the type of home, the areas or projects, and the
+  purpose (to live in, to rent out, to invest) when the questions show it. Example:
+  "A ready 1-bed in JVC or Dubai Marina to rent out, comparing handover dates and service charges."
+  Do not start with "The user". Do not mention budget, timing or bedrooms unless the questions say so.
+  If the questions are too general to say what they want, write what they have been researching.
 - "acot_score" MUST be between 0 and {max_score:g}.
 - Do not exceed the subscription maximum under any circumstance.
 - "key_insights" holds 4 to 6 short strings, each one observation.

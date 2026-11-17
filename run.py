@@ -2029,11 +2029,19 @@ def _classify_small_talk(question):
     return None
 
 
-def _small_talk_answer(kind, name=None):
-    """name: the signed-in user's first name, when the app sent it."""
+def _small_talk_answer(kind, name=None, audience="buyer"):
+    """name: the signed-in user's first name, when the app sent it.
+    audience: buyer (default) or broker — Nest sends broker for agent Ask ACOT."""
     who = f" {name}" if name else ""
+    broker = (audience or "buyer") == "broker"
 
     if kind == "identity":
+        if broker:
+            return (
+                "I'm ACOT, your CRM companion. I can read your leads and pipeline, "
+                "help you decide what to claim, and answer Dubai market questions — "
+                "I never message a buyer without you."
+            )
         return (
             "I'm ACOT, an AI assistant for Dubai real estate. I answer from "
             "project records and documents, including prices, developers, "
@@ -2041,6 +2049,12 @@ def _small_talk_answer(kind, name=None):
         )
 
     if kind == "capabilities":
+        if broker:
+            return (
+                "Ask me about follow-ups and your pipeline, draft a message to a lead, "
+                "which projects to claim, or Dubai areas, prices and projects. "
+                "Nothing is sent to a buyer unless you press Send."
+            )
         return (
             "I can help you with Dubai project data:\n\n"
             "- Find projects in a community\n"
@@ -2050,21 +2064,32 @@ def _small_talk_answer(kind, name=None):
         )
 
     if kind in ("GoodMorning", "Good Morning", "Morning"):
+        if broker:
+            return f"Good morning{who}. Ask about follow-ups, your pipeline, or the Dubai market."
         return (
             f"Good morning{who}, How can I help you with Dubai real estate today?"
         )
 
     if kind in ("GoodAfternoon", "Good Afternoon", "Afternoon"):
+        if broker:
+            return f"Good afternoon{who}. Ask about follow-ups, your pipeline, or the Dubai market."
         return (
             f"Good afternoon{who}, How can I help you with Dubai real estate today?"
         )
 
     if kind in ("GoodEvening", "Good Evening", "Evening"):
+        if broker:
+            return f"Good evening{who}. Ask about follow-ups, your pipeline, or the Dubai market."
         return (
             f"Good evening{who}, How can I help you with Dubai real estate today?"
         )
 
     if kind == "thanks":
+        if broker:
+            return (
+                f"You're welcome{who}. Ask about a lead, your pipeline, or the market "
+                "whenever you're ready."
+            )
         return (
             f"You're welcome{who}. Ask me about a Dubai community or project "
             "whenever you're ready."
@@ -2077,10 +2102,17 @@ def _small_talk_answer(kind, name=None):
         )
 
     if kind == "bye":
+        if broker:
+            return f"Goodbye{who}. I'll be here when you want to check leads or the market again."
         return (
             f"Goodbye{who}. Have a great day! I'll be here when you want to look at Dubai projects again."
         )
 
+    if broker:
+        return (
+            f"Hello{who}, I'm ACOT — ask about follow-ups, your pipeline, what to claim, "
+            "or the Dubai market."
+        )
     return f"Hello{who}, I'm ACOT, a Dubai real estate assistant. How can I help you?"
 
 
@@ -2309,7 +2341,8 @@ async def _try_agent_turn(question, components, timing_ms, ask_started):
     await llm._acquire_slot()
     try:
         result = await asyncio.to_thread(
-            agent.answer, question, list(history), None, profile, _agent_results_hook.get(), components.get("page")
+            agent.answer, question, list(history), None, profile, _agent_results_hook.get(),
+            components.get("page"), components.get("audience"),
         )
     except LLMQueueTimeoutError:
         raise
@@ -2465,7 +2498,18 @@ async def _try_agent_turn(question, components, timing_ms, ask_started):
     }
 
 
-async def _prepare_acot_turn(
+async def _prepare_acot_turn(question, components):
+    """Prepare a turn; a broker's CRM/claim part carried from a mixed question rides along with the market answer."""
+    components.pop("_carry_companion", None)
+    prepared = await _prepare_acot_turn_inner(question, components)
+    carry = components.pop("_carry_companion", None)
+    if carry and not prepared.get("broker_companion"):
+        prepared["broker_companion"] = carry
+        prepared["companion_suffix"] = f"**For you:** {carry['answer']}" if carry.get("answer") else ""
+    return prepared
+
+
+async def _prepare_acot_turn_inner(
     question,
     components
 ):
@@ -2486,6 +2530,7 @@ async def _prepare_acot_turn(
     timing_ms = {}
     ask_started = time.perf_counter()
 
+    # Greetings first — never answer "hi" with a sticky claim/CRM companion payload.
     small_talk = _classify_small_talk(question)
     if small_talk:
         timing_ms["rewrite"] = 0
@@ -2508,12 +2553,38 @@ async def _prepare_acot_turn(
             "rag_chain": rag_chain,
             "conversation_memory": conversation_memory,
             "use_fast": True,
-            "fast_answer": _small_talk_answer(small_talk, components.get("user_name")),
+            "fast_answer": _small_talk_answer(
+                small_talk,
+                components.get("user_name"),
+                components.get("audience") or "buyer",
+            ),
             "context": None,
             "timing_ms": timing_ms,
             "ask_started": ask_started,
             "small_talk": small_talk,
+            "audience": components.get("audience") or "buyer",
         }
+
+    # Nest agent Ask ACOT: CRM / claim / intro data in profile.companion (this question only).
+    profile = components.get("profile") or {}
+    companion = profile.get("companion") if isinstance(profile, dict) else None
+    if (
+        (components.get("audience") or "buyer") == "broker"
+        and isinstance(companion, dict)
+        and companion.get("kind")
+    ):
+        from app.answers.broker_companion import prepare_companion_turn
+
+        prepared = await prepare_companion_turn(question, components, companion)
+        prepared["timing_ms"] = timing_ms
+        prepared["ask_started"] = ask_started
+        broker_part = prepared.get("broker_companion") or {}
+        if not broker_part.get("market") and not broker_part.get("alsoMarket"):
+            return prepared
+        components.setdefault("profile", {}).pop("companion", None)
+        # Mixed question: run the market answer below, then add the broker's own part after it.
+        if broker_part.get("alsoMarket") and not broker_part.get("market"):
+            components["_carry_companion"] = broker_part
 
     # After clarify: rewrite to a clean browse so SQL can answer (low tokens).
     prior = prior_anchor_question(conversation_memory, question)
@@ -3040,6 +3111,19 @@ def _finalize_acot_turn(prepared, answer, answer_started):
     response.setdefault("meta", {})["timing_ms"] = timing_ms
     if prepared.get("agent"):
         response["meta"]["agent"] = prepared["agent"]
+    # Suggested next questions — same chips stream clients get via `followups`.
+    followups = _followup_questions(prepared)
+    if followups:
+        response["followups"] = followups
+    companion = prepared.get("broker_companion")
+    if isinstance(companion, dict):
+        response["companion"] = {
+            "source": companion.get("source"),
+            "leads": companion.get("leads") or [],
+            "draft": companion.get("draft"),
+            "suggestions": companion.get("suggestions") or followups or [],
+            "claimCandidates": companion.get("claimCandidates") or [],
+        }
     return response
 
 
@@ -3061,6 +3145,8 @@ async def ask_acot(
             context=prepared["context"],
             question_type=prepared["question_type"]
         )
+    if prepared.get("companion_suffix"):
+        answer = f"{answer}\n\n{prepared['companion_suffix']}"
 
     return _finalize_acot_turn(
         prepared,
@@ -3253,7 +3339,15 @@ def _listing_followup_chips(place, listings):
 def _followup_questions(prepared):
     question = prepared.get("question") or ""
 
+    companion = prepared.get("broker_companion") or {}
+    if isinstance(companion, dict) and companion.get("suggestions"):
+        return list(companion.get("suggestions") or [])[:3]
+
     if prepared.get("small_talk"):
+        if (prepared.get("audience") or "buyer") == "broker":
+            from app.answers.broker_companion import BROKER_STARTER_CHIPS
+
+            return _unused_followups(prepared, BROKER_STARTER_CHIPS)
         return _unused_followups(prepared, _STARTER_CHIPS)
 
     summary = prepared.get("structured_summary") or {}
@@ -3553,6 +3647,13 @@ async def stream_acot(
                 raise RuntimeError(
                     "LLM returned an empty answer."
                 )
+
+        if prepared.get("companion_suffix"):
+            tail = f"\n\n{prepared['companion_suffix']}"
+            for piece in _iter_typewriter_pieces(tail):
+                yield ("delta", {"type": "delta", "text": piece})
+                await asyncio.sleep(0.02)
+            answer = f"{answer}{tail}"
 
         followups = _followup_questions(prepared)
         if followups:
