@@ -75,6 +75,23 @@ async def answer_companion(
     }
     history = companion.get("history") or ""
     page_note = companion.get("page_note") or ""
+    focus_project = companion.get("focusProject") if isinstance(companion.get("focusProject"), dict) else None
+    focus_community = companion.get("focusCommunity") if isinstance(companion.get("focusCommunity"), dict) else None
+    focus_rules = ""
+    if focus_project:
+        focus_rules += (
+            "- FOCUS PROJECT is the project the broker is asking about. Keep market false and answer about IT first: "
+            "its claimStatus in plain words, and (only if you are NOT setting also_market) where it is and the developer.\n"
+            "- If claimStatus is available, judge the claim from claimScore and claimReasons (and buyerDemand30d if not null). "
+            "Not appearing in CLAIM PROJECTS does NOT make it a weak claim; never say that.\n"
+            "- For which leads fit, use ONLY FOCUS PROJECT matchingLeads. If it is empty, say no current lead clearly fits it "
+            "and name what is missing (area or budget). Do not list other leads just because they are warm.\n"
+        )
+    if focus_community:
+        focus_rules += (
+            "- FOCUS COMMUNITY is the area on screen. For leads that fit it, use ONLY its matchingLeads; "
+            "if empty, say none of the broker's leads named this area.\n"
+        )
 
     prompt = (
         f"You are ACOT, a friendly CRM companion for a Dubai real-estate broker"
@@ -89,12 +106,19 @@ async def answer_companion(
         "- If they ask for the WORST / weakest / avoid claims, pick the LOWEST scores and say why they are weak — "
         "do not praise the top fits.\n"
         "- If they ask for the BEST claims, pick the HIGHEST scores.\n"
-        "- If it is about Dubai market (areas, prices, projects, rents) and not their CRM, set market true.\n"
+        "- If it is ONLY about the Dubai market (areas, prices, projects, rents) and not their CRM or claims, set market true.\n"
+        "- If it needs BOTH market facts (a project's or area's prices, rents, sales, details, comparisons) AND their leads or claims, "
+        "set also_market true: ACOT's market answer is shown first, so your answer must cover only the broker's side "
+        "(claim status and strength, which leads fit and why, the next step). Never mention price, handover, developer, "
+        "size or any other project facts, not even to say they are missing: the market answer covers those.\n"
         "- Be concise: 2–5 short sentences. No markdown tables.\n"
-        "- Nothing is sent to a buyer unless they press Send on a draft.\n\n"
+        "- Nothing is sent to a buyer unless they press Send on a draft.\n"
+        + focus_rules
+        + "\n"
         "Reply with ONLY JSON:\n"
         "{"
         '"market": false, '
+        '"also_market": false, '
         '"source": "crm" or "claim", '
         '"answer": "friendly plain text", '
         '"leads": [{"leadId": "...", "why": "..."}] (max 5, only ids from the data), '
@@ -106,6 +130,8 @@ async def answer_companion(
         'Set "market": true and leave leads/draft/claimKeys empty when they need Dubai market data instead.\n\n'
         + (f"EARLIER IN THIS CHAT:\n{history}\n\n" if history else "")
         + (f"PAGE CONTEXT: {page_note}\n\n" if page_note else "")
+        + (f"FOCUS PROJECT:\n{json.dumps(focus_project, default=str)}\n\n" if focus_project else "")
+        + (f"FOCUS COMMUNITY:\n{json.dumps(focus_community, default=str)}\n\n" if focus_community else "")
         + f"CRM:\n{json.dumps(crm, default=str)}\n\n"
         + f"CLAIM PROJECTS (scored, usually best-first):\n{json.dumps(claims, default=str)}\n\n"
         + f"QUESTION: {question}"
@@ -226,6 +252,8 @@ async def answer_companion(
         "suggestions": _suggestions(parsed.get("suggestions")),
         "source": source,
         "market": False,
+        # A project or area on screen always gets ACOT's market answer as well, with this as the broker's part.
+        "alsoMarket": bool(parsed.get("also_market")) or bool(focus_project) or bool(focus_community),
         "claimCandidates": claim_candidates,
     }
 
