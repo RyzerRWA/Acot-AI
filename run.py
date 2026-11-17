@@ -2032,7 +2032,18 @@ async def _try_agent_turn(question, components, timing_ms, ask_started):
     }
 
 
-async def _prepare_acot_turn(
+async def _prepare_acot_turn(question, components):
+    """Prepare a turn; a broker's CRM/claim part carried from a mixed question rides along with the market answer."""
+    components.pop("_carry_companion", None)
+    prepared = await _prepare_acot_turn_inner(question, components)
+    carry = components.pop("_carry_companion", None)
+    if carry and not prepared.get("broker_companion"):
+        prepared["broker_companion"] = carry
+        prepared["companion_suffix"] = f"**For you:** {carry['answer']}" if carry.get("answer") else ""
+    return prepared
+
+
+async def _prepare_acot_turn_inner(
     question,
     components
 ):
@@ -2101,9 +2112,13 @@ async def _prepare_acot_turn(
         prepared = await prepare_companion_turn(question, components, companion)
         prepared["timing_ms"] = timing_ms
         prepared["ask_started"] = ask_started
-        if not (prepared.get("broker_companion") or {}).get("market"):
+        broker_part = prepared.get("broker_companion") or {}
+        if not broker_part.get("market") and not broker_part.get("alsoMarket"):
             return prepared
         components.setdefault("profile", {}).pop("companion", None)
+        # Mixed question: run the market answer below, then add the broker's own part after it.
+        if broker_part.get("alsoMarket") and not broker_part.get("market"):
+            components["_carry_companion"] = broker_part
 
     # "Compare Dubai Marina and Business Bay": a table built from the database, no model call.
     areas = None
@@ -2605,6 +2620,8 @@ async def ask_acot(
             context=prepared["context"],
             question_type=prepared["question_type"]
         )
+    if prepared.get("companion_suffix"):
+        answer = f"{answer}\n\n{prepared['companion_suffix']}"
 
     return _finalize_acot_turn(
         prepared,
@@ -3075,6 +3092,13 @@ async def stream_acot(
                 raise RuntimeError(
                     "LLM returned an empty answer."
                 )
+
+        if prepared.get("companion_suffix"):
+            tail = f"\n\n{prepared['companion_suffix']}"
+            for piece in _iter_typewriter_pieces(tail):
+                yield ("delta", {"type": "delta", "text": piece})
+                await asyncio.sleep(0.02)
+            answer = f"{answer}{tail}"
 
         followups = _followup_questions(prepared)
         if followups:
