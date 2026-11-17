@@ -22,7 +22,7 @@ from app.listings.tools import ToolInputError, mentions_known_name, run_tool
 
 log = logging.getLogger("acot.listings")
 
-MAX_ROUNDS = 5
+MAX_ROUNDS = 3
 MAX_TOOL_JSON = 9_000  # characters of tool output handed back to the model
 HISTORY_TURNS = 6      # earlier messages sent along with a question
 HISTORY_CHARS = 1_200  # longest earlier message sent in full

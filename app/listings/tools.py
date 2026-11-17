@@ -46,7 +46,7 @@ SORTS = {
 GROUPS = {"community": "community", "beds": "beds", "property_type": "property_type", "furnishing": "furnishing"}
 
 COLUMNS = ("listing_id, title, property_type, price_aed, beds, baths, size_sqft, furnishing, "
-           "community, sub_community, stored_photos")
+           "community, sub_community, agency_name, stored_photos")
 
 
 class ToolInputError(ValueError):
@@ -69,6 +69,23 @@ def _obj(raw: Any) -> dict:
     return raw
 
 
+_BED_WORDS = {
+    "studio": 0, "studios": 0,
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+}
+_BED_TOKEN = re.compile(
+    r"\b(studio|studios|one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s*-?\s*"
+    r"(?:bed(?:room)?s?|br)\b",
+    re.I,
+)
+_BROWSE_NAME = re.compile(
+    r"\b(?:show|find|list|tell|apartments?|bedrooms?|propert(?:y|ies)|projects?|"
+    r"villas?|rentals?|listings?)\b",
+    re.I,
+)
+
+
 def _num(args: dict, key: str, lo: float, hi: float):
     value = args.get(key)
     if value is None or value == "":
@@ -80,6 +97,86 @@ def _num(args: dict, key: str, lo: float, hi: float):
     if n != n or n < lo or n > hi:
         raise ToolInputError(f"{key} must be a number between {lo:g} and {hi:g}.")
     return n
+
+
+def _beds(args: dict, key: str, lo: float = 0, hi: float = 12):
+    """Bedroom counts: 2, '2', 'two' / 'two bedrooms', or [2] from the model."""
+    value = args.get(key)
+    if value is None or value == "":
+        return None
+    # Models often send bedrooms as [2] or {"min": 2}.
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+        if value is None or value == "":
+            return None
+    if isinstance(value, dict):
+        value = (
+            value.get("min")
+            if value.get("min") is not None
+            else value.get("max")
+            if value.get("max") is not None
+            else value.get("value")
+            if value.get("value") is not None
+            else value.get(key)
+        )
+        if value is None or value == "":
+            return None
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _BED_WORDS:
+            value = _BED_WORDS[text]
+        else:
+            match = _BED_TOKEN.search(text) or re.fullmatch(
+                r"(studio|studios|one|two|three|four|five|six|seven|eight|nine|ten|\d+)",
+                text,
+            )
+            if match:
+                token = match.group(1).lower()
+                value = _BED_WORDS.get(token, token)
+    return _num({key: value}, key, lo, hi)
+
+
+def _place_from_text(text: str) -> str | None:
+    lowered = (text or "").lower()
+    for key in sorted(ALIASES, key=len, reverse=True):
+        if re.search(rf"(?<![a-z0-9]){re.escape(key)}(?![a-z0-9])", lowered):
+            return ALIASES[key]
+    for alias in dict.fromkeys(ALIASES.values()):
+        if alias.lower() in lowered:
+            return alias
+    return None
+
+
+def _normalize_project_search(a: dict) -> dict:
+    """Turn a browse phrase the model put in `name` into real filters."""
+    a = dict(a)
+    if a.get("bedrooms") is not None:
+        beds = _beds(a, "bedrooms")
+        if beds is not None:
+            a["bedrooms"] = int(beds)
+    # Models sometimes send area/community under rental-style keys.
+    if not a.get("communities"):
+        for key in ("areas", "community", "area", "place"):
+            if a.get(key) in (None, "", []):
+                continue
+            places = _strings(a, key)
+            if places:
+                a["communities"] = places
+                break
+    name = str(a.get("name") or "").strip()
+    if not name or not _BROWSE_NAME.search(name):
+        return a
+    if a.get("bedrooms") is None:
+        match = _BED_TOKEN.search(name)
+        if match:
+            token = match.group(1).lower()
+            a["bedrooms"] = _BED_WORDS[token] if token in _BED_WORDS else int(token)
+    if not a.get("communities"):
+        place = _place_from_text(name)
+        if place:
+            a["communities"] = [place]
+    a["name"] = None
+    return a
 
 
 def _strings(args: dict, key: str):
@@ -110,8 +207,8 @@ def parse_filters(raw: Any) -> dict:
 
     f = {
         "areas": _strings(a, "areas"),
-        "beds_min": _num(a, "beds_min", 0, 10),
-        "beds_max": _num(a, "beds_max", 0, 10),
+        "beds_min": _beds(a, "beds_min", 0, 10),
+        "beds_max": _beds(a, "beds_max", 0, 10),
         "baths_min": _num(a, "baths_min", 0, 10),
         "property_types": _strings(a, "property_types"),
         "furnishing": furnishing,
@@ -190,10 +287,11 @@ def _card(row: dict) -> dict:
         "property_type": row.get("property_type"),
         "beds": row.get("beds"),
         "baths": row.get("baths"),
-        "size_sqft": size if usable else None,
+        "size_sqft": int(round(size)) if usable else None,
         "furnishing": row.get("furnishing"),
         "community": row.get("community"),
         "sub_community": row.get("sub_community"),
+        "agency_name": row.get("agency_name"),
         "annual_rent_aed": round(annual),
         "monthly_rent_aed": _monthly(annual),
         "rent_per_sqft_per_year": round(annual / size, 1) if usable else None,
@@ -232,10 +330,10 @@ def _recorded_rents(filters: dict) -> dict | None:
         return None
 
 
-def _new_projects(filters: dict, limit: int, sort: str) -> tuple[list[dict], int]:
+def _new_projects(filters: dict, limit: int, sort: str, skip_names=None) -> tuple[list[dict], int]:
     try:
         from app.retrieval.propai_catalog import agent_projects
-        return agent_projects(filters, limit=limit, sort=sort)
+        return agent_projects(filters, limit=limit, sort=sort, skip_names=skip_names)
     except Exception as exc:
         print(f"Prop-AI project search unavailable: {exc}")
         return [], 0
@@ -419,7 +517,9 @@ PROJECT_SORTS = {
     "earliest_handover": "handover_time ASC NULLS LAST, id",
     "latest_handover": "handover_time DESC NULLS LAST, id",
     "largest": "size_max DESC NULLS LAST, id",
+    "more": "handover_time DESC NULLS LAST, id",
 }
+DEFAULT_PROJECT_SORT = "latest_handover"
 PROJECT_GROUPS = {"community": "community", "developer": "btrim(developer_name)"}
 _NAME_STOPWORDS = {"by", "at", "the", "of", "in", "and", "a"}
 MAX_PROFILE_NOTE = 200
@@ -432,7 +532,7 @@ def _project_filters(a: dict) -> dict:
         "name": (str(a.get("name") or "").strip()[:80] or None),
         "min_price": _num(a, "min_price_aed", 0, 10_000_000_000),
         "max_price": _num(a, "max_price_aed", 0, 10_000_000_000),
-        "bedrooms": _num(a, "bedrooms", 0, 12),
+        "bedrooms": _beds(a, "bedrooms", 0, 12),
         "handover_year": _num(a, "handover_year", 2000, 2100),
         "property_types": _strings(a, "property_types"),
         "min_size": _num(a, "min_size_sqft", 0, 1_000_000),
@@ -506,7 +606,13 @@ def _project_for_model(row: dict) -> dict:
         "size_sqft_min": size(row.get("size_min")),
         "size_sqft_max": size(row.get("size_max")),
         "handover": _format_handover_month(row.get("handover_time")),
+        # Prop-AI rows often omit property_types; null must not be read as "not an apartment".
         "property_types": row.get("property_types") or None,
+        "property_types_note": (
+            None
+            if row.get("property_types")
+            else "Type not recorded; treat as a residential project match for apartment browses."
+        ),
         "status": row.get("project_status") or row.get("status"),
         "has_brochure": bool(row.get("brochure_url")),
         "price_kind": row.get("price_kind") or "starting",
@@ -522,10 +628,18 @@ def _project_card(row: dict) -> dict:
 def _available_places() -> dict:
     """Shown when a search finds nothing, so the model can offer real alternatives instead of a dead end."""
     return {
-        "communities_with_projects": fetch("select community, count(*)::int as projects from projects "
-                                            "where community is not null group by community order by projects desc"),
-        "developers": fetch("select btrim(developer_name) as developer, count(*)::int as projects from projects "
-                            "where developer_name is not null group by 1 order by projects desc"),
+        "communities_with_projects": fetch(
+            "select coalesce(nullif(btrim(master_project), ''), area) as community, "
+            "count(*)::int as projects from propai_projects "
+            "where coalesce(name, '') <> '' "
+            "and coalesce(nullif(btrim(master_project), ''), area) is not null "
+            "group by 1 order by projects desc"
+        ),
+        "developers": fetch(
+            "select btrim(developer) as developer, count(*)::int as projects "
+            "from propai_projects where coalesce(developer, '') <> '' "
+            "group by 1 order by projects desc"
+        ),
     }
 
 
@@ -537,10 +651,11 @@ def mentions_known_name(text: str) -> bool:
     global _known_names
     if _known_names is None:
         try:
-            rows = fetch("select lower(btrim(community)) as n from projects union "
+            rows = fetch("select lower(btrim(coalesce(nullif(btrim(master_project), ''), area))) as n "
+                         "from propai_projects union "
                          "select lower(btrim(community)) from listings union "
-                         "select lower(btrim(developer_name)) from projects union "
-                         "select lower(btrim(name)) from projects")
+                         "select lower(btrim(developer)) from propai_projects union "
+                         "select lower(btrim(name)) from propai_projects")
             extra = fetch("select lower(btrim(label)) as n from propai_places "
                           "where level in ('area', 'master')")
             rows = list(rows) + list(extra)
@@ -561,8 +676,7 @@ def _closest_place(text: str) -> str | None:
     global _place_names
     if _place_names is None:
         try:
-            rows = list(fetch("select distinct btrim(community) as n from projects where community is not null"))
-            rows += list(fetch("select distinct btrim(label) as n from propai_places where level in ('area', 'master')"))
+            rows = list(fetch("select distinct btrim(label) as n from propai_places where level in ('area', 'master')"))
         except Exception:
             return None  # no database: leave the name as typed
         _place_names = sorted({r["n"] for r in rows if r.get("n")})
@@ -573,7 +687,7 @@ def _closest_place(text: str) -> str | None:
 
 def search_projects(raw) -> ToolResult:
     """Project search that also reads a misspelt place the way the user meant it."""
-    a = _obj(raw)
+    a = _normalize_project_search(_obj(raw))
     result = _search_projects(a)
     if result.output.get("matching_projects"):
         return result
@@ -598,23 +712,37 @@ def search_projects(raw) -> ToolResult:
     return retry
 
 
+def _project_sort(raw) -> str:
+    sort = str(raw or DEFAULT_PROJECT_SORT).strip().lower()
+    if sort in PROJECT_SORTS:
+        return sort
+    if sort in {"newest", "new", "recent", "relevance", "best", "recommended"}:
+        return DEFAULT_PROJECT_SORT
+    if not re.fullmatch(r"[a-z_]+", sort or ""):
+        raise ToolInputError(f"sort must be one of: {', '.join(PROJECT_SORTS)}.")
+    return DEFAULT_PROJECT_SORT
+
+
+def _project_limit(raw) -> int:
+    if raw is None or raw == "":
+        return 8
+    try:
+        return max(1, min(int(round(float(raw))), 10))
+    except (TypeError, ValueError):
+        return 8
+
+
 def _search_projects(a: dict) -> ToolResult:
     f = _project_filters(a)
-    sort = str(a.get("sort") or "cheapest")
-    if sort not in PROJECT_SORTS:
-        raise ToolInputError(f"sort must be one of: {', '.join(PROJECT_SORTS)}.")
-    limit = int(round(_num(a, "limit", 1, 10) or 8))
-    where, params = _project_where(f)
-    new_rows, new_total = _new_projects(f, limit, sort)
-    old_rows, old_total = [], 0
-    if len(new_rows) < limit:
-        old_rows = fetch(f"select {PROJECT_COLUMNS} from projects where {where} order by {PROJECT_SORTS[sort]} limit %s",
-                         (*params, limit))
-        old_total = fetch(f"select count(*)::int as total from projects where {where}", tuple(params))[0]["total"]
-    taken = {str(row.get("name") or "").lower() for row in new_rows}
-    extra = [row for row in old_rows if str(row.get("name") or "").lower() not in taken]
-    rows = (new_rows + extra)[:limit]
-    total = new_total + old_total
+    sort = _project_sort(a.get("sort"))
+    limit = _project_limit(a.get("limit"))
+    raw_skip = a.get("exclude_names")
+    if raw_skip is None:
+        skip_names = []
+    else:
+        items = raw_skip if isinstance(raw_skip, list) else [raw_skip]
+        skip_names = [str(name).strip() for name in items if str(name).strip()][:20]
+    rows, total = _new_projects(f, limit, sort, skip_names=skip_names)
     projects_out = []
     for row in rows:
         shown = _project_for_model(row)
@@ -623,31 +751,41 @@ def _search_projects(a: dict) -> ToolResult:
         projects_out.append(shown)
     out = {
         "matching_projects": total, "showing": len(rows), "sorted_by": sort,
-        "price_note": "price_kind recent_sale is the median sale price from the last 24 months in the new data. "
-                      "price_kind starting is a starting price from the older project table, not a unit price.",
+        "source": "propai",
+        "price_note": "price_kind recent_sale is the median sale price from the last 24 months in recorded sales data.",
         "projects": projects_out,
         "browse_note": (
-            "For plain show/list/find project browse questions, list the projects only. "
-            "Do NOT add Acot Recommend unless the user asked which is best, invest, buy, or recommend."
+            "These are recorded projects. List them now. Do not call search_projects again, "
+            "and do not call search_listings unless the user asked for listings. "
+            "Do NOT add Acot Recommend unless the user asked which is best, invest, buy, or recommend. "
+            "Never say Prop-AI in the user-facing answer."
         ),
     }
+    if total > 0 and f.get("bedrooms") is not None:
+        out["bedroom_match_note"] = (
+            f"matching_projects={total} means these projects include {int(f['bedrooms'])}-bedroom units "
+            "(bedroom ranges like 1 to 4 or studios to 2 count as matches). "
+            "Present them as normal results. Do not say there was no exact match."
+        )
     cards = [_project_card(r) for r in rows]
     if total == 0:
-        out["note"] = ("No project matches these filters. Tell the user, and offer to loosen a filter or pick "
-                       "from what exists. Unless the user asked to buy, or for sale or off-plan, ALSO call "
-                       "search_listings for the same place, bedrooms and size before you answer, and show the "
-                       "rentals too. Only call a result 'over budget' if the user actually gave a budget.")
+        out["note"] = (
+            "No project matches these filters. Say so. Offer to loosen a filter. "
+            "Do not call search_listings and do not use the older project table. "
+            "Only call a result 'over budget' if the user actually gave a budget. "
+            "Never say Prop-AI in the user-facing answer."
+        )
         closest = _closest_projects(f)
         if closest:
             out["closest_matches"] = [_project_for_model(r) | _gap(r, f) for r in closest]
-            out["closest_matches_note"] = ("These are the nearest real projects after relaxing: "
+            out["closest_matches_note"] = ("These are the nearest projects after relaxing: "
                                            f"{closest[0]['_relaxed']}. Present them as the closest options, "
-                                           "say plainly that they do not fully match, and quote the gap given."
+                                           "say plainly that they do not fully match, and quote the gap given. "
+                                           "Never say Prop-AI in the user-facing answer."
                                            + ("" if f.get("max_price") else
                                               " The user gave no budget, so do not say anything is over budget "
                                               "or compute a gap."))
             cards += [_project_card({k: v for k, v in r.items() if k != "_relaxed"}) for r in closest]
-        out.update(_available_places())
     return ToolResult(out, cards)
 
 
@@ -668,14 +806,9 @@ def _closest_projects(f: dict, limit: int = 3) -> list[dict]:
         loosened.update(drop)  # each step keeps the earlier relaxations, so the match gets looser and looser
         dropped.append(label)
         label = " and ".join(dropped)
-        where, params = _project_where(loosened)
-        # with a budget cap, the nearest projects are the cheapest ones; with a floor, the cheapest above it
-        order = "NULLIF(price, 0) ASC NULLS LAST, id" if f.get("max_price") or f.get("min_price") else \
-            PROJECT_SORTS["cheapest"]
-        rows = fetch(f"select {PROJECT_COLUMNS} from projects where {where} and price > 0 "
-                     f"order by {order} limit %s", (*params, limit))
-        if rows:
-            return [{**r, "_relaxed": label} for r in rows]
+        new_rows, _ = _new_projects(loosened, limit, "latest_handover")
+        if new_rows:
+            return [{**r, "_relaxed": label} for r in new_rows]
     return []
 
 
@@ -706,24 +839,7 @@ def _find_projects(ref: str, limit: int = 6) -> list[dict]:
         propai = _propai_matches(ref, limit)
     except Exception as exc:
         print(f"Prop-AI project lookup unavailable: {exc}")
-    if re.fullmatch(r"P\d{12}", ref):
-        return propai
-    if len(propai) == 1 and str(propai[0].get("name") or "").lower() == ref.lower():
-        return propai
-    if re.fullmatch(r"\d{1,12}", ref):
-        return fetch(f"select {PROJECT_COLUMNS} from projects where id = %s", (int(ref),))
-    exact = fetch(f"select {PROJECT_COLUMNS} from projects where lower(btrim(name)) = lower(%s) limit 2", (ref,))
-    if len(exact) == 1 and not propai:
-        return exact
-    where, params = _project_where({"name": ref})
-    old = fetch(f"select {PROJECT_COLUMNS} from projects where {where} order by length(name), id limit %s",
-                (*params, limit))
-    if len(old) == 1 and str(old[0].get("name") or "").lower() == ref.lower():
-        return old
-    if not propai:
-        return old
-    taken = {str(row.get("name") or "").lower() for row in propai}
-    return (propai + [row for row in old if str(row.get("name") or "").lower() not in taken])[:limit]
+    return propai[:limit]
 
 
 def get_project(raw) -> ToolResult:
@@ -733,19 +849,13 @@ def get_project(raw) -> ToolResult:
         raise ToolInputError("Give project_id (numeric id) or name.")
     rows = _find_projects(ref)
     if not rows:
-        return ToolResult({"found": False, "note": f'No project matching "{ref[:80]}" in the data.',
-                           **_available_places()})
+        return ToolResult({"found": False, "note": f'No project matching "{ref[:80]}" in our data.'})
     if len(rows) > 1:
         return ToolResult({"found": False, "ambiguous": True,
                            "note": "Several projects match. Ask the user which one, or pick by exact name.",
                            "candidates": [_project_for_model(r) for r in rows]},
                           [_project_card(r) for r in rows])
     row = rows[0]
-    has_price = bool(row.get("price") and row["price"] > 0)
-    peers = fetch(
-        "select count(*)::int as n, round(percentile_cont(0.5) within group (order by price))::bigint as median, "
-        "round(100.0 * count(*) filter (where price < %s) / nullif(count(*), 0))::int as pct_cheaper "
-        "from projects where community = %s and price > 0", (row["price"] if has_price else 0, row.get("community")))[0]
     description = re.sub(r"\s+", " ", str(row.get("description") or "")).strip()[:1200] or None
     shown = _project_for_model(row)
     return ToolResult({
@@ -754,11 +864,6 @@ def get_project(raw) -> ToolResult:
         "developer_marketing_description": description,
         "marketing_note": "The description is developer marketing text: say 'the developer describes it as', "
                           "never state its claims as verified fact.",
-        "compared_with_other_projects_in_same_community": {
-            "projects": peers["n"], "reliability": _reliability(peers["n"]),
-            "median_starting_price_aed": None if peers["median"] is None else int(peers["median"]),
-            "percent_of_them_cheaper_than_this_one": peers["pct_cheaper"] if has_price else None,
-        },
     }, [_project_card(row)])
 
 
@@ -812,7 +917,7 @@ def compare_projects(raw) -> ToolResult:
         out["price_difference"] = {
             "lowest_starting_price": low["name"], "highest_starting_price": high["name"],
             "gap_aed": int(gap), "highest_is_percent_more": round(100 * gap / float(low["price"]), 1),
-            "note": "price_kind recent_sale is a median sale; starting is from the older table.",
+            "note": "price_kind recent_sale is a median from recorded sales. Never say Prop-AI to the user.",
         }
     dated = [r for r in found if r.get("handover_time") is not None]
     if len(dated) >= 2:
@@ -835,33 +940,51 @@ def market_stats(raw) -> ToolResult:
     group_key = str(a.get("group_by") or "none")
     if group_key != "none" and group_key not in PROJECT_GROUPS:
         raise ToolInputError(f"group_by must be one of: none, {', '.join(PROJECT_GROUPS)}.")
-    group = None if group_key == "none" else PROJECT_GROUPS[group_key]
-    where, params = _project_where(f)
+    parts, params = ["coalesce(name, '') <> ''"], []
+    if f.get("communities"):
+        names = [n for c in f["communities"] for n in (c, ALIASES.get(c.lower())) if n]
+        clause, extra = contains_place_sql(["master_project", "area", "name"], names)
+        parts.append(clause)
+        params.extend(extra)
+    if f.get("developers"):
+        parts.append("developer ilike any(%s::text[])")
+        params.append(_like(f["developers"]))
+    for token in _name_tokens(f.get("name") or ""):
+        parts.append("name ilike %s")
+        params.append(_like([token])[0])
+    if f.get("handover_year") is not None:
+        parts.append("extract(year from end_date) = %s")
+        params.append(f["handover_year"])
+    where = " and ".join(parts)
+    group_sql = None
+    if group_key == "community":
+        group_sql = "coalesce(nullif(btrim(master_project), ''), area)"
+    elif group_key == "developer":
+        group_sql = "btrim(developer)"
     sql = (
-        f"select {group + ' as grp,' if group else ''} count(*)::int as projects, "
-        "(min(price) filter (where price > 0))::bigint as min_price, "
-        "round(percentile_cont(0.5) within group (order by price) filter (where price > 0))::bigint as median_price, "
-        "(max(price) filter (where price > 0))::bigint as max_price, "
-        "min(bedroom_min) as bed_min, max(bedroom_max) as bed_max, "
-        "count(*) filter (where handover_time is not null)::int as with_handover "
-        f"from projects where {where}"
-        + (f" group by {group} order by count(*) desc limit 15" if group else "")
+        f"select {group_sql + ' as grp,' if group_sql else ''} count(*)::int as projects, "
+        "count(*) filter (where end_date is not null)::int as with_handover "
+        f"from propai_projects where {where}"
+        + (f" group by {group_sql} order by count(*) desc limit 15" if group_sql else "")
     )
     rows = fetch(sql, tuple(params))
-    years = fetch("select extract(year from handover_time at time zone 'UTC')::int as year, count(*)::int as projects "
-                  f"from projects where {where} and handover_time is not null group by 1 order by 1", tuple(params))
+    years = fetch(
+        "select extract(year from end_date)::int as year, count(*)::int as projects "
+        f"from propai_projects where {where} and end_date is not null group by 1 order by 1",
+        tuple(params),
+    )
     out = []
     for r in rows:
-        row = {group_key: r["grp"]} if group else {}
+        row = {group_key: r["grp"]} if group_sql else {}
         row.update({"projects": r["projects"], "reliability": _reliability(r["projects"]),
-                    "min_starting_price_aed": r["min_price"], "median_starting_price_aed": r["median_price"],
-                    "max_starting_price_aed": r["max_price"],
-                    "bedrooms_offered": [r["bed_min"], r["bed_max"]], "projects_with_handover_date": r["with_handover"]})
+                    "min_starting_price_aed": None, "median_starting_price_aed": None,
+                    "max_starting_price_aed": None,
+                    "bedrooms_offered": None, "projects_with_handover_date": r["with_handover"]})
         out.append(row)
     result = {
         "grouped_by": group_key, "rows": out, "handover_years": years,
-        "note": "rows are starting prices from the older project table. new_data, when present, is recorded "
-                "sales from the last 24 months and is the price to quote. There is no yield, ROI or price growth.",
+        "note": "Project counts are from recorded project data. new_data, when present, is recorded sales "
+                "from the last 24 months and is the price to quote. There is no yield, ROI or price growth.",
     }
     if f.get("communities"):
         try:
@@ -940,6 +1063,32 @@ def top_areas_by_sales(limit: int = 8) -> list[dict]:
     return [_area_stat_row(r, names) for r in rows]
 
 
+def top_areas_by_cheapest(limit: int = 8) -> list[dict]:
+    """Communities with the lowest typical sale price and enough recent sales."""
+    rows = fetch(
+        "select area, sales_12m, median_price, median_ppsf, median_rent, rent_contracts "
+        "from public.propai_area_stats "
+        "where sales_12m >= 80 and median_price >= 200000 "
+        "order by median_price asc limit %s",
+        (max(int(limit) * 4, 20),),
+    )
+    names = _popular([r["area"] for r in rows])
+    items = []
+    seen: set[str] = set()
+    for row in rows:
+        item = _area_stat_row(row, names)
+        label = str(item.get("area") or "").lower()
+        if "industrial" in label or "labour" in label:
+            continue
+        if label in seen:
+            continue
+        seen.add(label)
+        items.append(item)
+        if len(items) >= limit:
+            break
+    return items
+
+
 def top_areas_by_rent(limit: int = 8) -> list[dict]:
     """Areas with the most recorded rental contracts, plus typical sale and rent."""
     rows = fetch(
@@ -978,10 +1127,12 @@ def clean_profile(raw: Any) -> dict:
             out[key] = int(v)
     if {"budget_min_aed", "budget_max_aed"} <= out.keys() and out["budget_min_aed"] > out["budget_max_aed"]:
         raise ToolInputError("budget_min_aed cannot exceed budget_max_aed.")
-    for key, lo, hi in (("bedrooms", 0, 12), ("family_size", 1, 30)):
-        v = _num(a, key, lo, hi)
-        if v is not None:
-            out[key] = int(v)
+    beds = _beds(a, "bedrooms", 0, 12)
+    if beds is not None:
+        out["bedrooms"] = int(beds)
+    family = _num(a, "family_size", 1, 30)
+    if family is not None:
+        out["family_size"] = int(family)
     goal = a.get("goal")
     if goal not in (None, ""):
         if goal not in PROFILE_GOALS:

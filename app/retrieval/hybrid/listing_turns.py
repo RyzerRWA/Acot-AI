@@ -6,6 +6,8 @@ from typing import Any, Dict, Optional
 from app.retrieval.hybrid.question_text import comparison_pair
 from app.retrieval.postgres.listing_retriever import ListingRetriever
 
+BROWSE_LISTING_LIMIT = 10
+
 
 def is_shown_listing(item: dict) -> bool:
     """True for on-screen rental cards, including property-typed listing rows."""
@@ -17,20 +19,146 @@ def is_shown_listing(item: dict) -> bool:
     return bool(item.get("listing_id") or item.get("rent_frequency") or item.get("title"))
 
 
+_TYPE_MAP = {
+    "apartment": "Apartments",
+    "apartments": "Apartments",
+    "villa": "Villas",
+    "villas": "Villas",
+    "townhouse": "Townhouses",
+    "townhouses": "Townhouses",
+    "penthouse": "Penthouses",
+    "penthouses": "Penthouses",
+}
+
+
+def listing_search_args(question: str, filters: Optional[Dict[str, Any]] = None) -> dict:
+    """Tool arguments for a rent browse. No database call."""
+    filters = filters or {}
+    args: dict = {"limit": BROWSE_LISTING_LIMIT, "sort": "cheapest"}
+    from app.answers.intent_route import extract_place, parse_bedrooms
+
+    place = extract_place(question) or filters.get("community") or filters.get("place")
+    if place:
+        args["areas"] = [place]
+    beds = filters.get("bedrooms")
+    if beds is None:
+        parsed = parse_bedrooms(question)
+        if parsed:
+            beds = parsed[0]
+    if re.search(r"\bstudios?\b", question or "", re.I) and beds is None:
+        beds = 0
+    if beds is not None:
+        args["beds_min"] = int(beds)
+        args["beds_max"] = int(beds)
+    mapped = []
+    for item in filters.get("property_types") or []:
+        key = str(item).strip().lower()
+        mapped.append(_TYPE_MAP.get(key) or _TYPE_MAP.get(key.rstrip("s")) or str(item).strip())
+    if not mapped and re.search(r"\bapartments?\b", question or "", re.I):
+        mapped.append("Apartments")
+    if mapped:
+        args["property_types"] = mapped
+    return args
+
+
+def _int_sqft(value):
+    if value is None or value == "":
+        return None
+    try:
+        return int(round(float(value)))
+    except (OverflowError, TypeError, ValueError):
+        return None
+
+
+def _listing_price(row: dict):
+    value = row.get("price_aed")
+    if value is None:
+        value = row.get("annual_rent_aed")
+    if value is None:
+        return None
+    try:
+        return int(round(float(value)))
+    except (OverflowError, TypeError, ValueError):
+        return None
+
+
+def _listing_dedupe_key(row: dict) -> tuple:
+    title = _normalize_listing_title(row.get("title") or row.get("name") or "")
+    return (title, _listing_price(row))
+
+
+def _prepare_listing_rows(rows: list, limit: int = BROWSE_LISTING_LIMIT) -> list[dict]:
+    """One card per advert (title + rent), integer sqft, browse cap."""
+    seen: set[tuple] = set()
+    prepared: list[dict] = []
+    cap = max(1, int(limit or BROWSE_LISTING_LIMIT))
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        item = dict(row)
+        size = _int_sqft(item.get("size_sqft"))
+        if size is not None:
+            item["size_sqft"] = size
+        key = _listing_dedupe_key(item)
+        if key[0] and key in seen:
+            continue
+        if key[0]:
+            seen.add(key)
+        prepared.append(item)
+        if len(prepared) >= cap:
+            break
+    return prepared
+
+
+def _row_from_rental_card(card: dict) -> dict:
+    return {
+        "listing_id": card.get("listing_id"),
+        "title": card.get("title"),
+        "property_type": card.get("property_type"),
+        "beds": card.get("beds"),
+        "baths": card.get("baths"),
+        "size_sqft": _int_sqft(card.get("size_sqft")),
+        "furnishing": card.get("furnishing"),
+        "community": card.get("community"),
+        "sub_community": card.get("sub_community"),
+        "price_aed": card.get("annual_rent_aed") or card.get("price_aed"),
+        "rent_frequency": "yearly",
+        "cover_photo": card.get("cover_photo"),
+        "url": card.get("path") or card.get("url"),
+        "agency_name": card.get("agency_name"),
+        "entity_type": "listing",
+    }
+
+
 def retrieve_listings(db, question: str, filters: Dict[str, Any]) -> Dict[str, Any]:
     """Search rental listings and keep project records out of the answer."""
 
+    args = listing_search_args(question, filters)
+    rows: list[dict] = []
+    total = 0
+    place = (args.get("areas") or [None])[0]
     try:
-        found = ListingRetriever(db).search(question, filters)
-    except Exception as exc:
-        print("Listing retrieval error:", exc)
-        found = {
-            "listings": [],
-            "listing_total": 0,
-            "subject": "that request",
-        }
+        from app.listings.tools import search_listings
 
-    rows = found.get("listings") or []
+        found = search_listings(args)
+        out = found.output or {}
+        total = int(out.get("matching_listings") or 0)
+        rows = [_row_from_rental_card(card) for card in (found.cards or []) if isinstance(card, dict)]
+        place = place or out.get("catalog_place")
+    except Exception as exc:
+        print("Listing search error:", exc)
+        rows, total = [], 0
+
+    if not rows:
+        try:
+            found = ListingRetriever(db).search(question, filters, limit=BROWSE_LISTING_LIMIT)
+            rows = found.get("listings") or []
+            total = found.get("listing_total") or len(rows)
+            place = place or found.get("subject")
+        except Exception as exc:
+            print("Listing retrieval error:", exc)
+
+    rows = _prepare_listing_rows(rows, BROWSE_LISTING_LIMIT)
     print(f"Listings retrieved: {len(rows)}")
 
     result = {
@@ -39,10 +167,11 @@ def retrieve_listings(db, question: str, filters: Dict[str, Any]) -> Dict[str, A
         "sub_communities": [],
         "listings": rows,
         "listing_query": True,
-        "listing_total": found.get("listing_total"),
+        "listing_total": total or len(rows),
+        "catalog_place": place,
     }
     if not rows:
-        result["understood_subject"] = found.get("subject") or "that request"
+        result["understood_subject"] = place or "that request"
         result["understood_kind"] = "listing"
     return result
 

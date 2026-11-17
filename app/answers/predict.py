@@ -1,6 +1,7 @@
 """Step 2–3 for prediction: recorded last-12-month sales, never a future AED figure."""
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any
 
@@ -15,6 +16,10 @@ def _change_pct(now, before) -> float | None:
 
 def _place_keys(place: str) -> list[str]:
     keys = [place]
+    bare = re.sub(r"^the\s+", "", place or "", flags=re.I).strip()
+    if bare and bare.lower() != (place or "").lower():
+        # Sales store "Springs", not "The Springs".
+        keys.append(bare)
     try:
         from app.listings.tools import ALIASES
 
@@ -74,7 +79,8 @@ def fetch_place_trend(place: str) -> dict[str, Any] | None:
                  from prev) as prev_sale,
               (select percentile_cont(0.5) within group (order by price_per_sqft)::float8
                  from prev where price_per_sqft > 0) as prev_psf,
-              (select max(instance_date) from cur) as as_of
+              (select max(instance_date) from cur) as as_of,
+              (select sale_price from cur order by instance_date desc limit 1) as latest_price
             """,
             tuple(lock_params),
         )
@@ -97,6 +103,7 @@ def fetch_place_trend(place: str) -> dict[str, Any] | None:
         "change_pct": change,
         "psf_change_pct": _change_pct(row.get("psf"), row.get("prev_psf")),
         "as_of": as_of.isoformat() if hasattr(as_of, "isoformat") else (str(as_of) if as_of else None),
+        "latest_price": int(round(row["latest_price"])) if row.get("latest_price") else None,
     }
 
 
@@ -179,6 +186,151 @@ def _bed_label(bedrooms: int) -> str:
     if bedrooms == 1:
         return "1-bedroom"
     return f"{int(bedrooms)}-bedroom"
+
+
+def attach_latest_project_sales(projects: list[dict] | None) -> list[dict]:
+    """Replace 24-month medians with the newest recorded sale for each project."""
+    rows = list(projects or [])
+    names = [str(row.get("name") or "").strip().upper() for row in rows if row.get("name")]
+    if not names:
+        return rows
+    try:
+        stats = fetch(
+            """
+            select upper(project_name_prop_ai) as name,
+                   max(instance_date) as sold_on,
+                   (array_agg(sale_price order by instance_date desc))[1] as price,
+                   min(bedrooms) filter (
+                     where instance_date >= current_date - interval '12 months'
+                       and bedrooms between 0 and 10
+                   ) as bedroom_min,
+                   max(bedrooms) filter (
+                     where instance_date >= current_date - interval '12 months'
+                       and bedrooms between 0 and 10
+                   ) as bedroom_max
+            from public.propai_sales
+            where deleted_at is null
+              and sale_price > 0
+              and coalesce(outlier_flag, '') <> 'True'
+              and upper(project_name_prop_ai) = any(%s)
+            group by 1
+            """,
+            (names,),
+        )
+    except Exception:
+        return rows
+    by_name = {str(row["name"]): row for row in stats if row.get("name")}
+    for project in rows:
+        stat = by_name.get(str(project.get("name") or "").strip().upper())
+        if not stat:
+            continue
+        if stat.get("price"):
+            project["price"] = int(round(float(stat["price"])))
+            project["price_kind"] = "latest_sale"
+        if stat.get("sold_on"):
+            project["last_sold_on"] = stat["sold_on"]
+        if stat.get("bedroom_min") is not None:
+            project["bedroom_min"] = stat["bedroom_min"]
+        if stat.get("bedroom_max") is not None:
+            project["bedroom_max"] = stat["bedroom_max"]
+    rows.sort(
+        key=lambda row: str(row.get("last_sold_on") or "0000-00-00")[:10],
+        reverse=True,
+    )
+    return rows
+
+
+def projects_for_place(place: str, projects: list[dict] | None) -> list[dict]:
+    """Keep rows whose community is this place. A name like Silver Springs is a different community."""
+    wanted = {key.upper() for key in _place_keys(place)}
+    return [
+        row for row in (projects or [])
+        if str(row.get("community") or "").strip().upper() in wanted
+    ]
+
+
+def _project_detail_line(row: dict) -> str:
+    name = str(row.get("name") or "This project").strip()
+    bits = []
+    developer = str(row.get("developer_name") or row.get("developer") or "").strip()
+    if developer:
+        bits.append(f"by {developer}")
+    price = row.get("price")
+    try:
+        price = int(round(float(price))) if price else None
+    except (TypeError, ValueError):
+        price = None
+    if price and price > 0:
+        pretty = _pretty_date(row.get("last_sold_on"))
+        kind = str(row.get("price_kind") or "")
+        if kind == "latest_sale" or pretty:
+            bits.append(f"latest sale AED {price:,}" + (f" on {pretty}" if pretty else ""))
+        else:
+            label = "recent sale" if kind == "recent_sale" else "from"
+            bits.append(f"{label} AED {price:,}")
+    lo, hi = row.get("bedroom_min"), row.get("bedroom_max")
+    if lo is not None or hi is not None:
+        lo = lo if lo is not None else hi
+        hi = hi if hi is not None else lo
+        if lo == hi:
+            count = int(lo)
+            bits.append("studio" if count == 0 else ("1 bedroom" if count == 1 else f"{count} bedrooms"))
+        else:
+            bits.append(f"{int(lo)} to {int(hi)} bedrooms")
+    extra = (", " + ", ".join(bits)) if bits else ""
+    return f"- **{name}**{extra}"
+
+
+def format_place_details(
+    place: str,
+    trend: dict | None,
+    projects: list[dict] | None = None,
+    total: int | None = None,
+) -> str:
+    """Full community details from recorded sales and project rows. No model call."""
+    shown = [row for row in (projects or []) if row.get("name")]
+    count = int(total) if total is not None else len(shown)
+    lines = [f"**{place}**"]
+    if count:
+        lines.append("")
+        noun = "project" if count == 1 else "projects"
+        if shown and count > len(shown):
+            lines.append(f"I found {count} {noun} in {place}. Here are {len(shown)} of them.")
+        else:
+            lines.append(f"I found {count} {noun} in {place}.")
+    if trend and (trend.get("median_sale") or trend.get("psf") or trend.get("sales_12m")):
+        pretty = _pretty_date(trend.get("as_of"))
+        lines.append("")
+        lines.append(
+            "Last 12 months of recorded sales"
+            + (f" (data through {pretty})" if pretty else "")
+            + ":"
+        )
+        lines.append("")
+        if trend.get("median_sale"):
+            lines.append(f"- Median sale price: {_aed(trend['median_sale'])}")
+        if trend.get("psf"):
+            lines.append(f"- Median price per sq ft: AED {int(trend['psf']):,}")
+        if trend.get("sales_12m"):
+            lines.append(f"- Recorded sales: {int(trend['sales_12m']):,}")
+        if trend.get("change_pct") is not None:
+            pct = trend["change_pct"]
+            direction = "higher" if pct >= 0 else "lower"
+            lines.append(f"- About {abs(pct):g}% {direction} than the previous 12 months")
+        if trend.get("latest_price"):
+            extra = f" on {pretty}" if pretty else ""
+            lines.append(f"- Latest recorded sale: {_aed(trend['latest_price'])}{extra}")
+        elif pretty:
+            lines.append(f"- Latest sale date in this set: {pretty}")
+    if shown:
+        lines.append("")
+        lines.append("Projects on record:")
+        lines.append("")
+        lines.extend(_project_detail_line(row) for row in shown)
+    if len(lines) == 1:
+        lines.append("")
+        lines.append(f"I don't have recorded sales for {place} in the last 12 months.")
+    return "\n".join(lines)
 
 
 def format_snapshot_answer(

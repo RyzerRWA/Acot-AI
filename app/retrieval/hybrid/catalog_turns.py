@@ -75,31 +75,16 @@ def retrieve_catalog(client, request: dict) -> dict:
         result["community_total"] = int(total[0]["total"]) if total else 0
 
     if request.get("projects"):
-        where, params = _place_clause("city, community", place)
-        bed_sql = ""
+        from app.retrieval.propai_catalog import agent_projects
+
+        payload = {}
+        if place:
+            payload["communities"] = [place]
         if bedrooms is not None:
-            bed_sql = " and bedroom_min <= %s and bedroom_max >= %s"
-            params = [*params, int(bedrooms), int(bedrooms)]
-        total = _query(
-            client,
-            f"select count(*) as total from public.projects where {where}{bed_sql}",
-            params,
-        )
-        rows = _query(
-            client,
-            f"""
-            select {_PROJECT_COLUMNS}
-            from public.projects
-            where {where}{bed_sql}
-            order by case when price is null or price <= 0 then 1 else 0 end,
-                     price asc,
-                     name
-            limit {_LIMIT}
-            """,
-            params,
-        )
+            payload["bedrooms"] = int(bedrooms)
+        rows, total = agent_projects(payload, limit=_LIMIT, sort="latest_handover")
         result["projects"] = rows
-        result["project_total"] = int(total[0]["total"]) if total else 0
+        result["project_total"] = int(total or len(rows))
 
     if request.get("listings"):
         where, params = _place_clause("community, location", place)

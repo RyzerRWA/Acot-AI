@@ -1,4 +1,13 @@
-from app.answers.intent_route import classify_intent, is_show_more, parse_bedrooms, parse_budget_aed
+from app.answers.intent_route import (
+    classify_intent,
+    is_incomplete_home_browse,
+    is_no_preference_reply,
+    is_show_more,
+    parse_bedrooms,
+    parse_budget_aed,
+    reuse_last_search,
+    wants_more_results,
+)
 from app.answers.predict import format_snapshot_answer, format_trend_answer
 from app.answers.recommend import (
     format_afford_answer,
@@ -141,6 +150,11 @@ def test_classify_family_areas():
     route = classify_intent("Which Dubai areas are best for families?")
     assert route["intent"] == "recommend"
     assert route["kind"] == "family_areas"
+    looking = classify_intent("I am looking for the best community for families")
+    assert looking["intent"] == "recommend"
+    assert looking["kind"] == "family_areas"
+    singular = classify_intent("best community for families")
+    assert singular["kind"] == "family_areas"
     assert route["focus"]["avoid_towers"] is False
 
 
@@ -152,6 +166,17 @@ def test_classify_communities_suit_families():
 def test_classify_family_of_four_in_jvc_is_not_city_family_areas():
     route = classify_intent("I want a 3-bedroom in JVC for a family of 4 to buy.")
     assert route["kind"] != "family_areas"
+
+
+def test_filtered_buy_keeps_household_and_bedrooms():
+    route = classify_intent(
+        "I want a 3-bedroom in JVC for a family of 4 to buy around AED 1.8M."
+    )
+    assert route["kind"] == "filtered"
+    assert route["bedrooms"] == 3
+    assert route["household"] == 4
+    assert route["budget_aed"] == 1_800_000
+    assert "Jumeirah Village Circle" in (route["subject"] or "")
 
 
 def test_family_questions_read_different_intents():
@@ -305,6 +330,18 @@ def test_classify_open_buy_styles_stay_on_sql_recommend():
         assert route["kind"] == "open_best", question
 
 
+def test_classify_which_project_is_best_to_buy_uses_on_screen_shortlist():
+    class _Memory:
+        active_candidates = [
+            {"name": "Sky Line By Peace Homes", "entity_type": "project"},
+            {"name": "Treppan Vision", "entity_type": "project"},
+        ]
+
+    route = classify_intent("Tell me which project is best to buy", _Memory())
+    assert route["intent"] == "recommend"
+    assert route["kind"] == "shortlist"
+
+
 def test_classify_best_properties_in_a_place_stays_filtered():
     route = classify_intent("show me the best properties in Jumeirah Village Circle?")
     assert route["intent"] == "recommend"
@@ -327,11 +364,122 @@ def test_classify_where_should_i_buy_stays_open_best_with_cards_on_screen():
     assert route["kind"] == "open_best"
 
 
+def test_classify_cheapest_community_projects_to_live():
+    route = classify_intent("which community projects having a cheapest to live")
+    assert route["intent"] == "recommend"
+    assert route["kind"] == "cheapest"
+    assert route["subject"] in {None, "Dubai"}
+
+
+def test_cheapest_follow_up_on_screen_stays_shortlist():
+    class _Memory:
+        active_candidates = [
+            {"name": "A", "entity_type": "project"},
+            {"name": "B", "entity_type": "project"},
+        ]
+
+    route = classify_intent("which is cheapest", _Memory())
+    assert route["kind"] == "shortlist"
+
+
+def test_cheapest_format_explains_recorded_sales():
+    from app.answers.recommend import format_cheapest
+
+    text = format_cheapest(
+        [
+            {
+                "area": "Jumeirah Village Circle",
+                "sales_12m": 11000,
+                "median_sale_price_aed": 1_000_000,
+                "median_price_per_sqft_aed": 1491,
+            }
+        ],
+        [{"name": "Helvetia Residences", "community": "Jumeirah Village Circle", "price": 900_000}],
+    )
+    _no_ids(text)
+    assert "recorded sale" in text.lower()
+    assert "Jumeirah Village Circle" in text
+    assert "Helvetia Residences" in text
+    assert "cannot be determined" not in text.lower()
+    assert "no relevant project" not in text.lower()
+
+
 def test_classify_ready_or_offplan_is_not_open_best():
     route = classify_intent("Should I buy ready or off-plan in Dubai?")
     assert route["intent"] == "recommend"
     assert route["kind"] == "ready_offplan"
     assert route["subject"] is None
+
+
+def test_full_details_of_a_community_is_not_an_agent_question():
+    from app.answers.intent_route import place_detail_subject, project_detail_subject
+
+    assert place_detail_subject("Give full details The Springs") == "The Springs"
+    assert place_detail_subject("Tell me about Dubai Marina") == "Dubai Marina"
+    assert place_detail_subject("Tell me about Binghatti Amber") is None
+    assert place_detail_subject("Show me properties in Dubai Marina") is None
+    assert project_detail_subject("Tell me about Binghatti Amber") == "Binghatti Amber"
+    assert project_detail_subject("Tell me about Dubai Marina") is None
+
+
+def test_full_detail_of_an_on_screen_project_is_not_a_place():
+    from app.answers.intent_route import place_detail_subject, project_detail_subject
+
+    class _Memory:
+        active_candidates = [
+            {"name": "Empire Gardens", "entity_type": "project", "community": "Dubai Land Residence Complex"},
+            {"name": "Floarea Oasis", "entity_type": "project"},
+        ]
+
+    question = "i want full detail Empire Gardens"
+    assert project_detail_subject(question, _Memory()) == "Empire Gardens"
+    assert place_detail_subject(question, _Memory()) is None
+
+
+def test_springs_details_quote_sales_and_skip_other_communities():
+    from app.answers.predict import format_place_details, projects_for_place
+
+    rows = [
+        {
+            "name": "Emirates Living - Springs 2",
+            "community": "Springs",
+            "developer_name": "EMAAR PROPERTIES (P.J.S.C)",
+            "price": 3650000,
+            "price_kind": "latest_sale",
+            "last_sold_on": "2026-10-05",
+            "bedroom_min": 2,
+            "bedroom_max": 3,
+        },
+        {
+            "name": "Damac Hills - Silver Springs 3",
+            "community": "Damac Hills",
+            "price": 3750000,
+            "price_kind": "recent_sale",
+        },
+    ]
+    kept = projects_for_place("The Springs", rows)
+    assert [row["name"] for row in kept] == ["Emirates Living - Springs 2"]
+    text = format_place_details(
+        "The Springs",
+        {
+            "median_sale": 4250000,
+            "psf": 1667,
+            "sales_12m": 340,
+            "change_pct": 1.2,
+            "as_of": "2026-11-03",
+            "latest_price": 2800000,
+        },
+        kept,
+        total=1,
+    )
+    assert "Share another Dubai area" not in text
+    assert "Silver Springs" not in text
+    assert "I found 1 project in The Springs." in text
+    assert "AED 4,250,000" in text
+    assert "Latest recorded sale: AED 2,800,000 on 3 Nov 2026" in text
+    assert "latest sale AED 3,650,000 on 5 Oct 2026" in text
+    assert "340" in text
+    assert "Emirates Living - Springs 2" in text
 
 
 def test_apartment_for_two_members_is_a_one_bedroom_recommend():
@@ -392,6 +540,9 @@ def test_classify_shortlist_on_screen():
 def test_parse_budget():
     assert parse_budget_aed("AED 1.5M") == 1_500_000
     assert parse_budget_aed("AED 900,000") == 900_000
+    assert parse_budget_aed("my budget is 50,000") == 50_000
+    assert parse_budget_aed("my budget is 50k") == 50_000
+    assert parse_budget_aed("Only villas under AED 4M") == 4_000_000
 
 
 def test_trend_answer_leads_with_history_not_a_future_price():
@@ -465,18 +616,43 @@ def test_open_areas_format():
     assert "no area or budget" in text.lower()
 
 
-def test_afford_below_median_offers_nearby_from_data():
+def test_afford_below_median_with_under_budget_sales_keeps_place():
+    text = format_afford_answer(
+        "Business Bay",
+        1_500_000,
+        {"median": 3_093_457},
+        [
+            {"name": "Aykon City Tower C", "price": 1_480_000, "sales_count": 42},
+            {"name": "Merano Tower", "price": 1_390_000, "sales_count": 12},
+        ],
+        [{"area": "AL SATWA"}, {"area": "NAD AL HAMAR"}],
+        bedrooms=2,
+    )
+    _no_ids(text)
+    assert "3,093,457" in text
+    assert "still exist there" in text.lower()
+    assert "nearby areas can be a better fit" not in text.lower()
+    assert "closest options we have" not in text.lower()
+    assert "recent 2-bedroom sales" in text.lower()
+    assert "prop-ai" not in text.lower()
+    assert "at or under" in text.lower()
+    assert "Business Bay" in text
+    assert "Al Satwa" in text or "Nad Al Hamar" in text
+    assert "not enough" not in text.lower()
+
+
+def test_afford_below_median_without_matches_offers_nearby():
     text = format_afford_answer(
         "Dubai Marina",
         900_000,
         {"median": 1_400_000},
-        [{"id": "P1", "name": "Close"}],
+        [],
         [{"area": "JUMEIRAH VILLAGE CIRCLE"}, {"area": "ARJAN"}],
         bedrooms=1,
     )
     _no_ids(text)
     assert "1,400,000" in text
-    assert "cards below" in text.lower()
+    assert "couldn’t find recorded" in text.lower() or "couldn't find recorded" in text.lower()
     assert "Jumeirah Village Circle" in text or "Arjan" in text
     assert "not enough" not in text.lower()
 
@@ -582,27 +758,231 @@ def test_recommend_open_best_turn(monkeypatch):
 
 
 class _Memory:
-    def __init__(self, question, names=None):
+    def __init__(self, question, names=None, areas=None):
         self.last_user_question = question
         self.last_standalone_question = question
+        names = names or []
+        areas = areas or []
         self.turns = [{
             "user_question": question,
             "standalone_question": question,
-            "candidate_names": names or [],
+            "candidate_names": names + areas,
         }]
         self.active_candidates = [
             {"name": name, "entity_type": "project"}
-            for name in (names or [])
+            for name in names
+        ] + [
+            {"name": area, "entity_type": "community"}
+            for area in areas
         ]
 
 
 def test_show_more_is_detected():
     assert is_show_more("show me more")
     assert is_show_more("Show more")
+    assert is_show_more("show mw more")
+    assert is_show_more("show mee more")
     assert is_show_more("more options")
     assert is_show_more("more please")
+    assert is_show_more("show me more and chep")
+    assert is_show_more("show me more and cheap")
+    assert is_show_more("show me more and best and high")
+    assert is_show_more("show me more and best")
     assert not is_show_more("show me more in Dubai Marina")
     assert not is_show_more("I want a 3-bedroom in JVC")
+    assert wants_more_results("show me more")
+    assert wants_more_results("show mw more")
+    assert wants_more_results(
+        "Show me properties in Dubai Marina. "
+        "Show additional options for the same request, not the same list again."
+    )
+    assert not wants_more_results("Show me properties in Dubai Marina")
+
+
+def test_family_areas_more_and_cheap_follow_up_stays_on_thread():
+    prior = "Best communities for a family with kids, not just the busiest towers."
+    memory = _Memory(
+        prior,
+        names=["Aseel", "The Valley - Virella"],
+        areas=["The Springs", "Arabian Ranches", "The Valley", "Villanova", "Tilal Al Ghaf"],
+    )
+    for question in (
+        "show me more and chep",
+        "show me more and cheap",
+        "cheaper ones",
+    ):
+        route = classify_intent(question, memory)
+        assert route["intent"] == "recommend", question
+        assert route["kind"] == "family_areas", question
+        assert route.get("more") is True, question
+        assert route.get("prefer_cheaper") is True, question
+        assert route.get("source_question") == prior, question
+
+
+def test_casual_followups_stay_on_last_search_thread():
+    prior = "My budget is 1.5 m show me the best Apartments for the family."
+    memory = _Memory(
+        prior,
+        names=["Adeba Azizi", "Adhara Star", "48 Parkside"],
+        areas=["Business Bay"],
+    )
+    more = classify_intent("any other options", memory)
+    assert more["intent"] == "recommend"
+    assert more["kind"] == "filtered"
+    assert more.get("more") is True
+    assert more["budget_aed"] == 1_500_000
+
+    cheap = classify_intent("too expensive", memory)
+    assert cheap["intent"] == "recommend"
+    assert cheap.get("prefer_cheaper") is True
+    assert not cheap.get("prefer_premium")
+
+    marina = classify_intent("and in marina?", memory)
+    assert marina["intent"] == "recommend"
+    assert marina["kind"] == "filtered"
+    assert marina["subject"] == "Dubai Marina"
+    assert marina["budget_aed"] == 1_500_000
+
+    better = classify_intent("which one is better", memory)
+    assert better["intent"] == "recommend"
+    assert better["kind"] == "shortlist"
+
+
+def test_budget_family_apartments_is_fresh_filtered_not_old_candidates():
+    prior = "Best communities for a family with kids, not just the busiest towers."
+    memory = _Memory(
+        prior,
+        names=["Forest City Tower 3", "Trump Tower", "Sobha Central"],
+        areas=["Business Bay"],
+    )
+    question = "My budget is 1.5 m show me the best Apartments for the family."
+    route = classify_intent(question, memory)
+    assert route["intent"] == "recommend"
+    assert route["kind"] == "filtered"
+    assert route["budget_aed"] == 1_500_000
+    assert route["property_type"] == "apartment"
+    assert route["bedrooms"] == 3
+    assert route.get("more") is not True
+    assert route.get("source_question") in {None, question}
+
+
+def test_casual_business_bay_budget_challenge_reuses_budget():
+    prior = "My budget is 1.5 m show me the best Apartments for the family."
+    memory = _Memory(prior, names=["Aykon City Tower C"], areas=["Business Bay"])
+    route = classify_intent(
+        "so you are telling there is a no budget in business Bay",
+        memory,
+    )
+    assert route["intent"] == "recommend"
+    assert route["kind"] == "afford"
+    assert route["subject"] == "Business Bay"
+    assert route["budget_aed"] == 1_500_000
+    assert route.get("property_type") == "apartment"
+
+
+def test_family_areas_more_and_best_high_follow_up_stays_on_thread():
+    prior = "Best communities for a family with kids, not just the busiest towers."
+    memory = _Memory(
+        prior,
+        names=["Aseel"],
+        areas=["The Springs", "Arabian Ranches", "The Valley"],
+    )
+    for question in (
+        "show me more and best and high",
+        "show me more and best",
+        "higher ones",
+    ):
+        route = classify_intent(question, memory)
+        assert route["intent"] == "recommend", question
+        assert route["kind"] == "family_areas", question
+        assert route.get("more") is True, question
+        assert route.get("prefer_premium") is True, question
+        assert not route.get("prefer_cheaper"), question
+        assert route.get("source_question") == prior, question
+
+
+def test_family_areas_more_and_cheap_turn_does_not_dead_end(monkeypatch):
+    prior = "Best communities for a family with kids, not just the busiest towers."
+    memory = _Memory(
+        prior,
+        names=["Aseel"],
+        areas=["The Springs", "Arabian Ranches", "The Valley", "Villanova", "Tilal Al Ghaf"],
+    )
+    shown = {
+        "The Springs",
+        "Arabian Ranches",
+        "The Valley",
+        "Villanova",
+        "Tilal Al Ghaf",
+    }
+    pool = [
+        {"area": name, "existing_villas": 80, "existing_family_sales": 40, "median_family_sale": price}
+        for name, price in [
+            ("The Springs", 5_780_000),
+            ("Arabian Ranches", 5_725_000),
+            ("The Valley", 2_855_000),
+            ("Villanova", 3_150_000),
+            ("Tilal Al Ghaf", 4_550_000),
+            ("Dubai Hills Estate", 4_200_000),
+            ("Mudon", 2_400_000),
+            ("Town Square", 1_900_000),
+        ]
+    ]
+
+    monkeypatch.setattr(intent_turns, "fetch_family_areas", lambda *a, **k: pool)
+    monkeypatch.setattr(
+        intent_turns,
+        "_search",
+        lambda filters, limit=3, skip_names=None: (
+            [{"name": f"{(filters.get('communities') or ['X'])[0]} Home", "price": 2_000_000}],
+            [],
+        ),
+    )
+    turn = intent_turns.recommend_data_turn("show me more and chep", memory)
+    assert turn is not None
+    answer = turn["fast_answer"].lower()
+    assert "couldn't retrieve" not in answer
+    assert "cheaper" in answer or "more family" in answer
+    names = [
+        row["name"]
+        for row in turn["structured_summary"].get("community") or []
+    ]
+    assert names
+    assert not shown.issuperset(set(names)) or any(name not in shown for name in names)
+    assert names[0] in {"Town Square", "Mudon", "Dubai Hills Estate", "The Valley", "Villanova"}
+
+
+def test_typo_show_more_reuses_the_last_two_bed_list():
+    prior = "Show me 2 bedroom apartments"
+    memory = _Memory(prior, ["Creek Palace", "Marina Gate"])
+    assert is_show_more("show mw more")
+    route = classify_intent("show mw more", memory)
+    assert route["kind"] == "show_more"
+    assert reuse_last_search("show mw more", memory)
+    assert reuse_last_search("show me more", memory)
+    assert not reuse_last_search("show mw more")
+    blank = _Memory("", [])
+    blank.last_user_question = None
+    blank.last_standalone_question = None
+    blank.turns = []
+    assert not reuse_last_search("show mw more", blank)
+
+
+def test_family_project_follow_up_stays_on_jvc_three_bed():
+    prior = "Show me projects in Jumeirah Village Circle."
+    route = classify_intent("Which project is suitable for a family", _Memory(prior))
+    assert route["intent"] == "recommend"
+    assert route["kind"] == "filtered"
+    assert "Jumeirah Village Circle" in (route["subject"] or "")
+    assert route["bedrooms"] == 3
+    assert route.get("household") == 4
+
+
+def test_cheapest_follow_up_after_jvc_browse_keeps_jvc():
+    prior = "Show me projects in Jumeirah Village Circle."
+    route = classify_intent("which project is cheapest", _Memory(prior))
+    assert "Jumeirah Village Circle" in (route.get("subject") or "")
+    assert route["kind"] in {"cheapest", "filtered", "shortlist"}
 
 
 def test_show_more_keeps_jvc_filters():
@@ -612,6 +992,7 @@ def test_show_more_keeps_jvc_filters():
     assert route["kind"] == "filtered"
     assert route["more"] is True
     assert route["bedrooms"] == 3
+    assert route.get("household") == 4
     assert route["budget_aed"] == 1_800_000
     assert "Jumeirah Village Circle" in (route["subject"] or "")
     assert route["source_question"] == prior
@@ -642,6 +1023,49 @@ def test_show_more_after_family_areas_stays_family_areas():
     route = classify_intent("show me more", _Memory(prior))
     assert route["kind"] == "family_areas"
     assert route["more"] is True
+
+
+def test_budget_follow_up_after_family_areas_stays_family_areas():
+    prior = "Which Dubai areas are best for families?"
+    route = classify_intent("my budget is 50,000", _Memory(prior))
+    assert route["intent"] == "recommend"
+    assert route["kind"] == "family_areas"
+    assert route["budget_aed"] == 50_000
+    assert route["source_question"] == prior
+
+
+def test_villas_under_budget_follow_up_after_family_areas():
+    prior = "Which Dubai areas are best for families?"
+    route = classify_intent("Only villas under AED 4M", _Memory(prior))
+    assert route["kind"] == "family_areas"
+    assert route["budget_aed"] == 4_000_000
+    assert route.get("focus", {}).get("want_villas") is True
+
+
+def test_family_budget_too_low_explains_typical_prices():
+    text = format_family_areas(
+        [
+            {
+                "area": "Mudon",
+                "existing_villas": 129,
+                "existing_family_sales": 122,
+                "median_family_sale": 3_737_500,
+            },
+            {
+                "area": "The Springs",
+                "existing_villas": 112,
+                "existing_family_sales": 50,
+                "median_family_sale": 5_780_000,
+            },
+        ],
+        budget_aed=50_000,
+    )
+    _no_ids(text)
+    assert "50,000" in text
+    assert "3,737,500" in text
+    assert "below recorded" in text.lower()
+    assert "pin that down" not in text.lower()
+    assert "cards below" not in text.lower()
 
 
 def test_show_more_skips_projects_already_on_screen(monkeypatch):
@@ -822,3 +1246,146 @@ def test_ready_offplan_turn(monkeypatch):
     names = [row["name"] for row in turn["structured_summary"]["projects"]]
     assert "Desert Sun Tower" in names
     assert "Waada - Altura 1" in names
+
+
+def test_show_me_villas_properties_is_propai_filtered():
+    route = classify_intent("show me villas properties")
+    assert route["intent"] == "recommend"
+    assert route["kind"] == "filtered"
+    assert route["property_type"] == "villa"
+    assert route.get("subject") in {None, "Dubai"}
+
+
+def test_show_me_villas_turn_uses_propai_sales(monkeypatch):
+    rows = [
+        {
+            "name": "DAMAC Islands 2 - Bahamas 1",
+            "community": "DAMAC Islands",
+            "price": 2_903_000,
+            "price_kind": "recent_sale",
+            "sales_count": 300,
+        }
+    ]
+
+    def fake_pool(filters, skip_names=None, pool_size=None):
+        assert filters.get("property_type") == "villa"
+        assert not filters.get("communities")
+        return rows, []
+
+    monkeypatch.setattr(intent_turns, "_recommend_pool", fake_pool)
+    turn = intent_turns.recommend_data_turn("show me villas properties")
+    assert turn is not None
+    text = turn["fast_answer"].lower()
+    assert "starting price" not in text
+    assert "damac islands" in text
+    assert turn["structured_summary"]["projects"][0]["name"] == "DAMAC Islands 2 - Bahamas 1"
+
+
+def test_villas_under_budget_in_business_bay_is_filtered():
+    route = classify_intent("Only villas under AED 4M. in business bay")
+    assert route["intent"] == "recommend"
+    assert route["kind"] == "filtered"
+    assert route["property_type"] == "villa"
+    assert route["budget_aed"] == 4_000_000
+    assert "Business Bay" in (route["subject"] or "")
+    assert route.get("focus", {}).get("want_villas") is True
+
+
+def test_show_me_in_urban_life_keeps_villa_budget():
+    prior = "Only villas under AED 4M. in business bay"
+    memory = _Memory(prior, ["Urban Life", "The Crestmark"])
+    route = classify_intent("show me in Urban Life", memory)
+    assert route["intent"] == "recommend"
+    assert route["kind"] == "filtered"
+    assert route["property_type"] == "villa"
+    assert route["budget_aed"] == 4_000_000
+    assert route["subject"] == "Urban Life"
+
+
+def test_villa_filter_does_not_fill_with_apartments(monkeypatch):
+    def fake_pool(filters, skip_names=None, pool_size=None):
+        assert filters.get("property_type") == "villa"
+        assert filters.get("communities") == ["Urban Life"]
+        assert filters.get("max_price") == 4_000_000
+        return [], []
+
+    monkeypatch.setattr(intent_turns, "_recommend_pool", fake_pool)
+    monkeypatch.setattr(intent_turns, "fetch_villa_projects_under_budget", lambda *a, **k: [])
+    turn = intent_turns.recommend_data_turn(
+        "show me in Urban Life",
+        _Memory("Only villas under AED 4M. in business bay", ["Urban Life"]),
+        {
+            "intent": "recommend",
+            "kind": "filtered",
+            "subject": "Urban Life",
+            "budget_aed": 4_000_000,
+            "property_type": "villa",
+        },
+    )
+    assert turn is not None
+    assert turn["structured_summary"]["projects"] == []
+    text = turn["fast_answer"].lower()
+    assert "villa" in text
+    assert "urban life" in text
+    assert "1,799,825" not in text
+
+
+def test_villa_miss_in_business_bay_lists_villas_elsewhere(monkeypatch):
+    def fake_pool(filters, skip_names=None, pool_size=None):
+        return [], []
+
+    alts = [
+        {
+            "name": "DAMAC Islands 2 - Bahamas 1",
+            "community": "DAMAC Islands",
+            "price": 2_903_000,
+            "sales_count": 300,
+        }
+    ]
+    monkeypatch.setattr(intent_turns, "_recommend_pool", fake_pool)
+    monkeypatch.setattr(
+        intent_turns, "fetch_villa_projects_under_budget", lambda *a, **k: alts
+    )
+    turn = intent_turns.recommend_data_turn(
+        "Only villas under AED 4M. in business bay",
+        None,
+        {
+            "intent": "recommend",
+            "kind": "filtered",
+            "subject": "Business Bay",
+            "budget_aed": 4_000_000,
+            "property_type": "villa",
+        },
+    )
+    assert turn is not None
+    text = turn["fast_answer"].lower()
+    assert "business bay" in text
+    assert "apartments" in text
+    assert "damac islands" in text
+    assert turn["structured_summary"]["projects"][0]["name"] == "DAMAC Islands 2 - Bahamas 1"
+    assert "1,799,825" not in text
+
+
+def test_incomplete_home_browse_vs_complete_first_message():
+    assert is_incomplete_home_browse(
+        "Hi, I am looking for the two bedroom apartments."
+    )
+    assert is_incomplete_home_browse("looking for 2 bedroom apartments")
+    assert is_incomplete_home_browse("I want 1 bedroom apartments")
+    assert not is_incomplete_home_browse(
+        "Show me 2 bedroom apartments in Dubai Marina"
+    )
+    assert not is_incomplete_home_browse("2 bed in JVC under 1.5M")
+    assert not is_incomplete_home_browse("1.5M budget family apartments")
+    assert not is_incomplete_home_browse("What is rera?")
+
+
+def test_no_preference_reply_after_clarify():
+    assert is_no_preference_reply("don't know")
+    assert is_no_preference_reply("dont know")
+    assert is_no_preference_reply("no idea")
+    assert is_no_preference_reply("I don't have any idea")
+    assert is_no_preference_reply("anything")
+    assert is_no_preference_reply("wherever")
+    assert not is_no_preference_reply("Dubai Marina")
+    assert not is_no_preference_reply("show me 2 bedroom apartments")

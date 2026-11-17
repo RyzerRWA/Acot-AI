@@ -18,6 +18,7 @@ from run import (
     _classify_small_talk,
     _detect_response_type,
     _followup_questions,
+    _is_broker_question,
     _is_fast_structured_question,
     _format_brokers,
     _format_transactions,
@@ -97,6 +98,24 @@ def _planner():
     return QueryPlanner(use_llm=False)
 
 
+def test_apartment_filter_does_not_drop_propai_projects_without_types():
+    from app.retrieval.hybrid.hybrid_retriever import HybridRetriever
+
+    projects = [
+        {"name": "Marina Cove", "bedroom_min": 1, "bedroom_max": 4, "property_types": None},
+        {"name": "Rove Home Dubai Marina", "bedroom_min": 0, "bedroom_max": 2, "property_types": []},
+        {"name": "A Villa Only", "bedroom_min": 1, "bedroom_max": 3, "property_types": ["Villa"]},
+    ]
+    kept = HybridRetriever._apply_project_filters(
+        projects,
+        {"bedrooms": 1, "property_types": ["apartment"], "transaction_type": "rent"},
+    )
+    names = {row["name"] for row in kept}
+    assert "Marina Cove" in names
+    assert "Rove Home Dubai Marina" in names
+    assert "A Villa Only" not in names
+
+
 def test_browse_uses_fast_project_list():
     question = "Show me the projects in Jumeirah Village Circle"
     summary = _summary()
@@ -129,6 +148,42 @@ def test_browse_uses_fast_project_list():
         documents=[],
     )
     assert response["response_type"] == "project_list"
+
+
+def test_propai_browse_says_recent_sale_not_starting_price():
+    question = "Show me projects in Dubai Land Residence Complex"
+    summary = _summary([
+        {
+            "name": "Sky Line By Peace Homes",
+            "developer_name": "PEACE HOMES REAL ESTATE L.L.C.",
+            "price": 750146,
+            "price_kind": "recent_sale",
+            "source": "propai",
+            "community": "Dubai Land Residence Complex",
+            "bedroom_min": 0,
+            "bedroom_max": 2,
+            "handover_time": "2030-05-01",
+        }
+    ])
+    summary["project_total"] = 128
+    summary["catalog_place"] = "Dubai Land Residence Complex"
+    answer = _build_fast_structured_answer(question, summary)
+    assert "I found 128 projects in Dubai Land Residence Complex" in answer
+    assert "Recent sale AED 750,146" in answer
+    assert "Starting price" not in answer
+
+
+def test_browse_more_says_here_are_more():
+    question = (
+        "Show me properties in Dubai Marina. "
+        "Show additional options for the same request, not the same list again."
+    )
+    summary = _summary()
+    summary["project_total"] = 133
+    summary["catalog_place"] = "Dubai Marina"
+    answer = _build_fast_structured_answer(question, summary)
+    assert "I found 133 projects in Dubai Marina." in answer
+    assert "Here are 5 more of them:" in answer
 
 
 def test_investment_answer_with_projects_shows_cards():
@@ -496,6 +551,65 @@ def test_close_community_spelling_scores_as_a_match():
     assert weak < 0.70
 
 
+def test_community_suffix_does_not_steal_a_longer_project_name():
+    assert EntityResolver._community_is_suffix_of_longer_name(
+        "i want full detail empire gardens",
+        "THE GARDENS",
+    )
+    assert not EntityResolver._community_is_suffix_of_longer_name(
+        "Tell me about Dubai Marina",
+        "Dubai Marina",
+    )
+
+
+def test_project_detail_turn_uses_the_on_screen_project(monkeypatch):
+    from run import _project_detail_turn
+
+    class _Memory:
+        active_candidates = [
+            {
+                "name": "Empire Gardens",
+                "entity_type": "project",
+                "price": 939777,
+                "price_kind": "recent_sale",
+                "source": "propai",
+                "community": "Dubai Land Residence Complex",
+                "developer_name": "EMPIRE GARDENS REAL ESTATE DEVELOPMENT L.L.C.",
+                "sales_count": 131,
+                "size_sqft": 558,
+            }
+        ]
+
+    monkeypatch.setattr(
+        "app.retrieval.propai_catalog.agent_projects",
+        lambda *args, **kwargs: ([], 0),
+    )
+    turn = _project_detail_turn("i want full detail Empire Gardens", _Memory())
+    assert turn is not None
+    assert "Empire Gardens" in turn["fast_answer"]
+    assert "couldn't retrieve" not in turn["fast_answer"].lower()
+    assert "THE GARDENS" not in turn["fast_answer"]
+    assert turn["structured_summary"]["projects"][0]["name"] == "Empire Gardens"
+
+
+def test_short_project_name_does_not_beat_the_place_it_sits_inside():
+    prefix = EntityResolver._score(
+        "Show me projects in Dubai Land Residence Complex",
+        "Dubai Land",
+    )
+    place = EntityResolver._score(
+        "Dubai Land Residence Complex",
+        "Dubai Land Residence Complex",
+    )
+    assert prefix < 0.90
+    assert place == 1.0
+    assert EntityResolver._prefer_community(
+        "Show me projects in Dubai Land Residence Complex",
+        {"name": "Dubai Land", "score": prefix},
+        {"name": "Dubai Land Residence Complex", "score": place},
+    )
+
+
 def test_developer_question_resolves_to_the_developer():
     projects = [
         {"name": "Dawn by Binghatti", "developer_name": " Binghatti"},
@@ -572,6 +686,90 @@ def test_latest_transactions_work_without_projects_on_screen(monkeypatch):
     assert captured.get("place") == "Business Bay"
 
     assert _transaction_turn("Show me projects in Business Bay", None) is None
+
+
+def test_rental_browse_drops_duplicates_and_formats_size():
+    listings = [
+        {
+            "title": "Spacious | Prime Location | Marina View",
+            "sub_community": "Marina Diamonds",
+            "community": "Dubai Marina",
+            "agency_name": "AEON & Trisl Real Estate",
+            "price_aed": 65000,
+            "rent_frequency": "yearly",
+            "beds": 1,
+            "size_sqft": 714.0,
+        },
+        {
+            "title": "BIG LAYOUT I GOOD BUILDING I NEAR TO TRAM",
+            "sub_community": "Elite Residence",
+            "community": "Dubai Marina",
+            "agency_name": "Banke International Properties - Commercial",
+            "price_aed": 74999,
+            "rent_frequency": "yearly",
+            "beds": 1,
+            "size_sqft": 1160.0,
+        },
+        {
+            "title": "BIG LAYOUT I GOOD BUILDING I NEAR TO TRAM",
+            "sub_community": "Elite Residence",
+            "community": "Dubai Marina",
+            "agency_name": "Banke International Properties",
+            "price_aed": 74999,
+            "rent_frequency": "yearly",
+            "beds": 1,
+            "size_sqft": 1160.0,
+        },
+    ]
+    summary = {
+        "listings": listings,
+        "listing_total": 69,
+        "catalog_place": "Dubai Marina",
+        "projects": [],
+        "community": [],
+        "sub_communities": [],
+    }
+    answer = _build_fast_structured_answer(
+        "Show me 1 bedroom apartments for rent in Dubai Marina.",
+        summary,
+    )
+    assert "I found 69 rental listings in Dubai Marina." in answer
+    assert "Here are 2 of them" in answer
+    assert "714.0" not in answer
+    assert "714 sqft" in answer
+    assert "Marina Diamonds" in answer
+    assert "AEON" not in answer
+    assert answer.count("BIG LAYOUT") == 1
+    assert len(summary["listings"]) == 2
+
+
+def test_transaction_followup_on_listings_says_there_are_none(monkeypatch):
+    class _Memory:
+        active_candidates = [{
+            "title": "Spacious | Prime Location | Marina View",
+            "name": "Spacious | Prime Location | Marina View",
+            "entity_type": "listing",
+            "community": "Dubai Marina",
+            "beds": 1,
+        }]
+        last_standalone_question = "Show me 1 bedroom apartments for rent in Dubai Marina."
+        last_user_question = "Show me 1 bedroom apartments for rent in Dubai Marina."
+        transaction_names = None
+        transaction_offset = 0
+
+    def boom(**kwargs):
+        raise AssertionError("listing ads have no transaction data")
+
+    monkeypatch.setattr("app.retrieval.propai_catalog.latest_sales", boom)
+    monkeypatch.setattr("app.retrieval.propai_catalog.recent_sales", boom)
+
+    turn = _transaction_turn("Show me the recent transaction details", _Memory())
+    assert turn is not None
+    answer = turn["fast_answer"].lower()
+    assert "no recorded transactions" in answer
+    assert "listings" in answer
+    assert (turn["structured_summary"].get("transactions") or []) == []
+    assert not turn["structured_summary"].get("transaction_followup")
     text = _format_transactions(
         ["Mayfair Tower", "Mayfair Residency"],
         {
@@ -620,6 +818,13 @@ def test_shortlist_recommend_uses_projects_on_screen():
     assert turn["use_fast"] is True
     assert "**Acot Recommend:** Cheaper Ready" in turn["fast_answer"]
     assert "Why this is the strongest match" in turn["fast_answer"]
+    best_to_buy = _shortlist_recommend_turn(
+        "Tell me which project is best to buy",
+        _Memory(),
+    )
+    assert best_to_buy is not None
+    assert "**Acot Recommend:**" in best_to_buy["fast_answer"]
+    assert "Starting price" not in best_to_buy["fast_answer"]
     assert _shortlist_recommend_turn(
         "Which of these have 2 bedroom options?",
         _Memory(),
@@ -903,9 +1108,58 @@ def test_price_followup_uses_the_projects_already_shown():
         "What are their starting prices?",
         {"projects": projects},
     )
-    assert "AED 1395448" in answer
+    assert "AED 1,395,448" in answer
     assert "exact match" not in answer.lower()
     assert _shown_project_followup("Show me projects in Dubai Marina", _Memory()) is None
+
+
+def test_rera_guidance_uses_the_agent_not_hybrid_evidence_only():
+    from run import _is_dubai_guidance_question, _propai_sql_browse
+
+    assert _is_dubai_guidance_question("What is rera?")
+    assert _is_dubai_guidance_question("What is freehold?")
+    assert _is_dubai_guidance_question("How do I buy property in Dubai?")
+    assert not _is_dubai_guidance_question("Show me off-plan projects in Dubai Marina")
+    assert not _is_dubai_guidance_question("Show me projects in Dubai Marina")
+    assert _propai_sql_browse("What is rera?") is False
+    assert _propai_sql_browse("Show me projects in Dubai Marina") is True
+
+
+def test_budget_for_each_project_is_group_attribute_not_project_name():
+    from app.answers.intent_route import project_detail_subject
+    from run import _propai_sql_browse
+
+    question = "budget details about the budget for each project"
+
+    class _Memory:
+        active_candidates = [
+            {
+                "name": "Marina Cove",
+                "entity_type": "project",
+                "price": 3196888,
+            },
+            {
+                "name": "Rove Home Dubai Marina",
+                "entity_type": "project",
+                "price": 1576250,
+            },
+        ]
+
+    assert is_group_attribute_question(question)
+    assert project_detail_subject(question, _Memory()) is None
+    assert _propai_sql_browse(question, _Memory()) is False
+    assert _propai_sql_browse("Show me projects in Dubai Marina", _Memory()) is True
+
+    projects, no_match = _shown_project_followup(question, _Memory())
+    assert no_match is False
+    assert [item["name"] for item in projects] == [
+        "Marina Cove",
+        "Rove Home Dubai Marina",
+    ]
+    answer = _build_fast_structured_answer(question, {"projects": projects})
+    assert "AED 3,196,888" in answer
+    assert "AED 1,576,250" in answer
+    assert "do not have a project matching" not in answer.lower()
 
 
 def test_followups_skip_the_question_just_asked():
@@ -1188,6 +1442,39 @@ def test_broker_followup_keeps_agent_intent(monkeypatch):
     assert _broker_turn("show me projects in dubai marina", _Memory()) is None
 
 
+def test_top_agents_for_these_projects_uses_on_screen_community(monkeypatch):
+    captured = {}
+
+    def fake_list(**kwargs):
+        captured.update(kwargs)
+        return _broker_rows()[: kwargs.get("limit", 5)]
+
+    class _Memory:
+        last_user_question = "show me 2 bedrooms apartments in Dubai Marina"
+        last_standalone_question = "show me 2 bedrooms apartments in Dubai Marina"
+        turns = []
+        active_candidates = [
+            {
+                "name": "Pier 8",
+                "entity_type": "project",
+                "community": "Dubai Marina",
+            },
+            {
+                "name": "Marina Living",
+                "entity_type": "project",
+                "community": "Dubai Marina",
+            },
+        ]
+
+    monkeypatch.setattr("app.retrieval.propai_catalog.list_brokers", fake_list)
+    turn = _broker_turn("tell me the top agents for these projects", _Memory())
+    assert turn is not None
+    assert captured.get("place") == "Dubai Marina"
+    assert "dubai marina" in turn["fast_answer"].lower()
+    assert turn["structured_summary"]["brokers"]
+    assert "don't have any projects" not in turn["fast_answer"].lower()
+
+
 def test_broker_followup_accepts_businessbay_spelling(monkeypatch):
     captured = {}
 
@@ -1239,6 +1526,24 @@ def test_broker_turn_reads_mistyped_agent_sentence(monkeypatch):
     assert _ambiguous_place_question("show me in marinna", None) == "Dubai Marina"
     assert _ambiguous_place_question("show me in jumera", None) is None
     assert _broker_turn("show me agnets in chennai", None)["structured_summary"]["brokers"] == []
+
+
+def test_what_is_dubai_is_definitional_not_place_choice():
+    from run import _is_definitional_question, _propai_sql_browse
+
+    assert _is_definitional_question("what is dubai")
+    assert _is_definitional_question("What is Marina?")
+    assert _is_definitional_question("tell me about Dubai Marina")
+    assert not _is_definitional_question("What is the price of 23 Marina?")
+    assert not _is_definitional_question("show me in dubai marina")
+    assert _ambiguous_place_question("what is dubai", None) is None
+    assert _ambiguous_place_question("What is Marina?", None) is None
+    assert _propai_sql_browse("what is dubai") is False
+    assert _propai_sql_browse("What is the price of 23 Marina?") is True
+    assert _propai_sql_browse("show me 2 bedrooms apartments in Dubai Marina") is True
+    assert _propai_sql_browse("Hi, I am looking for the two bedroom apartments.") is False
+    assert _is_broker_question("jukam suggest plot in India", None) is False
+    assert _is_broker_question("show me indian agents", None) is True
 
 
 def test_first_place_only_question_asks_properties_or_agents():

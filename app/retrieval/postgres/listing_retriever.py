@@ -28,7 +28,7 @@ class ListingRetriever:
     def __init__(self, client: PostgresClient = None):
         self.client = client or PostgresClient()
 
-    def search(self, question: str, filters: dict = None, limit: int = 12) -> dict:
+    def search(self, question: str, filters: dict = None, limit: int = 10) -> dict:
         filters = filters or {}
         community = self._match_community(question)
         constraints = self._constraints(filters)

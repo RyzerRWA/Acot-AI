@@ -276,11 +276,81 @@ def test_afford_turn_caps_at_budget_and_lists_nearby(monkeypatch):
     names = [row["name"] for row in turn["structured_summary"]["projects"]]
     assert "Marina Over" not in names
     assert "Jumeirah Village Circle" in turn["fast_answer"] or "JUMEIRAH" in turn["fast_answer"]
+    assert "couldn’t find recorded" in turn["fast_answer"].lower() or "couldn't find recorded" in turn["fast_answer"].lower()
 
 
-def test_filtered_turn_ranks_a_wide_pool_then_shows_six(monkeypatch):
+def test_afford_turn_keeps_under_budget_sales_and_drops_weak_old_handover(monkeypatch):
     from app.answers import intent_turns
-    from app.answers.recommend import RECOMMEND_POOL, RECOMMEND_SHOW
+
+    matches = [
+        {
+            "name": "Damac Voleo",
+            "price": 1_400_000,
+            "sales_count": 1,
+            "price_kind": "recent_sale",
+            "handover_time": "2014-06-05",
+            "last_sold_on": "2026-10-08",
+        },
+        {
+            "name": "Aykon City Tower C",
+            "price": 1_480_000,
+            "sales_count": 42,
+            "price_kind": "recent_sale",
+            "handover_time": "2023-10-12",
+            "last_sold_on": "2026-11-03",
+        },
+        {
+            "name": "Merano Tower",
+            "price": 1_390_000,
+            "sales_count": 12,
+            "price_kind": "recent_sale",
+            "handover_time": "2020-02-27",
+            "last_sold_on": "2026-10-15",
+        },
+        {
+            "name": "Over Budget Bay",
+            "price": 2_200_000,
+            "sales_count": 20,
+            "price_kind": "recent_sale",
+        },
+    ]
+    monkeypatch.setattr(intent_turns, "fetch_recommend_projects", lambda *a, **k: (matches, []))
+    monkeypatch.setattr(intent_turns, "fetch_bedroom_median", lambda *a, **k: {"median": 3_093_457})
+    monkeypatch.setattr(
+        intent_turns,
+        "fetch_areas_near_budget",
+        lambda *a, **k: [{"area": "AL SATWA"}],
+    )
+    turn = intent_turns.recommend_data_turn(
+        "Is AED 1.5M enough for a 2-bedroom in Business Bay?"
+    )
+    names = [row["name"] for row in turn["structured_summary"]["projects"]]
+    answer = turn["fast_answer"].lower()
+    assert "Over Budget Bay" not in names
+    assert "Damac Voleo" not in names
+    assert "Aykon City Tower C" in names
+    assert "Merano Tower" in names
+    assert "still exist there" in answer
+    assert "nearby areas can be a better fit" not in answer
+    assert "closest options we have" not in answer
+    for row in turn["structured_summary"]["projects"]:
+        assert row.get("handover_time"), row.get("name")
+        assert float(row["price"]) <= 1_500_000
+    # Compare must still see completion dates (cards hide past handover in the UI).
+    from app.answers.recommend import format_compare_table, rank_projects
+
+    ranked = rank_projects(
+        turn["structured_summary"]["projects"],
+        attach_sales=False,
+    )
+    table = format_compare_table(turn["structured_summary"]["projects"], ranked)
+    assert "| Handover |" in table
+    assert table.count("| — |") == 0 or "Oct 2023" in table or "2023" in table or "2020" in table
+
+
+def test_filtered_turn_ranks_a_wide_pool_then_shows_three(monkeypatch):
+    from app.answers import intent_turns
+    from app.answers.recommend import RECOMMEND_POOL
 
     pool = []
     pool.append({"name": "Hanover Square", "price": 430_000, "bedroom_min": 3, "bedroom_max": 3, "sales_count": 80, "price_kind": "recent_sale"})
@@ -299,7 +369,217 @@ def test_filtered_turn_ranks_a_wide_pool_then_shows_six(monkeypatch):
         "I want a 3-bedroom in JVC for a family of 4 to buy around AED 1.8M."
     )
     names = [row["name"] for row in turn["structured_summary"]["projects"]]
-    assert len(names) == RECOMMEND_SHOW
+    assert len(names) == 3
     assert names[0] != "Hanover Square"
     assert "Hanover Square" not in names
     assert "430,000" not in turn["fast_answer"]
+    answer = turn["fast_answer"]
+    assert "family of 4" in answer.lower()
+    assert "3-bedroom" in answer
+    assert "1,800,000" in answer
+    assert "Jumeirah Village Circle" in answer
+    assert "not far cheaper" in answer.lower()
+    assert "parents" in answer.lower()
+    for name in names:
+        assert name in answer
+
+
+_FILTERED_ASKS = [
+    "I want a 3-bedroom in JVC for a family of 4 to buy around AED 1.8M.",
+    "I want a 2-bedroom in Business Bay for AED 1.5M to buy.",
+    "I want a 1-bedroom in Dubai Marina around AED 1.2M.",
+    "Looking for a 4-bedroom in Arabian Ranches around AED 4M.",
+    "I need a 3-bedroom in Dubai Hills Estate around AED 2.5M.",
+    "I want a studio in JLT under AED 800,000.",
+]
+
+
+def test_filtered_asks_keep_explanation_and_never_sell_over_budget_as_match(monkeypatch):
+    """Class rule for place + beds + budget: explain the ask; data must fit the ask."""
+    from app.answers import intent_turns
+    from app.answers.intent_route import classify_intent, parse_budget_aed
+
+    for question in _FILTERED_ASKS:
+        route = classify_intent(question)
+        assert route["kind"] == "filtered", question
+        budget = int(route["budget_aed"] or parse_budget_aed(question) or 0)
+        assert budget > 0, question
+        place = route["subject"]
+        assert place, question
+
+        over = [
+            {
+                "name": f"{place} Far One",
+                "price": int(budget * 1.5),
+                "bedroom_min": route.get("bedrooms") or 0,
+                "bedroom_max": route.get("bedrooms") or 0,
+                "sales_count": 12,
+                "community": place,
+                "price_kind": "recent_sale",
+            },
+            {
+                "name": f"{place} Far Two",
+                "price": int(budget * 1.8),
+                "bedroom_min": route.get("bedrooms") or 0,
+                "bedroom_max": route.get("bedrooms") or 0,
+                "sales_count": 9,
+                "community": place,
+                "price_kind": "recent_sale",
+            },
+            {
+                "name": f"{place} Far Three",
+                "price": int(budget * 2.2),
+                "bedroom_min": route.get("bedrooms") or 0,
+                "bedroom_max": route.get("bedrooms") or 0,
+                "sales_count": 4,
+                "community": place,
+                "price_kind": "recent_sale",
+            },
+            {
+                "name": f"{place} Far Dump",
+                "price": int(budget * 3.1),
+                "bedroom_min": route.get("bedrooms") or 0,
+                "bedroom_max": route.get("bedrooms") or 0,
+                "sales_count": 2,
+                "community": place,
+                "price_kind": "recent_sale",
+            },
+        ]
+        monkeypatch.setattr(
+            intent_turns, "fetch_recommend_projects", lambda *a, **k: ([], over)
+        )
+        turn = intent_turns.recommend_data_turn(question)
+        answer = turn["fast_answer"]
+        cards = turn["structured_summary"]["projects"]
+        assert place in answer, question
+        assert f"{budget:,}" in answer, question
+        assert "looked for recorded" in answer.lower() or "you asked" in answer.lower(), question
+        assert "the options below are recorded" not in answer.lower(), question
+        assert "above" in answer.lower(), question
+        assert len(cards) <= 3, question
+        assert f"{place} Far Dump" not in [row["name"] for row in cards], question
+        for row in cards:
+            assert float(row["price"]) > budget, question
+            assert row["name"] in answer, question
+
+        memory = type("M", (), {
+            "last_user_question": question,
+            "last_standalone_question": question,
+            "turns": [{
+                "user_question": question,
+                "standalone_question": question,
+                "candidate_names": [row["name"] for row in cards],
+            }],
+            "active_candidates": [
+                {"name": row["name"], "entity_type": "project"} for row in cards
+            ],
+        })()
+        more = intent_turns.recommend_data_turn("show me more", memory)
+        assert more["structured_summary"]["projects"] == [], question
+        assert "already showed" in more["fast_answer"].lower() or "requested budget" in more["fast_answer"].lower(), question
+
+
+def test_filtered_in_band_sales_keep_near_budget_explanation(monkeypatch):
+    from app.answers import intent_turns
+    from app.answers.intent_route import classify_intent
+
+    for question in _FILTERED_ASKS:
+        route = classify_intent(question)
+        budget = int(route["budget_aed"])
+        place = route["subject"]
+        beds = route.get("bedrooms")
+        matches = [
+            {
+                "name": f"{place} Fit {index}",
+                "price": int(budget * ratio),
+                "bedroom_min": beds or 0,
+                "bedroom_max": beds or 0,
+                "sales_count": 10 + index,
+                "community": place,
+                "price_kind": "recent_sale",
+            }
+            for index, ratio in enumerate((0.72, 0.85, 0.94, 0.98), start=1)
+        ]
+        monkeypatch.setattr(
+            intent_turns, "fetch_recommend_projects", lambda *a, **k: (matches, [])
+        )
+        turn = intent_turns.recommend_data_turn(question)
+        answer = turn["fast_answer"]
+        cards = turn["structured_summary"]["projects"]
+        assert "sit near" in answer.lower() and "not far cheaper" in answer.lower(), question
+        assert f"{budget:,}" in answer, question
+        assert place in answer, question
+        assert len(cards) == 3, question
+        for row in cards:
+            assert float(row["price"]) <= budget, question
+            assert row["name"] in answer, question
+
+
+def test_hyphen_bedroom_is_not_rewritten_to_bedroom_only():
+    from app.retrieval.hybrid.question_text import repair_typed_question
+    from app.answers.intent_route import classify_intent, parse_bedrooms
+    from app.answers.intent_turns import _explain_filtered_request
+
+    raw = "I want a 3-bedroom in JVC for a family of 4 to buy around AED 1.8M."
+    repaired = repair_typed_question(raw)
+    assert "3-bedroom" in repaired.lower()
+    assert parse_bedrooms(repaired) == [3]
+    route = classify_intent(repaired)
+    text = _explain_filtered_request(route, route.get("subject"), repaired)
+    assert "family of 4" in text.lower()
+    assert "3-bedroom" in text
+    assert "1,800,000" in text
+
+
+def test_filtered_explains_beds_place_and_budget_without_family():
+    from app.answers.intent_route import classify_intent
+    from app.answers.intent_turns import _explain_filtered_request
+
+    for question in _FILTERED_ASKS:
+        route = classify_intent(question)
+        text = _explain_filtered_request(route, route.get("subject"), question)
+        assert text, question
+        assert route["subject"] in text, question
+        assert f"{int(route['budget_aed']):,}" in text, question
+        assert "sit near" in text.lower(), question
+
+    route = classify_intent("I want a 2-bedroom in Business Bay for AED 1.5M to buy.")
+    text = _explain_filtered_request(route, route.get("subject"), "I want a 2-bedroom in Business Bay for AED 1.5M to buy.")
+    assert "2-bedroom" in text
+    assert "Business Bay" in text
+    assert "1,500,000" in text
+    assert "not far cheaper" in text.lower()
+
+    studio = classify_intent("I want a studio in JLT under AED 800,000.")
+    studio_text = _explain_filtered_request(
+        studio, studio.get("subject"), "I want a studio in JLT under AED 800,000."
+    )
+    assert "studio" in studio_text.lower()
+    assert "800,000" in studio_text
+
+
+def test_afford_and_split_open_with_the_ask():
+    from app.answers.recommend import format_afford_answer, format_split_answer
+
+    afford = format_afford_answer(
+        "Dubai Marina",
+        900_000,
+        {"median": 1_400_000},
+        [{"name": "Close", "price": 850_000, "sales_count": 8}],
+        [{"area": "JUMEIRAH VILLAGE CIRCLE"}],
+        bedrooms=1,
+    )
+    assert afford.lower().startswith("you're asking whether aed 900,000 is enough")
+    assert "1-bedroom" in afford
+    assert "Dubai Marina" in afford
+    assert "still exist there" in afford.lower()
+    assert "nearby areas can be a better fit" not in afford.lower()
+
+    split = format_split_answer(
+        [{"name": "Studio One"}],
+        [{"name": "Villa One"}],
+        900_000,
+    )
+    assert "two short lists" in split.lower()
+    assert "studio" in split.lower()
+    assert "villa" in split.lower()

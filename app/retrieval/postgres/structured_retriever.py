@@ -16,7 +16,7 @@ class StructuredRetriever:
 
     Tables used:
         - communities
-        - projects
+        - propai_projects
         - sub_communities
     """
 
@@ -65,6 +65,16 @@ class StructuredRetriever:
     # PROJECTS BY COMMUNITY
     # =========================================================
 
+    @staticmethod
+    def _propai_rows(filters: dict, limit: int = 20):
+        try:
+            from app.retrieval.propai_catalog import agent_projects
+
+            rows, _ = agent_projects(filters, limit=limit)
+            return rows
+        except Exception:
+            return []
+
     def search_projects_by_community(
         self,
         community_name: str,
@@ -77,11 +87,9 @@ class StructuredRetriever:
         if not community_name:
             return []
 
-        query = community_name.strip()
-
-        return fetch(
-            f"select {self.PROJECT_FIELDS} from projects where community ilike %s limit %s",
-            (query, limit),
+        return self._propai_rows(
+            {"communities": [community_name.strip()]},
+            limit,
         )
 
     # =========================================================
@@ -154,32 +162,11 @@ class StructuredRetriever:
         if not query:
             return []
 
-        rows = fetch(
-            f"select {self.PROJECT_FIELDS} from projects where name ilike %s limit %s",
-            (f"%{query}%", limit),
-        )
-        if rows:
-            return rows
-
-        tokens = self._project_name_tokens(query)
-        if not tokens:
+        rows = self._propai_rows({"name": query}, max(limit * 5, 40))
+        if not rows:
             return []
-
-        if len(tokens) == 1:
-            rows = fetch(
-                f"select {self.PROJECT_FIELDS} from projects "
-                f"where name ilike %s limit %s",
-                (f"%{tokens[0]}%", max(limit * 5, 40)),
-            )
-            return self._rank_project_name_matches(query, rows)[:limit]
-
-        where = " and ".join(["name ilike %s"] * len(tokens))
-        params = tuple(f"%{token}%" for token in tokens)
-        rows = fetch(
-            f"select {self.PROJECT_FIELDS} from projects where {where} limit %s",
-            (*params, max(limit * 5, 40)),
-        )
-        return self._rank_project_name_matches(query, rows)[:limit]
+        ranked = self._rank_project_name_matches(query, rows)
+        return (ranked or rows)[:limit]
 
     # =========================================================
     # PROJECTS BY NAME, DEVELOPER, AND COMMUNITY
@@ -207,27 +194,19 @@ class StructuredRetriever:
         if not name_pattern and not developer_name and not community_name:
             return []
 
-        where, params = [], []
-
+        payload = {}
         if name_pattern:
-            safe = name_pattern.replace("%", "").replace("_", " ").strip()
-            where.append("name ilike %s")
-            params.append(f"{safe}%" if starts_with else f"%{safe}%")
-
+            payload["name"] = name_pattern.replace("%", "").replace("_", " ").strip()
         if developer_name:
-            safe_developer = developer_name.replace("%", "").replace("_", " ").strip()
-            where.append("developer_name ilike %s")
-            params.append(f"%{safe_developer}%")
-
+            payload["developers"] = [
+                developer_name.replace("%", "").replace("_", " ").strip()
+            ]
         if community_name:
-            safe_community = community_name.replace("%", "").replace("_", " ").strip()
-            where.append("community ilike %s")
-            params.append(f"%{safe_community}%")
+            payload["communities"] = [
+                community_name.replace("%", "").replace("_", " ").strip()
+            ]
 
-        rows = fetch(
-            f"select {self.PROJECT_FIELDS} from projects where {' and '.join(where)} limit %s",
-            (*params, limit),
-        )
+        rows = self._propai_rows(payload, limit)
 
         if community_name and rows:
             wanted_community = community_name.strip().lower()

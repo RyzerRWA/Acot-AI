@@ -28,7 +28,6 @@ from app.database.postgres import fetch
 import asyncio
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
 from app.retrieval.hybrid.entity_resolver import EntityResolver
@@ -44,6 +43,7 @@ from app.retrieval.hybrid.listing_turns import (
     retrieve_listings,
     shown_listing_followup,
 )
+from app.answers.intent_route import wants_more_results
 from app.retrieval.hybrid.question_text import (
     asks_for_listings,
     bedroom_rental_pair,
@@ -106,6 +106,7 @@ class HybridRetriever:
         self.structured_retriever = (
             structured_retriever
         )
+        self._browse_skip_names = set()
 
         # Backward compatibility
         self.document_retriever = (
@@ -554,21 +555,19 @@ class HybridRetriever:
         self,
         developer_name: str,
     ) -> Dict[str, Any]:
-        """Retrieve projects by developer name from the current schema."""
-        if not self.structured_retriever:
-            return self._empty_structured_result()
-
+        """Retrieve Prop-AI projects by developer name."""
         try:
-            projects = fetch(
-                "select * from projects where developer_name ilike %s limit 1000",
-                (f"%{developer_name}%",),
-            )
+            from app.retrieval.propai_catalog import agent_projects
 
-            return {
-                "communities": [],
-                "projects": projects,
-                "sub_communities": [],
-            }
+            rows, total = agent_projects(
+                {"developers": [developer_name]},
+                limit=40,
+            )
+            if not rows:
+                return self._empty_structured_result()
+            result = self._project_result(rows)
+            result["project_total"] = total or len(rows)
+            return result
         except Exception as exc:
             print("Developer retrieval error:", exc)
             return self._empty_structured_result()
@@ -581,41 +580,10 @@ class HybridRetriever:
         self,
         sub_community_name: str,
     ) -> Dict[str, Any]:
-        """Retrieve projects and rental listings for a sub-community / cluster."""
-        if not self.structured_retriever:
-            return self._empty_structured_result()
-
+        """Retrieve Prop-AI projects for a sub-community / cluster."""
         try:
-            sub_communities = fetch(
-                "select * from sub_communities where name ilike %s limit 1000",
-                (f"%{sub_community_name}%",),
-            )
-            projects = fetch(
-                "select * from projects where sub_community ilike %s limit 1000",
-                (f"%{sub_community_name}%",),
-            )
-            listings = fetch(
-                "select listing_id, title, purpose, property_type, category, "
-                "beds, baths, size_sqft, price_aed, rent_frequency, furnishing, "
-                "completion_status, community, sub_community, location, "
-                "agency_name, cover_photo, image_urls, url "
-                "from listings "
-                "where sub_community ilike %s "
-                "order by price_aed asc nulls last "
-                "limit 50",
-                (f"%{sub_community_name}%",),
-            )
-
-            return {
-                "communities": [],
-                "projects": projects or [],
-                "sub_communities": sub_communities or [],
-                "listings": listings or [],
-                "listing_query": bool(listings),
-                "listing_total": len(listings or []),
-                "understood_subject": sub_community_name,
-                "understood_kind": "listing" if listings else "place",
-            }
+            result = self._place_projects(sub_community_name)
+            return result or self._empty_structured_result()
         except Exception as exc:
             print("Sub-community retrieval error:", exc)
             return self._empty_structured_result()
@@ -636,8 +604,8 @@ class HybridRetriever:
         if HybridRetriever._developer_names is None:
             try:
                 rows = fetch(
-                    "select distinct btrim(developer_name) as name "
-                    "from projects where developer_name is not null"
+                    "select distinct btrim(developer) as name "
+                    "from propai_projects where coalesce(developer, '') <> ''"
                 )
                 HybridRetriever._developer_names = [
                     str(row["name"]).lower()
@@ -768,29 +736,28 @@ class HybridRetriever:
 
             if requested_property_types:
 
-                project_types = (
-                    project.get(
-                        "property_types"
-                    )
-                    or []
-                )
-
-                normalized_project_types = {
-                    str(value).lower()
-                    for value in project_types
-                }
-
-                requested_types = {
-                    str(value).lower()
-                    for value in requested_property_types
-                }
-
-                if not (
-                    normalized_project_types
-                    &
-                    requested_types
-                ):
-                    continue
+                project_types = [
+                    str(value).strip().lower()
+                    for value in (project.get("property_types") or [])
+                    if str(value).strip()
+                ]
+                # Prop-AI rows often have no type field. "apartments for rent
+                # in Dubai Marina" must not wipe every matching project.
+                if project_types:
+                    requested_types = set()
+                    for value in requested_property_types:
+                        key = str(value).strip().lower()
+                        if not key:
+                            continue
+                        requested_types.add(key)
+                        requested_types.add(key.rstrip("s"))
+                        if not key.endswith("s"):
+                            requested_types.add(key + "s")
+                    if not any(
+                        item in requested_types or item.rstrip("s") in requested_types
+                        for item in project_types
+                    ):
+                        continue
 
             # ----------------------------------------------------
             # BEDROOMS
@@ -1069,44 +1036,14 @@ class HybridRetriever:
         community_name: str,
     ) -> Dict[str, Any]:
 
-        if not self.structured_retriever:
-            return self._empty_structured_result()
-
         print(
             f"Structured lookup by community: "
             f"{community_name}"
         )
 
         try:
-
-            result = (
-                self.structured_retriever
-                .retrieve(
-                    community_name=
-                        community_name
-                )
-                or {}
-            )
-
-            # `StructuredRetriever.retrieve()` returns the
-            # community collection under `community`. Keep accepting
-            # `communities` too so the retrieval layer stays compatible
-            # with older callers.
-            communities = (
-                result.get("communities")
-                or result.get("community")
-                or []
-            )
-
-            return {
-                "communities": communities,
-                "projects": result.get("projects", []) or [],
-                "sub_communities": (
-                    result.get("sub_communities", [])
-                    or []
-                ),
-            }
-
+            result = self._place_projects(community_name)
+            return result or self._empty_structured_result()
         except Exception as exc:
 
             print(
@@ -1122,66 +1059,64 @@ class HybridRetriever:
     # STRUCTURED RETRIEVAL BY CITY
     # ============================================================
 
+    def _dubai_projects(self, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """City-wide Prop-AI browse when the question names no community."""
+        from app.retrieval.propai_catalog import agent_projects
+
+        payload = dict(filters or {})
+        types = [
+            str(item).strip().lower()
+            for item in (payload.get("property_types") or [])
+            if str(item).strip()
+        ]
+        if any("villa" in item or "townhouse" in item or item.rstrip("s") == "villa" for item in types):
+            from app.answers.recommend import fetch_villa_projects_under_budget
+
+            kind = "townhouse" if any("town" in item for item in types) else "villa"
+            budget = payload.get("max_price") or payload.get("max_price_aed")
+            rows = fetch_villa_projects_under_budget(
+                int(budget) if budget else None,
+                limit=10,
+                property_type=kind,
+            )
+            if not rows:
+                return self._empty_structured_result()
+            result = self._project_result(rows)
+            result["project_total"] = len(rows)
+            result["catalog_place"] = "Dubai"
+            return result
+        skip = {
+            str(name).strip().lower()
+            for name in (getattr(self, "_browse_skip_names", None) or [])
+            if str(name or "").strip()
+        }
+        try:
+            rows, total = agent_projects(
+                payload,
+                limit=10,
+                sort="more" if skip else "latest_handover",
+                skip_names=skip,
+            )
+        except Exception as exc:
+            print("Prop-AI Dubai browse error:", exc)
+            return self._empty_structured_result()
+        if not rows:
+            return self._empty_structured_result()
+        result = self._project_result(rows)
+        result["project_total"] = total or len(rows)
+        result["catalog_place"] = "Dubai"
+        return result
+
     def _retrieve_by_city(
         self,
         city_name: str,
     ) -> Dict[str, Any]:
 
-        if not self.structured_retriever:
-            return self._empty_structured_result()
-
         print(
             f"Structured lookup by city: "
             f"{city_name}"
         )
-
-        try:
-
-            def _city_rows(table_name: str):
-                # table_name is one of three internal constants, never user input
-                return fetch(
-                    f"select * from {table_name} where city ilike %s limit 1000",
-                    (city_name,),
-                )
-
-            with ThreadPoolExecutor(max_workers=3) as pool:
-                community_future = pool.submit(
-                    _city_rows,
-                    "communities",
-                )
-                project_future = pool.submit(
-                    _city_rows,
-                    "projects",
-                )
-                subcommunity_future = pool.submit(
-                    _city_rows,
-                    "sub_communities",
-                )
-                communities = community_future.result()
-                projects = project_future.result()
-                sub_communities = subcommunity_future.result()
-
-            return {
-                "communities":
-                    communities,
-
-                "projects":
-                    projects,
-
-                "sub_communities":
-                    sub_communities,
-            }
-
-        except Exception as exc:
-
-            print(
-                "City retrieval error:",
-                exc
-            )
-
-            return (
-                self._empty_structured_result()
-            )
+        return self._dubai_projects(getattr(self, "_request_filters", None) or {})
 
     # ============================================================
     # QUERY HELPERS
@@ -1583,19 +1518,28 @@ class HybridRetriever:
     def _place_projects(self, community_name: str):
         """Projects in one community.
 
-        Prop-AI holds the live area list. The older projects table is only
-        the fallback when that area has no Prop-AI rows.
+        Prop-AI holds the live area list. Empty when that area has no Prop-AI rows.
         """
         label = (community_name or "").strip()
         if not label:
             return None
+        skip = {
+            str(name).strip().lower()
+            for name in (getattr(self, "_browse_skip_names", None) or [])
+            if str(name or "").strip()
+        }
         try:
             from app.retrieval.propai_catalog import agent_projects
 
+            payload = {"communities": [label]}
+            requested = getattr(self, "_request_filters", None) or {}
+            if requested.get("bedrooms") is not None:
+                payload["bedrooms"] = requested["bedrooms"]
             rows, total = agent_projects(
-                {"communities": [label]},
+                payload,
                 limit=10,
-                sort="cheapest",
+                sort="more" if skip else "latest_handover",
+                skip_names=skip,
             )
         except Exception as exc:
             print("Prop-AI place lookup error:", exc)
@@ -1605,10 +1549,7 @@ class HybridRetriever:
             result["project_total"] = total or len(rows)
             result["catalog_place"] = label
             return result
-        projects = self._filtered_projects(community_name=label)
-        if not projects:
-            return None
-        return self._project_result(projects)
+        return None
 
     def _project_result(self, projects, ambiguous_label=None):
         result = {
@@ -1786,6 +1727,7 @@ class HybridRetriever:
             )
 
         try:
+            self._request_filters = filters or {}
 
             # ----------------------------------------------------
             # MULTI-PROJECT COMPARISON / INVESTMENT FOLLOW-UP
@@ -1811,6 +1753,11 @@ class HybridRetriever:
                 ).strip().lower()
                 == "project"
             ]
+            asking_more = wants_more_results(question)
+            self._browse_skip_names = (
+                {name.lower() for name in candidate_names if name}
+                if asking_more else set()
+            )
 
             question_lower = (question or "").lower()
 
@@ -1863,6 +1810,8 @@ class HybridRetriever:
             )
             if candidate_names and is_group_attribute_question(question):
                 candidate_list_reference = True
+            if asking_more:
+                candidate_list_reference = False
 
             # Explicit project names in the current question.
             explicit_multi_project_reference = (
@@ -1903,6 +1852,7 @@ class HybridRetriever:
 
             wants_multi_project = (
                 bool(candidate_names)
+                and not asking_more
                 and (
                     candidate_list_reference
                     or explicit_multi_project_reference
@@ -2142,9 +2092,9 @@ class HybridRetriever:
                     resolved_entity
                     and resolved_entity.entity_type == "city"
                 ):
-                    result = self._retrieve_by_city(
-                        resolved_entity.name
-                    )
+                    result = self._dubai_projects(filters)
+                    if not (result.get("projects") or []):
+                        result = self._empty_structured_result()
                 else:
                     # Empty shaped browse must not block year/investment defaults.
                     result = None
@@ -2230,11 +2180,9 @@ class HybridRetriever:
                 == "city"
             ):
 
-                result = (
-                    self._retrieve_by_city(
-                        resolved_entity.name
-                    )
-                )
+                result = self._dubai_projects(filters)
+                if not (result.get("projects") or []):
+                    result = self._empty_structured_result()
 
             else:
                 # No place name: still answer year / investment asks.
@@ -2248,17 +2196,17 @@ class HybridRetriever:
                 )
                 if handover_year is not None:
                     try:
-                        year_projects = fetch(
-                            "select * from projects "
-                            "where handover_time::text ilike %s "
-                            "limit 1000",
-                            (f"%{handover_year}%",),
+                        from app.retrieval.propai_catalog import agent_projects
+
+                        year_projects, total = agent_projects(
+                            {"handover_year": handover_year},
+                            limit=40,
                         )
-                        result = {
-                            "communities": [],
-                            "projects": year_projects or [],
-                            "sub_communities": [],
-                        }
+                        if year_projects:
+                            result = self._project_result(year_projects)
+                            result["project_total"] = total or len(year_projects)
+                        else:
+                            result = self._empty_structured_result()
                     except Exception as exc:
                         print("Handover-year retrieval error:", exc)
                         result = self._empty_structured_result()
@@ -2280,9 +2228,10 @@ class HybridRetriever:
                 ):
                     # No place was named, but the user asked for communities
                     # or projects, or described what they want ("1-bedroom
-                    # apartments", "villas under 5M"). Load the Dubai catalog;
-                    # the filters below narrow it. An empty result would be wrong.
-                    result = self._retrieve_by_city("Dubai")
+                    # apartments", "villas under 5M"). Prop-AI first.
+                    result = self._dubai_projects(filters)
+                    if not (result.get("projects") or []):
+                        result = self._empty_structured_result()
                 else:
                     result = (
                         self._empty_structured_result()

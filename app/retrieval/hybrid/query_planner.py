@@ -510,7 +510,7 @@ class QueryPlanner:
 
         These requests should not consume an LLM planning call because the
         rule planner already extracts their intent/entity/filter requirements.
-        Prediction, document, ranking, and comparison stay on the LLM planner.
+        Prediction and document asks still use the LLM planner.
         """
         if plan is None:
             return False
@@ -524,12 +524,10 @@ class QueryPlanner:
         if plan.intent in {"prediction", "document", "calculation"}:
             return False
 
-        # Ranking/comparison still benefit from LLM planning.
         if plan.intent in {"ranking", "comparison"}:
-            return False
-
+            return True
         if plan.needs_ranking or plan.needs_comparison:
-            return False
+            return True
 
         # search / information / investment: rule planner is enough.
         if plan.intent in {"search", "information", "investment", "general"}:

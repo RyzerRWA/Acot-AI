@@ -1,4 +1,4 @@
-﻿"""
+"""
 The ACOT agent as a LangGraph graph.
 
     model -> (tool calls?) -> tools -> model ...        the model picks read-only tools until it can answer
@@ -186,6 +186,20 @@ def build_agent_graph(
         return {"messages": messages, "seen": seen, "used": used, "calls": [], "tool_cache": prior}
 
     def give_up_node(state: AgentState) -> dict:
+        seen = state.get("seen") or {}
+        lines = []
+        for card in seen.values():
+            row = card.get("row") or {}
+            key = card.get("listing_id")
+            if key and (row.get("name") or card.get("title")):
+                lines.append(f"- [[{key}]]")
+            if len(lines) >= 8:
+                break
+        if lines:
+            return {
+                "text": "Here are the matching projects from our data:\n" + "\n".join(lines),
+                "calls": [],
+            }
         return {"text": GIVE_UP, "calls": []}
 
     def check_node(state: AgentState) -> dict:

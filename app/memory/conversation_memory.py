@@ -314,6 +314,11 @@ class ConversationMemory:
         if not question:
             return False
 
+        from app.answers.intent_route import is_show_more
+
+        if is_show_more(question):
+            return True
+
         q_lower = question.lower()
 
         # ---------------------------------------------------------
@@ -1347,6 +1352,8 @@ Rules:
         communities = (
             retrieval_result.get("communities")
             or structured_data.get("communities")
+            or structured_data.get("community")
+            or retrieval_result.get("community")
         )
 
         sub_communities = (
@@ -1362,21 +1369,18 @@ Rules:
                 "project",
             )
 
-            if candidates:
-                return candidates[
-                    : self.MAX_CANDIDATES
-                ]
-
+        # Keep communities too when both are shown (family-area turns need
+        # community names in memory so "show me more" can skip them).
         if communities:
             add_candidates(
                 communities,
                 "community",
             )
 
-            if candidates:
-                return candidates[
-                    : self.MAX_CANDIDATES
-                ]
+        if candidates:
+            return candidates[
+                : self.MAX_CANDIDATES
+            ]
 
         if sub_communities:
             add_candidates(

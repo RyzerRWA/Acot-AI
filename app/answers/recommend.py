@@ -367,6 +367,7 @@ def fetch_recommend_projects(
     bedrooms: int | None = None,
     budget: int | None = None,
     limit: int = RECOMMEND_POOL,
+    property_type: str | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Projects with recorded sales for this place and bedroom, near the budget when given.
 
@@ -387,6 +388,22 @@ def fetch_recommend_projects(
         "coalesce(project_name_prop_ai, '') <> ''",
         lock,
     ]
+    kind = (property_type or "").strip().lower()
+    if kind == "villa":
+        where.append("property_type_en = 'Villa'")
+    elif kind == "townhouse":
+        where.append(
+            "("
+            "property_type_en ilike 'townhouse%%'"
+            " or lower(coalesce(property_sub_type_en, '')) like '%%townhouse%%'"
+            ")"
+        )
+    elif kind == "apartment":
+        where.append(
+            "("
+            "property_type_en = 'Unit' and property_sub_type_en = 'Flat'"
+            ")"
+        )
     params: list[Any] = list(lock_params)
     if bedrooms is not None:
         where.append("bedrooms between %s - 0.2 and %s + 0.2")
@@ -429,6 +446,68 @@ def fetch_recommend_projects(
     if budget:
         return [], rows
     return rows, []
+
+
+def fetch_villa_projects_under_budget(
+    budget: int | None = None,
+    limit: int = RECOMMEND_SHOW,
+    skip_place: str | None = None,
+    property_type: str = "villa",
+) -> list[dict]:
+    """Villa / townhouse projects from Prop-AI sales, optionally at or under a budget."""
+    from app.database.postgres import fetch
+
+    kind = (property_type or "villa").strip().lower()
+    if kind == "townhouse":
+        type_sql = (
+            "("
+            "property_type_en ilike 'townhouse%%'"
+            " or lower(coalesce(property_sub_type_en, '')) like '%%townhouse%%'"
+            ")"
+        )
+    else:
+        type_sql = "property_type_en = 'Villa'"
+    having = "having count(*) >= 5"
+    params: list[Any] = []
+    if budget:
+        having = (
+            "having percentile_cont(0.5) within group (order by sale_price) "
+            "between %s and %s"
+        )
+        params.extend([int(budget * _BUDGET_FLOOR), int(budget)])
+    params.append(int(limit))
+    try:
+        rows = fetch(
+            f"""
+            select project_name_prop_ai as name,
+                   count(*)::int as sales,
+                   percentile_cont(0.5) within group (order by sale_price)::float8 as price,
+                   max(instance_date) as last_sale
+            from public.propai_sales
+            where deleted_at is null
+              and coalesce(outlier_flag, '') <> 'True'
+              and sale_price > 0
+              and instance_date >= current_date - interval '{_RECENT_SALES_INTERVAL}'
+              and coalesce(project_name_prop_ai, '') <> ''
+              and {type_sql}
+            group by 1
+            {having}
+            order by count(*) desc
+            limit %s
+            """,
+            tuple(params),
+        )
+    except Exception:
+        return []
+    projects = _sale_project_rows(rows or [], "Dubai", None)
+    skip = (skip_place or "").strip().lower()
+    if skip:
+        projects = [
+            row for row in projects
+            if skip not in str(row.get("community") or "").lower()
+            and skip not in str(row.get("name") or "").lower()
+        ]
+    return projects
 
 
 def _why_line(factor: str) -> str:
@@ -1162,13 +1241,74 @@ def fetch_family_areas(limit: int = 5, focus: dict | None = None) -> list[dict]:
     return rank_family_areas(items, focus=focus, limit=limit)
 
 
-def format_family_areas(areas: list[dict], focus: dict | None = None) -> str:
+def format_family_areas(
+    areas: list[dict],
+    focus: dict | None = None,
+    budget_aed: int | None = None,
+    prefer_cheaper: bool = False,
+    prefer_premium: bool = False,
+) -> str:
+    focus = focus or {}
+    if budget_aed:
+        fitting = [
+            row for row in (areas or [])
+            if row.get("median_family_sale") and int(row["median_family_sale"]) <= int(budget_aed)
+        ]
+        prices = [
+            int(row["median_family_sale"])
+            for row in (areas or [])
+            if row.get("median_family_sale")
+        ]
+        if fitting:
+            intro = (
+                f"You set a budget of AED {int(budget_aed):,} after asking for family areas. "
+                "These communities have typical 3+ bedroom sales at or under that level:"
+            )
+            follow = "Want a villa or a townhouse in one of these?"
+            areas = fitting
+        else:
+            band = ""
+            if prices:
+                band = (
+                    f" Typical 3+ bedroom sales in those family communities sit around "
+                    f"AED {min(prices):,} to AED {max(prices):,}."
+                )
+            intro = (
+                f"You set a budget of AED {int(budget_aed):,} after asking for family areas.{band} "
+                "That is below recorded villa and 3-bedroom sale prices in our data, "
+                "so I am not listing a buy match at this budget."
+            )
+            follow = "If you meant AED 5 million, or a monthly rent, say which and I’ll rerun this list."
+            if not areas:
+                return intro + "\n\n" + follow
+        if focus.get("no_yield"):
+            intro = "ACOT does not have rental yield or ROI. " + intro
+        lines = [intro, ""]
+        for index, area in enumerate(areas[:5], start=1):
+            name = str(area.get("area") or "This area").strip()
+            bits = []
+            ready_villas = area.get("existing_villas")
+            if ready_villas:
+                bits.append(f"{int(ready_villas):,} ready villa sales")
+            family = area.get("existing_family_sales") or area.get("family_sales")
+            if family:
+                bits.append(f"{int(family):,} ready 3+ bedroom sales")
+            price = _aed_text(area.get("median_family_sale"))
+            if price:
+                bits.append(f"typical 3+ bedroom sale around {price}")
+            lines.append(f"{index}. **{name}**")
+            if bits:
+                lines.append("   " + ". ".join(bits) + ".")
+            lines.append("")
+        if fitting:
+            lines.append("The cards below are example homes from these communities.")
+        lines.append(follow)
+        return "\n".join(lines)
     if not areas:
         return (
             "Share your budget and whether you want a villa, townhouse or apartment, "
             "and I’ll match family-size homes from our data."
         )
-    focus = focus or {}
     if focus.get("avoid_towers"):
         intro = (
             "You asked for family communities, not busy apartment towers. "
@@ -1199,6 +1339,18 @@ def format_family_areas(areas: list[dict], focus: dict | None = None) -> str:
             "From ready sales in the last 12 months, these Dubai communities stand out on villa and 3-bedroom activity:"
         )
         follow = "What’s your budget, and do you want a villa, townhouse, or apartment?"
+    if prefer_cheaper:
+        intro = (
+            "You asked for cheaper family communities from the same villa / kids ranking. "
+            "These are ordered by typical 3+ bedroom sale price, lowest first:"
+        )
+        follow = "Want a budget cap, or townhouses only?"
+    elif prefer_premium:
+        intro = (
+            "You asked for higher / best family communities from the same villa / kids ranking. "
+            "These are ordered by typical 3+ bedroom sale price, highest first:"
+        )
+        follow = "Want a budget cap, or townhouses only?"
     if focus.get("no_yield"):
         intro = (
             "ACOT does not have rental yield or ROI. "
@@ -1257,6 +1409,62 @@ def format_open_areas(areas: list[dict], question: str | None = None, more: bool
         lines.append("")
     lines.append("The cards below are example projects from these areas.")
     lines.append("What’s your budget, and is this to live in or to rent out?")
+    return "\n".join(lines)
+
+
+def format_cheapest(
+    areas: list[dict],
+    projects: list[dict],
+    place: str | None = None,
+    more: bool = False,
+) -> str:
+    """Cheapest communities/projects from recorded sales, not asking rents."""
+    where = f" in {place}" if place else " in Dubai"
+    if more:
+        lines = [
+            f"More of the lowest recorded sale prices{where}:",
+            "",
+        ]
+    else:
+        lines = [
+            f"Cheapest to live{where} is based on recorded sale prices in the last 12 months, "
+            "not asking rents or lifestyle scores.",
+            "",
+        ]
+    if areas:
+        lines.append("These communities currently have the lowest typical sale prices:")
+        lines.append("")
+        for index, area in enumerate(areas[:5], start=1):
+            name = str(area.get("area") or "This area").strip()
+            bits = []
+            price = _aed_text(area.get("median_sale_price_aed") or area.get("median_price"))
+            if price:
+                bits.append(f"typical sale around {price}")
+            if area.get("sales_12m"):
+                bits.append(f"{int(area['sales_12m']):,} recorded sales")
+            psf = area.get("median_price_per_sqft_aed") or area.get("median_ppsf")
+            if psf:
+                bits.append(f"about AED {int(psf):,} per sq ft")
+            lines.append(f"{index}. **{name}**")
+            if bits:
+                lines.append("   " + ". ".join(bits) + ".")
+            lines.append("")
+    shown = projects[:3]
+    if shown:
+        if areas:
+            lines.append("Lowest-priced projects from that same recorded-sales set:")
+        else:
+            lines.append(f"Lowest-priced projects{where} from recorded sales:")
+        lines.append("")
+        for index, row in enumerate(shown, start=1):
+            lines.append(_project_bullet(index, row))
+        lines.append("")
+    if not areas and not shown:
+        return (
+            f"Share a community or a bedroom count and I’ll rank the cheapest recorded sales{where}."
+        )
+    lines.append("The cards below are example projects from this cheapest list.")
+    lines.append("Share a bedroom count or a max budget and I’ll tighten this.")
     return "\n".join(lines)
 
 
@@ -1437,46 +1645,76 @@ def format_afford_answer(
     nearby: list[dict],
     bedrooms: int | None = 1,
 ) -> str:
-    names = [str(row.get("name") or "").strip() for row in projects[:3] if row.get("name")]
+    names = [str(row.get("name") or "").strip() for row in projects[:4] if row.get("name")]
     areas = [str(row.get("area") or "").title() for row in nearby[:3] if row.get("area")]
     label = _bed_label(bedrooms)
-    lines = []
+    lead = f"You're asking whether AED {budget_aed:,} is enough for a {label} in {place}."
+    lines = [lead]
     if median and median.get("median"):
         centre = f"AED {int(median['median']):,}"
         lines.append(
             f"{label.capitalize()} sales in {place} recently centre around {centre} (last 12 months)."
         )
         lines.append("")
-        if budget_aed >= median["median"] * 0.92:
-            lines.append(f"AED {budget_aed:,} sits in that band.")
-        else:
-            lines.append(
-                f"AED {budget_aed:,} sits below that typical {place} level, so nearby areas can be a better fit."
-            )
+        below = budget_aed < median["median"] * 0.92
         if names:
-            lines.append("Closest options we have are on the cards below.")
-        if areas and budget_aed < median["median"] * 0.92:
+            # Under-budget recorded sales exist: never say the place is a miss.
+            if below:
+                lines.append(
+                    f"AED {budget_aed:,} sits below that typical {place} level, "
+                    f"but recorded {label} sales at or under this budget still exist there."
+                )
+            else:
+                lines.append(f"AED {budget_aed:,} sits in that band.")
             lines.append(
-                f"AED {budget_aed:,} also lines up with recorded prices in "
-                + " and ".join(areas)
-                + "."
+                f"The cards below are recent {label} sales in {place} "
+                f"at or under AED {budget_aed:,}."
             )
+            if areas and below:
+                lines.append(
+                    "If you want more choice at this budget, recorded prices also line up in "
+                    + " and ".join(areas)
+                    + "."
+                )
+            lines.append("")
+            lines.append(
+                f"Want me to compare these {place} options, or switch to those nearby areas?"
+            )
+            return "\n".join(lines)
+        if below:
+            lines.append(
+                f"AED {budget_aed:,} sits below that typical {place} level, "
+                f"and I couldn’t find recorded {label} sales there at or under this budget."
+            )
+            if areas:
+                lines.append(
+                    f"AED {budget_aed:,} lines up with recorded prices in "
+                    + " and ".join(areas)
+                    + "."
+                )
+            lines.append("")
+            lines.append(f"Want me to show {label}s in those nearby areas?")
+            return "\n".join(lines)
+        lines.append(f"AED {budget_aed:,} sits in that band.")
         lines.append("")
-        lines.append(f"Want those {label}s, or {place} homes closest to this budget?")
+        lines.append(f"Want me to list {place} {label}s closest to this budget?")
         return "\n".join(lines)
     if names:
         return (
-            f"Here are {place} options in our data near AED {budget_aed:,}. "
+            lead + "\n\n"
+            f"Here are recent {label} sales in {place} at or under AED {budget_aed:,}. "
             "They are on the cards below.\n\n"
-            "Want me to filter by bedrooms?"
+            "Want me to compare these options?"
         )
     if areas:
         return (
+            lead + "\n\n"
             f"AED {budget_aed:,} lines up with recorded prices in "
             + " and ".join(areas)
             + f". I can show {label}s there now."
         )
     return (
+        lead + "\n\n"
         f"Share a bedroom count or a nearby area and I’ll match options around AED {budget_aed:,}."
     )
 
@@ -1484,7 +1722,7 @@ def format_afford_answer(
 def format_split_answer(studios: list[dict], villas: list[dict], budget_aed: int | None) -> str:
     budget = f" around AED {budget_aed:,}" if budget_aed else ""
     lines = [
-        "Those are two different searches, so here are two short lists from our data.",
+        "A studio apartment and a 4-bedroom villa are different products, so here are two short lists from our data rather than one ranked mix.",
         "",
         f"Studios{budget}:",
     ]

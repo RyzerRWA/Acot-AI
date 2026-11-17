@@ -123,6 +123,21 @@ def _format_aed(value):
     return f"AED {number:,.0f}"
 
 
+def _recent_sale_row(record) -> bool:
+    kind = str((record or {}).get("price_kind") or "").lower()
+    source = str((record or {}).get("source") or "").lower()
+    return kind in {"recent_sale", "latest_sale"} or source == "propai"
+
+
+def _price_clause(record, *, sentence: bool = False) -> str | None:
+    text = _format_aed((record or {}).get("price"))
+    if not text:
+        return None
+    if _recent_sale_row(record):
+        return f"Recent sale {text}." if sentence else f"recent sale {text}"
+    return f"Starting price {text}." if sentence else f"Starting price: {text}"
+
+
 def _format_handover_month(value):
     if value is None:
         return None
@@ -178,6 +193,8 @@ def _format_listing_card(record):
         price_label = price_text
 
     size = _record_number(record, "size_sqft", "size")
+    if size is not None:
+        size = int(round(size))
     baths = _record_number(record, "baths", "bathrooms")
     property_type = record.get("property_type")
     if not property_type:
@@ -234,8 +251,11 @@ def _format_project_card(record):
         "community": record.get("community"),
         "sub_community": record.get("sub_community"),
         "price": _json_safe(record.get("price")),
+        "price_kind": record.get("price_kind") or (
+            "recent_sale" if _recent_sale_row(record) else None
+        ),
         "price_label": (
-            f"AED {record.get('price')}"
+            _price_clause(record)
             if record.get("price") is not None
             else None
         ),
@@ -256,6 +276,12 @@ def _format_project_card(record):
         "pool_type": record.get("pool_type"),
         "handover_time": _json_safe(
             record.get("handover_time")
+        ),
+        "last_sold_on": _json_safe(
+            record.get("last_sold_on") or record.get("last_sale")
+        ),
+        "sales_count": _json_safe(
+            record.get("sales_count") or record.get("sales")
         ),
         "amenities": _json_safe(
             record.get("amenities") or []
@@ -1110,7 +1136,7 @@ def _is_fast_structured_question(
     if not has_rows:
         return False
 
-    if question_type in {"search", "investment"}:
+    if question_type in {"search", "investment", "ranking", "comparison"}:
         return True
 
     # Information field follow-ups: template already formats these.
@@ -1267,13 +1293,18 @@ def _listing_answer(listings, structured_summary, question=None):
     repeat_community = len(communities) != 1
     for listing in listings:
         title = listing.get("title") or "Untitled listing"
-        agency = str(listing.get("agency_name") or "").strip()
-        sentence = f"- **{title}**"
-        sentence += f" by {agency}." if agency else "."
+        building = str(listing.get("sub_community") or "").strip()
+        community = str(listing.get("community") or "").strip()
+        if building and community and repeat_community:
+            sentence = f"- **{title}**. {building}, {community}."
+        elif building:
+            sentence = f"- **{title}**. {building}."
+        elif repeat_community and community:
+            sentence = f"- **{title}**. {community}."
+        else:
+            sentence = f"- **{title}**."
 
         details = []
-        if repeat_community and listing.get("community"):
-            details.append(f"Community {listing.get('community')}.")
         rent_text = _listing_rent_phrase(listing, monthly=monthly)
         if rent_text:
             details.append(f"{rent_text}.")
@@ -1281,8 +1312,13 @@ def _listing_answer(listings, structured_summary, question=None):
         if bedroom_text:
             details.append(f"{bedroom_text}.")
         size = listing.get("size_sqft")
-        if size:
-            details.append(f"{size} sqft.")
+        if size not in (None, ""):
+            try:
+                size = int(round(float(size)))
+            except (OverflowError, TypeError, ValueError):
+                size = None
+            if size:
+                details.append(f"{size} sqft.")
         if details:
             sentence = f"{sentence} {' '.join(details)}"
         lines.append(sentence)
@@ -1320,6 +1356,44 @@ def _limit_browse_projects(question, projects, structured_summary):
         structured_summary["projects"] = projects
     return projects, structured_summary, True
 
+
+def _limit_browse_listings(question, listings, structured_summary):
+    """A rent browse shows a short unique list, matching the cards the app draws."""
+    if not listings:
+        return listings, structured_summary
+    match = _REQUESTED_COUNT.search(question or "")
+    cap = int(match.group(1)) if match else DEFAULT_BROWSE_COUNT
+    cap = max(1, min(cap, 20))
+    unique = []
+    seen = set()
+    for listing in listings:
+        if not isinstance(listing, dict):
+            continue
+        title = re.sub(r"[^a-z0-9\s]+", " ", str(listing.get("title") or listing.get("name") or "").lower())
+        title = re.sub(r"\s+", " ", title).strip()
+        price = listing.get("price_aed")
+        if price is None:
+            price = listing.get("annual_rent_aed") or listing.get("price")
+        try:
+            price = int(round(float(price))) if price is not None else None
+        except (OverflowError, TypeError, ValueError):
+            price = None
+        key = (title, price)
+        if title and key in seen:
+            continue
+        if title:
+            seen.add(key)
+        unique.append(listing)
+    listings = unique
+    total = structured_summary.get("listing_total")
+    if not isinstance(total, int) or total < len(listings):
+        structured_summary["listing_total"] = len(listings)
+    if len(listings) > cap:
+        listings = listings[:cap]
+    structured_summary["listings"] = listings
+    return listings, structured_summary
+
+
 def _build_fast_structured_answer(
     question,
     structured_summary,
@@ -1332,6 +1406,9 @@ def _build_fast_structured_answer(
     q = (question or "").lower()
     listings = structured_summary.get("listings", []) or []
     if listings:
+        listings, structured_summary = _limit_browse_listings(
+            question, listings, structured_summary
+        )
         return _listing_answer(listings, structured_summary, question)
 
     evidence_listings = structured_summary.get("filter_evidence_listings") or []
@@ -1412,15 +1489,10 @@ def _build_fast_structured_answer(
 
         # Generic fallback for other conversational filters.
         if evidence_projects:
-            names = [
-                project.get("name") or "Unknown project"
-                for project in evidence_projects
-            ]
             return (
-                "None of the previously retrieved projects matched "
-                "the requested filter. Previous candidates: "
-                + ", ".join(names)
-                + "."
+                "Those earlier projects don’t match this new request. "
+                "Share the area, budget, or bedroom count again and I’ll search fresh "
+                "instead of filtering the old list."
             )
 
     if projects:
@@ -1444,7 +1516,7 @@ def _build_fast_structured_answer(
         wants_status = "status" in q
         wants_price = any(
             term in q
-            for term in ("price", "prices", "cost")
+            for term in ("price", "prices", "cost", "budget", "budgets")
         )
 
         if browsing:
@@ -1496,13 +1568,9 @@ def _build_fast_structured_answer(
                 return f"{name} status: {value}"
 
             if wants_price:
-                value = project.get("price")
-                value = (
-                    f"AED {value}"
-                    if value is not None
-                    else "Not available"
-                )
-                return f"{name} starting price: {value}"
+                clause = _price_clause(project)
+                value = clause or "Not available"
+                return f"{name} {value}"
 
         # Multi-project field-specific answers.
         if wants_bedrooms:
@@ -1558,12 +1626,9 @@ def _build_fast_structured_answer(
             ]
             for index, project in enumerate(projects, start=1):
                 name = project.get("name") or "Unknown project"
-                price = project.get("price")
-                price_text = (
-                    f"AED {price}" if price is not None else "Not available"
-                )
+                clause = _price_clause(project) or "Not available"
                 lines.append(
-                    f"{index}. {name} | Starting price: {price_text}"
+                    f"{index}. {name} | {clause}"
                 )
             return "\n".join(lines)
 
@@ -1578,9 +1643,19 @@ def _build_fast_structured_answer(
             named_place = str(structured_summary.get("catalog_place") or "").strip()
             if named_place:
                 where = f" in {named_place}"
+            from app.answers.intent_route import parse_bedrooms, wants_more_results
+
+            beds = parse_bedrooms(question)
+            bed_bit = ""
+            if beds:
+                if beds[0] == 0:
+                    bed_bit = " that include studio units"
+                else:
+                    bed_bit = f" that include {beds[0]}-bedroom units"
+            more = " more" if wants_more_results(question) else ""
             intro = (
-                f"I found {project_total} projects{where}. "
-                f"Here are {len(projects)} of them:"
+                f"I found {project_total} projects{where}{bed_bit}. "
+                f"Here are {len(projects)}{more} of them:"
             )
         lines = [intro, ""]
 
@@ -1596,9 +1671,9 @@ def _build_fast_structured_answer(
             sentence += f" by {developer_text}." if developer_text else "."
 
             details = []
-            price_text = _format_aed(project.get("price"))
+            price_text = _price_clause(project, sentence=True)
             if price_text:
-                details.append(f"Starting price {price_text}.")
+                details.append(price_text)
 
             bedroom_text = _format_bedroom_phrase(project)
             if bedroom_text:
@@ -1607,6 +1682,21 @@ def _build_fast_structured_answer(
             handover_text = _format_handover_month(project.get("handover_time"))
             if handover_text:
                 details.append(f"Handover {handover_text}.")
+
+            community = str(project.get("community") or "").strip()
+            if community and len(projects) == 1:
+                details.append(f"In {community}.")
+            sales = project.get("sales_count") or project.get("recent_sales_count")
+            if sales and len(projects) == 1:
+                details.append(f"{int(sales)} recorded sales.")
+            size = project.get("size_min") or project.get("size_sqft") or project.get("size")
+            if isinstance(size, dict):
+                size = size.get("min") or size.get("max")
+            if size and len(projects) == 1:
+                try:
+                    details.append(f"{int(round(float(size))):,} sqft.")
+                except (TypeError, ValueError):
+                    pass
 
             if details:
                 sentence = f"{sentence} {' '.join(details)}"
@@ -1736,8 +1826,13 @@ def _price_range_clause(projects):
     high = _format_aed(max(prices))
     if not low or not high:
         return ""
+    recent = any(_recent_sale_row(project) for project in projects)
     if low == high:
+        if recent:
+            return f", with a recent sale of {low}"
         return f", with a starting price of {low}"
+    if recent:
+        return f", with recent sale prices from {low} to {high}"
     return f", with starting prices from {low} to {high}"
 
 
