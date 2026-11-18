@@ -16,9 +16,19 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from app.listings.router import is_rent_browse
 from app.listings.tools import _find_projects, top_areas_by_sales
+from app.answers.intent_route import (
+    extract_place,
+    is_incomplete_home_browse,
+    is_no_preference_reply,
+    is_show_more,
+    parse_bedrooms,
+    prior_anchor_question,
+    reuse_last_search,
+    wants_more_results,
+)
 from app.listings.agent import EARLIER_NAME, ListingAgent, ListingsUnavailable, _ID_TAG as _AGENT_TAG
-from app.listings.router import is_rent_question
 from app.llm.client import LLMQueueTimeoutError
 from app.answers.spoken import MAX_FACT_CHARS, start_spoken_reply
 from app.subscription.token_usage import add_tokens
@@ -640,7 +650,18 @@ _SMALL_TALK_FILLER = {
     "to", "meet", "see", "later", "take", "care", "and", "i", "am",
     "fine", "well", "great", "mornin", "alaikum", "alaykum", "aleikum",
     "wa", "everybody", "folks", "guys",
+    # Spoken false starts must stay small-talk, not full hybrid RAG.
+    "uh", "um", "erm", "ah", "oh", "hmm", "hmmm", "like", "just",
+    "please", "can", "could", "would", "will", "me", "my", "name",
+    "is", "this", "that", "here", "okay", "ok", "yeah", "yep", "yes",
 }
+_SMALL_TALK_REAL_ASK = re.compile(
+    r"\b(?:show|find|list|search|projects?|propert(?:y|ies)|apartments?|"
+    r"villas?|townhouses?|listings?|agents?|brokers?|price|prices|budget|"
+    r"bedrooms?|handover|invest|buy|rent|compare|rera|escrow|marina|jvc|"
+    r"jlt|downtown|palm|bay)\b",
+    re.I,
+)
 
 
 _TRANSACTION = re.compile(
@@ -771,9 +792,10 @@ def _format_transactions(name, payload, label=None, more=False) -> str:
     return "\n".join(lines).rstrip()
 
 
-def _transaction_reply(question, answer, sales=None):
+def _transaction_reply(question, answer, sales=None, followup=True):
     summary = _empty_structured_summary()
-    summary["transaction_followup"] = True
+    if followup:
+        summary["transaction_followup"] = True
     # The sales themselves, so the app can show them by unit type and over time (data.transactions).
     summary["transactions"] = sales or []
     return {
@@ -840,6 +862,15 @@ def _transaction_turn(question, conversation_memory):
         if not _TRANSACTION_BROWSE.search(question or ""):
             return None
         asked = _transaction_place(question)
+        listings_on_screen = bool(_active_listings(conversation_memory))
+        projects_on_screen = bool(_active_projects(conversation_memory))
+        if listings_on_screen and not projects_on_screen and not asked:
+            return _transaction_reply(
+                question,
+                "There are no recorded transactions for these rental listings. "
+                "Advertised listings do not include sale history.",
+                followup=False,
+            )
         if asked and is_outside_dubai(asked):
             return _transaction_reply(
                 question,
@@ -916,6 +947,12 @@ _BROKER_PLACE = re.compile(
     r"\b(?:for|in|at)\s+(.+?)$",
     re.I,
 )
+_BROKER_POINTER = re.compile(
+    r"\b(?:this|these|those|that|them|here|above|shown)\b|"
+    r"\b(?:projects?|propert(?:y|ies)|areas?|ones?|options?|listings?|"
+    r"communities?|places?)\b",
+    re.I,
+)
 
 
 def _broker_identity_filters(question):
@@ -972,9 +1009,11 @@ def _is_broker_question(question, conversation_memory=None) -> bool:
         return True
     if asks_for_listings(text) or _BROKER_SWITCH_AWAY.search(text):
         return False
-    if _BROKER_FILTER_WORDS.search(text):
+    # "plot in India" is not an agents ask. Nationality/gender words only
+    # continue an agents thread when the last turn was already about agents.
+    if _last_asked_about_agents(conversation_memory):
         return True
-    return _last_asked_about_agents(conversation_memory)
+    return False
 
 
 _AMBIGUOUS_FILLER = re.compile(
@@ -988,11 +1027,42 @@ _AMBIGUOUS_BLOCK = re.compile(
     r"compare|vs|versus)\b",
     re.I,
 )
+# "what is dubai" / "tell me about marina" = explain, not "show me that place".
+_DEFINITIONAL_ASK = re.compile(
+    r"^\s*(?:please\s+)?(?:"
+    r"what(?:'s|\s+is|\s+are)\s+(?:a\s+|an\s+|the\s+)?|"
+    r"whats\s+(?:a\s+|an\s+|the\s+)?|"
+    r"tell\s+(?:me\s+)?about\s+|"
+    r"explain\s+(?:what\s+)?|"
+    r"define\s+|"
+    r"describe\s+"
+    r")(.+)$",
+    re.I,
+)
+_DEFINITIONAL_FIELD = re.compile(
+    r"^(?:the\s+)?(?:price|prices|cost|costs|handover|bedroom|bedrooms|"
+    r"rent|rents|size|sizes|developer|status|budget|budgets)\b",
+    re.I,
+)
 _CHOICE_AGENTS = re.compile(r"^\s*(?:show\s+me\s+)?(?:the\s+)?(?:agents?|brokers?)\s*[.!]?\s*$", re.I)
 _CHOICE_PROPERTIES = re.compile(
     r"^\s*(?:show\s+me\s+)?(?:the\s+)?(?:propert(?:y|ies)|projects?|listings?)\s*[.!]?\s*$",
     re.I,
 )
+
+
+def _is_definitional_question(question: str) -> bool:
+    """True for normal explain asks ('what is dubai'), not price/handover field asks."""
+    text = (question or "").strip()
+    matched = _DEFINITIONAL_ASK.match(text)
+    if not matched:
+        return False
+    rest = matched.group(1).strip(" .?!")
+    if not rest:
+        return False
+    if _DEFINITIONAL_FIELD.match(rest):
+        return False
+    return True
 
 
 def _memory_question_texts(conversation_memory) -> list[str]:
@@ -1065,6 +1135,9 @@ def _ambiguous_place_question(question, conversation_memory):
         return None
     if _last_asked_about_properties(conversation_memory):
         return None
+    # "what is dubai" is an explanation ask, not a bare place browse.
+    if _is_definitional_question(text):
+        return None
     if (
         _BROKER.search(text)
         or _BROKER_SWITCH_AWAY.search(text)
@@ -1128,6 +1201,57 @@ def _place_choice_turn(question, place, conversation_memory):
     }
 
 
+def _inherit_place_for_home_browse(question, conversation_memory, prior=None):
+    """Attach the last Dubai place when the user only names beds/type.
+
+    After "projects in JVC", "show me two-bedroom apartments" must become
+    "Show me 2 bedroom apartments in Jumeirah Village Circle" for SQL browse.
+    """
+    if not is_incomplete_home_browse(question):
+        return question
+    locked = extract_place(question)
+    if not locked or locked.lower() == "dubai":
+        locked = extract_place(prior) if prior else None
+    if not locked or str(locked).lower() == "dubai":
+        locked = _on_screen_broker_place(conversation_memory)
+    if not locked or str(locked).lower() == "dubai":
+        return question
+    beds = parse_bedrooms(question)
+    bed_label = f"{beds[0]} bedroom " if beds else ""
+    home = "apartments" if re.search(
+        r"\b(?:apartments?|flats?)\b", question or "", re.I
+    ) else "projects"
+    return f"Show me {bed_label}{home} in {locked}"
+
+
+def _on_screen_broker_place(conversation_memory):
+    """First area or project already on screen, so agent follow-ups stay on the last answer."""
+    items = getattr(conversation_memory, "active_candidates", None) or []
+    communities = []
+    names = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("entity_type") or "project").lower()
+        name = str(item.get("name") or item.get("title") or "").strip()
+        community = str(
+            item.get("community") or item.get("official_area") or ""
+        ).strip()
+        if kind == "community":
+            if name and name not in communities:
+                communities.append(name)
+            continue
+        if community and community not in communities:
+            communities.append(community)
+        if kind in {"project", "listing"} and name:
+            names.append(name)
+    if communities:
+        return communities[0]
+    if len(names) == 1:
+        return names[0]
+    return None
+
+
 def _broker_place(question, conversation_memory):
     """Community or project a broker follow-up refers to."""
     asked = (question or "").strip()
@@ -1143,35 +1267,19 @@ def _broker_place(question, conversation_memory):
         place = " ".join(_BROKER_FILTER_WORDS.sub(" ", place).split()).strip(" .?")
         # "the jvc" -> "Jumeirah Village Circle", so answers read properly and the search uses the full name.
         place = re.sub(r"^(?:the|a)\s+", "", place, flags=re.I)
-        from app.listings.tools import ALIASES
-        place = ALIASES.get(place.lower(), place)
-        if place:
-            return place
+        # "these projects" / "those areas" points at the last answer, not a new place.
+        pointed = " ".join(_BROKER_POINTER.sub(" ", place).split()).strip(" .?")
+        if pointed:
+            from app.listings.tools import ALIASES
+            return ALIASES.get(pointed.lower(), pointed)
     leftover = " ".join(_BROKER_FILLER.sub(" ", asked).split())
     leftover = " ".join(_BROKER_FILTER_WORDS.sub(" ", leftover).split()).strip(" .?")
+    leftover = " ".join(_BROKER_POINTER.sub(" ", leftover).split()).strip(" .?")
     if leftover:
         from app.retrieval.propai_catalog import is_outside_dubai, known_dubai_label
         if is_outside_dubai(leftover) or known_dubai_label(leftover):
             return leftover
-    items = getattr(conversation_memory, "active_candidates", None) or []
-    communities = []
-    names = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        if str(item.get("entity_type") or "project").lower() != "project":
-            continue
-        community = str(item.get("community") or "").strip()
-        name = str(item.get("name") or "").strip()
-        if community and community not in communities:
-            communities.append(community)
-        if name:
-            names.append(name)
-    if len(communities) == 1:
-        return communities[0]
-    if len(names) == 1:
-        return names[0]
-    return None
+    return _on_screen_broker_place(conversation_memory)
 
 
 def _broker_lookup(question, conversation_memory):
@@ -1337,6 +1445,244 @@ _COMMUNITY_NARROWED = re.compile(
 )
 
 
+def _project_detail_turn(question, conversation_memory=None):
+    """Full detail for a named / on-screen project from Prop-AI. No model call."""
+    from app.answers.intent_route import project_detail_subject
+    from app.retrieval.propai_catalog import agent_projects
+
+    name = project_detail_subject(question, conversation_memory)
+    if not name:
+        return None
+    shown = None
+    needle = name.strip().lower()
+    for item in _active_projects(conversation_memory):
+        label = str(item.get("name") or "").strip()
+        if label.lower() == needle or needle in label.lower():
+            shown = item
+            if label.lower() == needle:
+                break
+    rows = []
+    try:
+        rows, _ = agent_projects({"name": shown.get("name") if shown else name}, limit=6)
+    except Exception:
+        rows = []
+    wanted = str((shown or {}).get("name") or name).strip().lower()
+    exact = [
+        row for row in rows
+        if str(row.get("name") or "").strip().lower() == wanted
+    ]
+    picked = exact[0] if exact else (rows[0] if len(rows) == 1 else None)
+    if shown:
+        merged = dict(shown)
+        if picked:
+            for key, value in picked.items():
+                if value in (None, "", [], {}):
+                    continue
+                if key not in merged or merged.get(key) in (None, "", [], {}):
+                    merged[key] = value
+                elif key in {
+                    "price", "developer_name", "community", "handover_time",
+                    "description", "photos", "sales_count", "price_kind",
+                    "bedroom_min", "bedroom_max", "size_min", "size_max",
+                }:
+                    merged[key] = value
+        picked = merged
+    if not picked:
+        summary = _empty_structured_summary()
+        return {
+            "question": question,
+            "standalone_question": question,
+            "question_type": "search",
+            "structured_summary": summary,
+            "documents": [],
+            "investment_analysis": None,
+            "retrieval_result": {
+                "question_type": "search",
+                "structured_data": {
+                    "community": [],
+                    "projects": [],
+                    "sub_communities": [],
+                },
+                "documents": [],
+            },
+            "use_fast": True,
+            "fast_answer": (
+                f'I do not have a project matching "{name}". '
+                "Ask about one of the projects already on screen, or name the area."
+            ),
+            "context": None,
+            "small_talk": None,
+        }
+    picked.setdefault("entity_type", "project")
+    summary = _empty_structured_summary()
+    summary["projects"] = [picked]
+    summary["project_total"] = 1
+    return {
+        "question": question,
+        "standalone_question": question,
+        "question_type": "search",
+        "structured_summary": summary,
+        "documents": [],
+        "investment_analysis": None,
+        "retrieval_result": {
+            "question_type": "search",
+            "structured_data": {
+                "community": [],
+                "projects": [picked],
+                "sub_communities": [],
+            },
+            "documents": [],
+        },
+        "use_fast": True,
+        "fast_answer": _build_fast_structured_answer(question, summary),
+        "context": None,
+        "small_talk": None,
+    }
+
+
+def _place_detail_turn(question, conversation_memory=None):
+    """Recorded sales and example projects for one community. No model call."""
+    from app.answers.intent_route import place_detail_subject
+    from app.answers.predict import (
+        _place_keys,
+        attach_latest_project_sales,
+        fetch_place_trend,
+        format_place_details,
+        projects_for_place,
+    )
+    from app.retrieval.propai_catalog import agent_projects
+
+    place = place_detail_subject(question, conversation_memory)
+    if not place:
+        return None
+    try:
+        trend = fetch_place_trend(place)
+    except Exception:
+        trend = None
+    try:
+        pool, _total = agent_projects({"communities": _place_keys(place)}, limit=40, sort="cheapest")
+    except Exception:
+        pool = []
+    matched = attach_latest_project_sales(projects_for_place(place, pool))
+    projects = matched if len(matched) <= 15 else matched[:8]
+    answer = format_place_details(place, trend, projects, total=len(matched))
+    summary = _empty_structured_summary()
+    summary["projects"] = projects or []
+    summary["project_total"] = len(matched)
+    summary["community"] = [{"name": place, "entity_type": "community"}]
+    return {
+        "question": question,
+        "standalone_question": question,
+        "question_type": "search",
+        "structured_summary": summary,
+        "documents": [],
+        "investment_analysis": None,
+        "retrieval_result": {
+            "question_type": "search",
+            "structured_data": {
+                "community": summary["community"],
+                "projects": projects or [],
+                "sub_communities": [],
+            },
+            "documents": [],
+        },
+        "use_fast": True,
+        "fast_answer": answer,
+        "context": None,
+        "small_talk": None,
+    }
+
+
+def _sql_project_browse_turn(question, conversation_memory=None):
+    """Clear community project browse via Prop-AI SQL only — no rewrite/plan/agent.
+
+    "Show me projects in JVC" and "2 bedroom apartments in Marina" were still
+    paying hybrid planner / rewrite latency even though the answer is SQL.
+    """
+    text = question or ""
+    if not re.search(
+        r"\b(?:show|find|list|projects?|propert(?:y|ies)|apartments?|villas?|"
+        r"townhouses?|flats?)\b",
+        text,
+        re.I,
+    ):
+        return None
+    if re.search(
+        r"\b(?:agents?|brokers?|compare|versus|\bvs\b|brochure|floor ?plans?|"
+        r"invest(?:ment|ing)?|yield|roi)\b",
+        text,
+        re.I,
+    ):
+        return None
+    if is_incomplete_home_browse(text):
+        return None
+    if asks_for_listings(text):
+        return None
+
+    place = extract_place(text)
+    if not place:
+        return None
+
+    from app.retrieval.propai_catalog import agent_projects, resolve_dubai_place
+
+    try:
+        resolved = resolve_dubai_place(place) or place
+    except Exception:
+        resolved = place
+    beds = parse_bedrooms(text)
+    payload = {"communities": [resolved]}
+    if beds:
+        payload["bedrooms"] = beds[0]
+
+    skip = []
+    if wants_more_results(text):
+        items = getattr(conversation_memory, "active_candidates", None) or []
+        skip = [
+            str(item.get("name") or "").strip()
+            for item in items
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        ]
+
+    try:
+        rows, total = agent_projects(
+            payload,
+            limit=10,
+            sort="more" if skip else "latest_handover",
+            skip_names=skip or None,
+        )
+    except Exception as exc:
+        print(f"SQL project browse unavailable: {exc}")
+        return None
+    if not rows:
+        return None
+
+    summary = _empty_structured_summary()
+    summary["projects"] = rows
+    summary["project_total"] = total or len(rows)
+    summary["catalog_place"] = str(resolved).strip()
+    return {
+        "question": question,
+        "standalone_question": question,
+        "question_type": "search",
+        "structured_summary": summary,
+        "documents": [],
+        "investment_analysis": None,
+        "retrieval_result": {
+            "question_type": "search",
+            "structured_data": {
+                "community": [],
+                "projects": rows,
+                "sub_communities": [],
+            },
+            "documents": [],
+        },
+        "use_fast": True,
+        "fast_answer": _build_fast_structured_answer(question, summary),
+        "context": None,
+        "small_talk": None,
+    }
+
+
 def _community_list_turn(question):
     text = question or ""
     if not _COMMUNITY_LIST.search(text) or _COMMUNITY_NARROWED.search(text):
@@ -1345,8 +1691,13 @@ def _community_list_turn(question):
     try:
         rentals = fetch("select btrim(community) as name, count(*)::int as n from listings "
                         "where coalesce(btrim(community), '') <> '' group by 1")
-        projects = fetch("select btrim(community) as name, count(*)::int as n from projects "
-                         "where coalesce(btrim(community), '') <> '' group by 1")
+        projects = fetch(
+            "select coalesce(nullif(btrim(master_project), ''), area) as name, count(*)::int as n "
+            "from propai_projects "
+            "where coalesce(name, '') <> '' "
+            "and coalesce(nullif(btrim(master_project), ''), area) is not null "
+            "group by 1"
+        )
     except Exception:
         return None
     rows: dict[str, dict] = {}
@@ -1460,10 +1811,13 @@ _SHORTLIST_RECOMMEND = re.compile(
     r"which of these (?:is|are) better|"
     r"which (?:of these |ones? |of those )?(?:should|would) i|"
     r"what should i (?:pick|choose|buy)|"
-    r"which property is best|"
-    r"best (?:property|project) to (?:invest|buy)|"
+    r"which (?:project|property) is (?:the )?best|"
+    r"tell(?: me)? which (?:project|property|one) is (?:the )?best|"
+    r"best (?:property|project|apartment|option) to (?:invest|buy|live)|"
+    r"best to live|"
+    r"tell(?: me)? (?:which |the )?best|"
     r"recommend (?:one|one of these|the best|among these)|"
-    r"best (?:one|option|pick|project)(?:\s+of these)?|"
+    r"best (?:one|option|pick|project|apartment)(?:\s+of these)?|"
     r"pick (?:one|for me)|"
     r"which of these (?:do you )?recommend"
     r")\b",
@@ -1471,6 +1825,10 @@ _SHORTLIST_RECOMMEND = re.compile(
 )
 _COMPARE_WORD = re.compile(r"\bcompar(?:e|ison|ing)\b", re.I)
 _COMPARE_ALL = re.compile(r"\b(?:all|every|each)\b", re.I)
+_SHOWN_RENTALS = re.compile(
+    r"\b(?:apartments?|rentals?|listings?|studios?|to live)\b",
+    re.I,
+)
 _COMPARE_FIRST_N = re.compile(
     r"\b(?:first|top)\s+(two|three|four|both|2|3|4)\b|\b(?:both|the two)\b",
     re.I,
@@ -1486,7 +1844,69 @@ def _active_projects(conversation_memory) -> list[dict]:
         if isinstance(item, dict)
         and str(item.get("entity_type") or "project").lower() == "project"
         and item.get("name")
+        and not _is_listing_row(item)
     ]
+
+
+def _is_listing_row(item: dict) -> bool:
+    kind = str(item.get("entity_type") or "").lower()
+    if kind == "listing":
+        return True
+    if kind == "project":
+        return False
+    return bool(item.get("listing_id") or item.get("rent_frequency") or item.get("title"))
+
+
+def _active_listings(conversation_memory) -> list[dict]:
+    items = getattr(conversation_memory, "active_candidates", None) or []
+    rows = []
+    for item in items:
+        if not isinstance(item, dict) or not _is_listing_row(item):
+            continue
+        if item.get("name") or item.get("title"):
+            rows.append(item)
+    return rows
+
+
+def _rankable_listing(item: dict) -> dict:
+    beds = item.get("beds")
+    rent = item.get("rent_frequency") or item.get("price_kind")
+    size = item.get("size_sqft") or item.get("size")
+    if isinstance(size, dict):
+        size = size.get("min") if size.get("min") is not None else size.get("max")
+    property_type = item.get("property_type")
+    if not property_type:
+        types = item.get("property_types") or []
+        if isinstance(types, list):
+            property_type = next((value for value in types if value), None)
+        elif types:
+            property_type = types
+    return {
+        **item,
+        "id": item.get("id") or item.get("listing_id"),
+        "name": item.get("name") or item.get("title"),
+        "price": item.get("price") or item.get("price_aed"),
+        "price_kind": item.get("price_kind") or ("yearly rent" if rent else "price"),
+        "size_sqft": size,
+        "baths": item.get("baths") if item.get("baths") is not None else item.get("bathrooms"),
+        "property_type": property_type,
+        "bedroom_min": item.get("bedroom_min") if item.get("bedroom_min") is not None else beds,
+        "bedroom_max": item.get("bedroom_max") if item.get("bedroom_max") is not None else beds,
+        "entity_type": "listing",
+    }
+
+
+def _shown_compare_rows(question, conversation_memory) -> tuple[str, list[dict]]:
+    projects = _active_projects(conversation_memory)
+    listings = _active_listings(conversation_memory)
+    rent_ask = bool(_SHOWN_RENTALS.search(question or ""))
+    if listings and (rent_ask or len(projects) < 2):
+        return "listing", [_rankable_listing(row) for row in listings]
+    if len(projects) >= 2:
+        return "project", projects
+    if len(listings) >= 2:
+        return "listing", [_rankable_listing(row) for row in listings]
+    return "", []
 
 
 def _shown_compare_limit(question: str) -> int | None:
@@ -1504,24 +1924,34 @@ def _shown_compare_limit(question: str) -> int | None:
 
 
 def _compare_shown_turn(question, conversation_memory):
-    """Compare N (or all) on-screen projects in a table + Acot Recommend."""
+    """Compare N (or all) on-screen projects or rentals in a table + Acot Recommend."""
     limit = _shown_compare_limit(question)
     if not limit:
         return None
     if _TRANSACTION.search(question or ""):
         return None
-    available = _active_projects(conversation_memory)
-    projects = available[:limit]
-    if len(projects) < 2:
+    kind, available = _shown_compare_rows(question, conversation_memory)
+    rows = available[:limit]
+    if len(rows) < 2:
         return None
     from app.answers.recommend import format_compare_table, rank_projects, wanted_bedrooms
 
-    ranked = rank_projects(projects, wanted_beds=wanted_bedrooms(question))
-    answer = format_compare_table(projects, ranked)
+    ranked = rank_projects(
+        rows,
+        wanted_beds=wanted_bedrooms(question),
+        attach_sales=(kind == "project"),
+    )
+    answer = format_compare_table(rows, ranked)
     summary = _empty_structured_summary()
     # Cards show the compared set; memory keeps the fuller shortlist via preserve logic.
-    summary["projects"] = projects
-    summary["project_total"] = len(projects)
+    if kind == "listing":
+        summary["listings"] = rows
+        summary["listing_total"] = len(rows)
+        data = {"community": [], "projects": [], "sub_communities": [], "listings": rows}
+    else:
+        summary["projects"] = rows
+        summary["project_total"] = len(rows)
+        data = {"community": [], "projects": rows, "sub_communities": []}
     summary["recommendation"] = ranked.get("recommendation")
     summary["comparison"] = True
     return {
@@ -1533,11 +1963,7 @@ def _compare_shown_turn(question, conversation_memory):
         "investment_analysis": None,
         "retrieval_result": {
             "question_type": "comparison",
-            "structured_data": {
-                "community": [],
-                "projects": projects,
-                "sub_communities": [],
-            },
+            "structured_data": data,
             "documents": [],
         },
         "use_fast": True,
@@ -1548,20 +1974,24 @@ def _compare_shown_turn(question, conversation_memory):
 
 
 def _shortlist_recommend_turn(question, conversation_memory):
-    """Rank projects already on screen and return Acot Recommend."""
+    """Rank projects or rentals already on screen and return Acot Recommend."""
     if _shown_compare_limit(question):
         return None
     if not _SHORTLIST_RECOMMEND.search(question or ""):
         return None
     if _TRANSACTION.search(question or ""):
         return None
-    projects = _active_projects(conversation_memory)
-    if len(projects) < 2:
+    kind, available = _shown_compare_rows(question, conversation_memory)
+    if len(available) < 2:
         return None
     from app.answers.recommend import format_shortlist, rank_projects, wanted_bedrooms
 
-    selected = projects[:_COMPARE_ALL_LIMIT]
-    ranked = rank_projects(selected, wanted_beds=wanted_bedrooms(question))
+    selected = available[:_COMPARE_ALL_LIMIT]
+    ranked = rank_projects(
+        selected,
+        wanted_beds=wanted_bedrooms(question),
+        attach_sales=(kind == "project"),
+    )
     # Compare-style "which is best" with many options still gets a table when asked to compare.
     if _COMPARE_WORD.search(question or ""):
         from app.answers.recommend import format_compare_table
@@ -1569,15 +1999,21 @@ def _shortlist_recommend_turn(question, conversation_memory):
     else:
         answer = format_shortlist(ranked, question=question)
     summary = _empty_structured_summary()
-    by_name = {str(item.get("name") or "").lower(): item for item in selected}
     ordered = []
     for item in ranked.get("ranked") or []:
-        row = by_name.get(str(item.get("name") or "").lower())
-        if row and row not in ordered:
+        row = item.get("row")
+        if row is not None and row not in ordered:
             ordered.append(row)
-    summary["projects"] = ordered
-    summary["project_total"] = len(ordered)
+    if kind == "listing":
+        summary["listings"] = ordered
+        summary["listing_total"] = len(ordered)
+        data = {"community": [], "projects": [], "sub_communities": [], "listings": ordered}
+    else:
+        summary["projects"] = ordered
+        summary["project_total"] = len(ordered)
+        data = {"community": [], "projects": ordered, "sub_communities": []}
     summary["recommendation"] = ranked.get("recommendation")
+    summary["comparison"] = True
     return {
         "question": question,
         "standalone_question": question,
@@ -1587,11 +2023,7 @@ def _shortlist_recommend_turn(question, conversation_memory):
         "investment_analysis": None,
         "retrieval_result": {
             "question_type": "comparison",
-            "structured_data": {
-                "community": [],
-                "projects": summary["projects"],
-                "sub_communities": [],
-            },
+            "structured_data": data,
             "documents": [],
         },
         "use_fast": True,
@@ -1648,6 +2080,46 @@ def _shown_project_followup(question, conversation_memory):
     return projects, True
 
 
+def _shown_attribute_response(question, conversation_memory, timing_ms, ask_started, rag_chain):
+    """Fast structured answer for price/handover/bedroom asks about on-screen projects."""
+    shown_followup = _shown_project_followup(question, conversation_memory)
+    if shown_followup is None:
+        return None
+    projects, no_match = shown_followup
+    summary = _empty_structured_summary()
+    if no_match:
+        summary["filter_no_match"] = True
+        summary["filter_evidence_projects"] = projects
+    else:
+        summary["projects"] = projects
+        summary["project_total"] = len(projects)
+    return {
+        "question": question,
+        "standalone_question": question,
+        "question_type": "search",
+        "structured_summary": summary,
+        "documents": [],
+        "investment_analysis": None,
+        "retrieval_result": {
+            "question_type": "search",
+            "structured_data": {
+                "community": [],
+                "projects": [] if no_match else projects,
+                "sub_communities": [],
+            },
+            "documents": [],
+        },
+        "rag_chain": rag_chain,
+        "conversation_memory": conversation_memory,
+        "use_fast": True,
+        "fast_answer": _build_fast_structured_answer(question, summary),
+        "context": None,
+        "timing_ms": timing_ms,
+        "ask_started": ask_started,
+        "small_talk": None,
+    }
+
+
 def _classify_small_talk(question):
     """Return a small-talk kind when the whole message is a greeting or identity question."""
 
@@ -1659,9 +2131,28 @@ def _classify_small_talk(question):
     words = re.findall(r"[a-z']+", text)
     if not words or len(words) > 8:
         return None
+    joined = " ".join(words)
+    # Casual thanks / soft acknowledgements that should not hit retrieval.
+    if re.fullmatch(
+        r"(?:ok(?:ay)?|alright|sure|yes|yep|yeah)?\s*"
+        r"(?:thanks?|thx|ty|thank you)(?:\s+\w+){0,3}",
+        joined,
+    ):
+        return "thanks"
+    ack_words = {
+        "ok", "okay", "alright", "sure", "yes", "yep", "yeah", "no", "nope",
+        "nah", "hmm", "hmmm", "interesting", "really", "got", "it", "cool",
+        "nice", "maybe", "later", "not", "now",
+    }
+    if words and len(words) <= 3 and all(word in ack_words for word in words):
+        return "ack"
     for pattern, lead_kind in _SMALL_TALK_LEADS:
         if pattern.match(words[0]):
-            if all(word in _SMALL_TALK_FILLER for word in words[1:]):
+            rest = words[1:]
+            if all(word in _SMALL_TALK_FILLER for word in rest):
+                return lead_kind
+            # "Hello. So, uh," / "hi there please" with no real ask → greeting.
+            if len(words) <= 8 and not _SMALL_TALK_REAL_ASK.search(joined):
                 return lead_kind
             return None
     return None
@@ -1733,6 +2224,12 @@ def _small_talk_answer(kind, name=None, audience="buyer"):
             "whenever you're ready."
         )
 
+    if kind == "ack":
+        return (
+            f"Okay{who}. If you want, I can show more options, compare the ones on screen, "
+            "or switch area or budget."
+        )
+
     if kind == "bye":
         if broker:
             return f"Goodbye{who}. I'll be here when you want to check leads or the market again."
@@ -1774,6 +2271,103 @@ def _empty_structured_summary():
 def _agent_enabled(components):
     on = os.getenv("ACOT_USE_AGENT", "0").strip().lower() in ("1", "true", "yes", "on")
     return on and components.get("listing_agent") is not None
+
+
+# Dubai buying/renting process terms the agent may answer from general knowledge.
+# Hybrid RAG refuses these ("only ACOT evidence"), so they must not skip the agent.
+_GUIDANCE_TOPIC = re.compile(
+    r"\b(?:"
+    r"rera|ejari|oqood|escrow|freehold|leasehold|"
+    r"dld(?:\s+fees?)?|dubai\s+land\s+department|"
+    r"title\s+deeds?|sale\s+(?:and\s+|\&\s+)?purchase\s+agreement|"
+    r"payment\s+plans?|mortgages?|off[\s-]?plan|"
+    r"service\s+charges?|transfer\s+fees?|"
+    r"how\s+(?:do\s+i|to|does\s+one)\s+(?:buy|purchase|rent)|"
+    r"buying\s+process|purchase\s+process|steps?\s+to\s+buy"
+    r")\b",
+    re.I,
+)
+_GUIDANCE_DATA_ASK = re.compile(
+    r"\b(?:show\s+me|find|list|projects?|listings?|apartments?|villas?|"
+    r"townhouses?|price|prices|handover|bedrooms?|agents?|brokers?)\b",
+    re.I,
+)
+
+
+def _is_dubai_guidance_question(question: str) -> bool:
+    """True for process/knowledge asks (RERA, escrow, how to buy) — not data browse."""
+    text = question or ""
+    if not _GUIDANCE_TOPIC.search(text):
+        return False
+    # "off-plan projects in Marina" / "RERA agents" stay on their data paths.
+    if _GUIDANCE_DATA_ASK.search(text):
+        return False
+    return True
+
+
+def _propai_sql_browse(question, conversation_memory=None) -> bool:
+    """True when Prop-AI SQL / hybrid should answer, not the listings LLM.
+
+    Clear project browses (show me 2 beds in Marina) stay on SQL — cheaper and
+    accurate. Agent keeps messy / guidance / incomplete-clarify turns.
+    """
+    if asks_for_listings(question):
+        return False
+    text = question or ""
+    if re.search(r"\b(?:agents?|brokers?)\b", text, re.I):
+        return False
+    if _is_dubai_guidance_question(text):
+        return False
+    if _is_definitional_question(text):
+        return False
+    if is_incomplete_home_browse(text):
+        return False
+    if is_no_preference_reply(text):
+        return False
+    items = []
+    if conversation_memory is not None:
+        items = getattr(conversation_memory, "active_candidates", None) or []
+    if items and is_group_attribute_question(question):
+        return False
+    return True
+
+
+def _seed_agent_history_from_memory(history, conversation_memory):
+    """Copy on-screen cards into agent history after a structured browse.
+
+    The listings agent only knows items from its own '[internal note]'. A
+    Prop-AI SQL list never writes that note, so 'show me more' had nothing
+    to exclude.
+    """
+    if history:
+        return
+    items = getattr(conversation_memory, "active_candidates", None) or []
+    shown = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        key = item.get("id") or item.get("listing_id") or item.get("project_id")
+        shown.append(f"{name} (id {key})" if key else name)
+    if not shown:
+        return
+    prior = (
+        getattr(conversation_memory, "last_user_question", None)
+        or getattr(conversation_memory, "last_standalone_question", None)
+        or "previous search"
+    )
+    history.append({"role": "user", "content": str(prior)})
+    history.append({
+        "role": "assistant",
+        "content": (
+            "Here are the options on screen.\n"
+            "[internal note, not part of the reply. Shown: "
+            + "; ".join(shown)
+            + "]"
+        ),
+    })
 
 
 def _agent_listing_record(card):
@@ -1844,12 +2438,10 @@ async def _try_agent_turn(question, components, timing_ms, ask_started):
         return None
 
     conversation_memory = components.get("conversation_memory")
-    if conversation_memory and should_use_structured_listing_comparison(
-        question,
-        conversation_memory.context(),
-    ):
+    # Simple Prop-AI browse is SQL, not the listings agent. The agent was
+    # retrying search_projects until the round limit and burning tokens.
+    if _propai_sql_browse(question, conversation_memory):
         return None
-
     agent = components["listing_agent"]
     history = components.setdefault("agent_history", [])
     profile = components.setdefault("profile", {})
@@ -1861,6 +2453,7 @@ async def _try_agent_turn(question, components, timing_ms, ask_started):
         history[:0] = saved_history
         for key, value in saved_profile.items():
             profile.setdefault(key, value)
+    _seed_agent_history_from_memory(history, conversation_memory)
     llm = components["rag_chain"].llm
 
     if _is_broker_question(question, conversation_memory):
@@ -1891,6 +2484,8 @@ async def _try_agent_turn(question, components, timing_ms, ask_started):
 
     add_tokens(result.tokens)
     if not (result.answer or "").strip():
+        return None
+    if "couldn't pin that down" in (result.answer or "").lower() and not result.cards:
         return None
 
     projects, listings, brokers, labels = [], [], [], {}
@@ -2120,6 +2715,63 @@ async def _prepare_acot_turn_inner(
         if broker_part.get("alsoMarket") and not broker_part.get("market"):
             components["_carry_companion"] = broker_part
 
+    # After clarify: rewrite to a clean browse so SQL can answer (low tokens).
+    prior = prior_anchor_question(conversation_memory, question)
+    if not prior:
+        prior = getattr(conversation_memory, "last_user_question", None)
+    if prior and is_incomplete_home_browse(prior):
+        beds = parse_bedrooms(prior)
+        bed_label = f"{beds[0]} bedroom " if beds else ""
+        home = "apartments" if re.search(
+            r"\b(?:apartments?|flats?)\b", prior, re.I
+        ) else "projects"
+        if is_no_preference_reply(question):
+            question = f"Show me {bed_label}{home}"
+        else:
+            place = extract_place(question)
+            short = len((question or "").split()) <= 6
+            if (
+                place
+                and place.lower() != "dubai"
+                and short
+                and not is_incomplete_home_browse(question)
+            ):
+                question = f"Show me {bed_label}{home} in {place}"
+
+    # "show me two-bedroom apartments" after a JVC browse → keep that place on SQL.
+    question = _inherit_place_for_home_browse(question, conversation_memory, prior)
+
+    # Agents for on-screen projects must beat agent-first (which often ignores cards).
+    broker_first = await asyncio.to_thread(
+        _broker_turn, question, conversation_memory
+    )
+    if broker_first is not None:
+        broker_first["timing_ms"] = timing_ms
+        broker_first["ask_started"] = ask_started
+        broker_first["rag_chain"] = rag_chain
+        broker_first["conversation_memory"] = conversation_memory
+        return broker_first
+
+    # Agent-first only when SQL browse should not handle this turn.
+    if _agent_enabled(components) and not _propai_sql_browse(question, conversation_memory):
+        agent_first = await _try_agent_turn(
+            question, components, timing_ms, ask_started
+        )
+        if agent_first is not None:
+            return agent_first
+
+    # Clear Prop-AI place browses: SQL + template only (skip rewrite/plan/RAG).
+    if _propai_sql_browse(question, conversation_memory):
+        sql_browse = await asyncio.to_thread(
+            _sql_project_browse_turn, question, conversation_memory
+        )
+        if sql_browse is not None:
+            sql_browse["timing_ms"] = timing_ms
+            sql_browse["ask_started"] = ask_started
+            sql_browse["rag_chain"] = rag_chain
+            sql_browse["conversation_memory"] = conversation_memory
+            return sql_browse
+
     # "Compare Dubai Marina and Business Bay": a table built from the database, no model call.
     areas = None
     try:
@@ -2261,7 +2913,7 @@ async def _prepare_acot_turn_inner(
         choice["conversation_memory"] = conversation_memory
         return choice
 
-    from app.answers.intent_route import classify_intent, prior_anchor_question
+    from app.answers.intent_route import classify_intent
     from app.answers.intent_turns import predict_turn, recommend_data_turn
 
     route = classify_intent(question, conversation_memory)
@@ -2307,41 +2959,19 @@ async def _prepare_acot_turn_inner(
             rec_turn["conversation_memory"] = conversation_memory
             return rec_turn
 
-    shown_followup = _shown_project_followup(question, conversation_memory)
-    if shown_followup is not None:
-        projects, no_match = shown_followup
-        summary = _empty_structured_summary()
-        if no_match:
-            summary["filter_no_match"] = True
-            summary["filter_evidence_projects"] = projects
-        else:
-            summary["projects"] = projects
-            summary["project_total"] = len(projects)
-        return {
-            "question": question,
-            "standalone_question": question,
-            "question_type": "search",
-            "structured_summary": summary,
-            "documents": [],
-            "investment_analysis": None,
-            "retrieval_result": {
-                "question_type": "search",
-                "structured_data": {
-                    "community": [],
-                    "projects": [] if no_match else projects,
-                    "sub_communities": [],
-                },
-                "documents": [],
-            },
-            "rag_chain": rag_chain,
-            "conversation_memory": conversation_memory,
-            "use_fast": True,
-            "fast_answer": _build_fast_structured_answer(question, summary),
-            "context": None,
-            "timing_ms": timing_ms,
-            "ask_started": ask_started,
-            "small_talk": None,
-        }
+    # With the agent on, on-screen attribute follow-ups ("budget for each")
+    # go through the agent so intent is understood from conversation context.
+    prefer_agent_followup = (
+        _agent_enabled(components)
+        and bool(getattr(conversation_memory, "active_candidates", None) or [])
+        and is_group_attribute_question(question)
+    )
+    if not prefer_agent_followup:
+        shown_attr = _shown_attribute_response(
+            question, conversation_memory, timing_ms, ask_started, rag_chain
+        )
+        if shown_attr is not None:
+            return shown_attr
 
     agent_question = question
     if route.get("kind") == "show_more":
@@ -2351,11 +2981,50 @@ async def _prepare_acot_turn_inner(
                 f"{prior.rstrip('.?!')}. "
                 "Show additional options for the same request, not the same list again."
             )
-    agent_turn = await _try_agent_turn(
-        agent_question, components, timing_ms, ask_started
-    )
-    if agent_turn is not None:
-        return agent_turn
+    if not prefer_agent_followup:
+        project_detail = await asyncio.to_thread(
+            _project_detail_turn, question, conversation_memory
+        )
+        if project_detail is not None:
+            project_detail["timing_ms"] = timing_ms
+            project_detail["ask_started"] = ask_started
+            project_detail["rag_chain"] = rag_chain
+            project_detail["conversation_memory"] = conversation_memory
+            return project_detail
+        place_detail = await asyncio.to_thread(
+            _place_detail_turn, question, conversation_memory
+        )
+        if place_detail is not None:
+            place_detail["timing_ms"] = timing_ms
+            place_detail["ask_started"] = ask_started
+            place_detail["rag_chain"] = rag_chain
+            place_detail["conversation_memory"] = conversation_memory
+            return place_detail
+
+    # Already tried agent-first above when enabled; do not burn a second pass.
+    if not _agent_enabled(components):
+        agent_turn = await _try_agent_turn(
+            question, components, timing_ms, ask_started
+        )
+        if agent_turn is not None:
+            return agent_turn
+
+    # Agent unavailable: fall back to structured on-screen attribute answers.
+    if prefer_agent_followup:
+        shown_attr = _shown_attribute_response(
+            question, conversation_memory, timing_ms, ask_started, rag_chain
+        )
+        if shown_attr is not None:
+            return shown_attr
+        project_detail = await asyncio.to_thread(
+            _project_detail_turn, question, conversation_memory
+        )
+        if project_detail is not None:
+            project_detail["timing_ms"] = timing_ms
+            project_detail["ask_started"] = ask_started
+            project_detail["rag_chain"] = rag_chain
+            project_detail["conversation_memory"] = conversation_memory
+            return project_detail
 
     rewrite_started = time.perf_counter()
     question_for_search = prepare_user_question(agent_question) or agent_question
@@ -2639,7 +3308,13 @@ def _iter_typewriter_pieces(text):
             yield text
         return
 
-    group_size = 1 if len(tokens) <= 80 else max(1, len(tokens) // 40)
+    # Larger chunks: old 1-token pacing added seconds of sleep on project lists.
+    if len(tokens) <= 40:
+        group_size = 3
+    elif len(tokens) <= 120:
+        group_size = 6
+    else:
+        group_size = max(8, len(tokens) // 25)
     buffer = []
     for token in tokens:
         buffer.append(token)
@@ -2867,6 +3542,13 @@ def _followup_questions(prepared):
             and item.get("name")
         ]
     place = _followup_place(prepared)
+    ranked_areas = [
+        row
+        for row in (summary.get("community") or [])
+        if isinstance(row, dict)
+        and str(row.get("name") or "").strip()
+        and (row.get("signals") or row.get("ranking") or row.get("focus") in {"ranking", "investment"})
+    ]
 
     if listings or asks_for_listings(question):
         chips = _listing_followup_chips(place, listings)
@@ -2874,6 +3556,29 @@ def _followup_questions(prepared):
             chips = [chip for chip in chips if not _BROKER.search(chip)]
             return _unused_followups(prepared, chips)
         return _unused_followups(prepared, chips, pinned=chips[0] if chips else None)
+
+    if ranked_areas:
+        first = str(ranked_areas[0].get("name") or "").strip()
+        broker_chip = _broker_followup_chip(place=first)
+        chips = [broker_chip]
+        if len(projects) >= 2:
+            chips.extend(chip for topic, chip in _PROJECT_FOLLOWUPS if topic != "brokers")
+        elif len(projects) == 1:
+            name = projects[0].get("name") or "this project"
+            chips.extend([
+                _TRANSACTION_FOLLOWUP,
+                f"What is the starting price of {name}?",
+                f"What is the handover date of {name}?",
+            ])
+        else:
+            chips.extend([
+                f"Show me properties in {first}",
+                f"What are typical rents in {first}?",
+            ])
+        if broker_done:
+            chips = [chip for chip in chips if chip != broker_chip]
+            return _unused_followups(prepared, chips)
+        return _unused_followups(prepared, chips, pinned=broker_chip)
 
     if len(projects) == 1:
         name = projects[0].get("name") or "this project"
@@ -3057,6 +3762,11 @@ async def stream_acot(
 
     try:
         answer_started = time.perf_counter()
+        # Voice UX stays on "Thinking…" until the first speech event. For fast
+        # answers the spoken line is templated — push it before typewriter text.
+        if speech and prepared.get("use_fast"):
+            for event in spoken_so_far():
+                yield event
         if prepared["use_fast"]:
             answer = prepared["fast_answer"] or ""
             for piece in _iter_typewriter_pieces(answer):
@@ -3066,7 +3776,7 @@ async def stream_acot(
                 )
                 for event in spoken_so_far():
                     yield event
-                await asyncio.sleep(0.02)
+                await asyncio.sleep(0.004)
         else:
             parts = []
 
@@ -3097,7 +3807,7 @@ async def stream_acot(
             tail = f"\n\n{prepared['companion_suffix']}"
             for piece in _iter_typewriter_pieces(tail):
                 yield ("delta", {"type": "delta", "text": piece})
-                await asyncio.sleep(0.02)
+                await asyncio.sleep(0.004)
             answer = f"{answer}{tail}"
 
         followups = _followup_questions(prepared)

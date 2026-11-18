@@ -15,6 +15,9 @@ SALE = re.compile(
     r"roi|invest|investment|investing|yield|brochure|project|projects|completion date|for sale|resale|"
     r"mortgage|down ?payment|starting price)\b", re.I)
 FOLLOW_UP = re.compile(r"^(and|also|what about|how about|ok|okay|then|what if|any|show|only|cheaper|bigger|smaller)\b", re.I)
+_BROWSE_VERB = re.compile(r"\b(?:show|list|find|give me|looking for)\b", re.I)
+_RENT_BROWSE = re.compile(r"\b(?:for rent|to rent|rentals?|listings?)\b", re.I)
+_AGENT_RENT = re.compile(r"\b(?:compar\w*|vs\.?|versus|yield|roi|fair|this listing|this one)\b", re.I)
 
 
 def is_rent_question(question: str, last_turn_type: str | None = None) -> bool:
@@ -29,3 +32,13 @@ def is_rent_question(question: str, last_turn_type: str | None = None) -> bool:
         return False   # "buy or rent?", "rental yield for investors": the existing pipeline handles both sides
     # no clear signal: a short follow-up inside a rental conversation stays with the rental agent
     return last_turn_type == "listings" and (len(text.split()) <= 12 or bool(FOLLOW_UP.search(text))) and not sale
+
+
+def is_rent_browse(question: str) -> bool:
+    """True for 'show me 1 bedroom apartments for rent in X' — structured list, no LLM agent."""
+    text = (question or "").strip()
+    if not is_rent_question(text) or _AGENT_RENT.search(text):
+        return False
+    if not _BROWSE_VERB.search(text):
+        return False
+    return bool(_RENT_BROWSE.search(text) or re.search(r"\brent\b", text, re.I))

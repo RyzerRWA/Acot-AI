@@ -7,7 +7,7 @@ from threading import Lock
 
 from openai import AsyncOpenAI
 
-from app.core.config import AICREDITS_API_KEY, AICREDITS_BASE_URL
+from app.core.config import AICREDITS_API_KEY, AICREDITS_BASE_URL, llm_chat_extras
 from app.subscription.token_usage import (
     add_tokens,
     get_tokens,
@@ -44,7 +44,7 @@ class LLMQueueTimeoutError(RuntimeError):
 
 class AICreditsClient:
     """
-    ACOT LLM client using AICredits and openai/gpt-4o-mini.
+    ACOT LLM client using AICredits and openai/gpt-6-luna.
 
     AICredits is an OpenAI-compatible gateway:
         https://api.aicredits.in/v1
@@ -64,7 +64,7 @@ class AICreditsClient:
 
         self.model = os.getenv(
             "AICREDITS_MODEL",
-            "openai/gpt-4o-mini",
+            "openai/gpt-6-luna",
         )
 
         # One retry of the same model.
@@ -263,6 +263,7 @@ class AICreditsClient:
                 if max_output_tokens is not None
                 else self.max_output_tokens
             ),
+            **llm_chat_extras(model),
         )
 
         # -----------------------------------------------------
@@ -340,6 +341,7 @@ class AICreditsClient:
             stream_options={
                 "include_usage": True
             },
+            **llm_chat_extras(model),
         )
 
         if not stream:

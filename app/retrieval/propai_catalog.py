@@ -15,9 +15,25 @@ from datetime import datetime
 
 from app.database.postgres import fetch
 from app.listings.tools import ALIASES
+from app.retrieval.place_lock import (
+    asked_keys,
+    contains_place_sql,
+    drop_numbered_siblings,
+    is_numbered_sibling,
+    sales_place_sql,
+)
 from app.retrieval.propai_vector_search import search_places
 
 MIN_SCORE = 0.55
+DEFAULT_PROJECT_SORT = "latest_handover"
+_PROJECT_SORTS = {
+    "cheapest",
+    "priciest",
+    "earliest_handover",
+    "latest_handover",
+    "largest",
+    "more",
+}
 _FILLER = re.compile(
     r"\b(?:show|me|find|list|properties|property|projects|project|apartments|apartment|"
     r"villas|villa|available|please|what|which|are|is|there|in|at|the|a|an|for|of|with|"
@@ -82,27 +98,8 @@ def _photos(value) -> list[str]:
 
 
 def _attach_brochures(projects: list[dict]) -> None:
-    """Catalog rows have no brochures; the listings projects table does. Match by name ("Sobha One")."""
-    names = [str(project.get("name") or "").strip().lower() for project in projects if project.get("name")]
-    if not names:
-        return
-    try:
-        rows = fetch(
-            """
-            select distinct on (lower(btrim(name))) lower(btrim(name)) as name, brochure_url
-            from projects
-            where coalesce(brochure_url, '') <> '' and lower(btrim(name)) = any(%s)
-            order by lower(btrim(name)), id
-            """,
-            (names,),
-        )
-    except Exception:
-        return
-    found = {row["name"]: row["brochure_url"] for row in rows}
-    for project in projects:
-        url = found.get(str(project.get("name") or "").strip().lower())
-        if url and not project.get("brochure_url"):
-            project["brochure_url"] = url
+    """Do not copy brochure URLs from the old projects table."""
+    return
 
 
 def _attach_photos(projects: list[dict]) -> None:
@@ -203,7 +200,7 @@ def _projects_for(place: dict, limit: int = 8) -> list[dict]:
                      (payload->>'developer_name') is not null desc,
                      payload->>'project_name_en'
         ) unique_projects
-        order by name
+        order by handover desc nulls last, name
         limit %s
         """,
         (*clause_args, limit),
@@ -249,7 +246,8 @@ def _add_sale_facts(projects: list[dict]) -> None:
                 select upper(project_name_prop_ai) as name,
                        percentile_cont(0.5) within group (order by sale_price) as price,
                        min(bedrooms) filter (where bedrooms between 0 and 10) as bedroom_min,
-                       max(bedrooms) filter (where bedrooms between 0 and 10) as bedroom_max
+                       max(bedrooms) filter (where bedrooms between 0 and 10) as bedroom_max,
+                       max(instance_date) as last_sale
                 from propai_sales
                 where deleted_at is null and sale_price > 0
                   and instance_date >= current_date - interval '24 months'
@@ -272,6 +270,8 @@ def _add_sale_facts(projects: list[dict]) -> None:
             project["price"] = int(round(float(stat["price"])))
         project["bedroom_min"] = stat.get("bedroom_min")
         project["bedroom_max"] = stat.get("bedroom_max")
+        if stat.get("last_sale"):
+            project["last_sale"] = stat["last_sale"]
 
 
 def lookup(question: str) -> dict | None:
@@ -349,22 +349,34 @@ def _official_areas(values) -> list[str]:
     names = _expanded(values)
     if not names:
         return []
-    likes = _likes(names)
+    clause, extra = contains_place_sql(["label", "area", "master"], names)
     try:
         rows = fetch(
-            """
-            select distinct upper(area) as area
+            f"""
+            select distinct upper(area) as area, label, master
             from propai_places
             where level in ('area', 'master')
               and area is not null
-              and (label ilike any(%s::text[]) or area ilike any(%s::text[]) or master ilike any(%s::text[]))
+              and {clause}
             """,
-            (likes, likes, likes),
+            tuple(extra),
         )
     except Exception:
-        return [name.upper() for name in names]
-    found = [row["area"] for row in rows if row.get("area")]
-    return found or [name.upper() for name in names]
+        return asked_keys(names)
+    found = []
+    for row in rows or []:
+        area = row.get("area")
+        if not area:
+            continue
+        if any(
+            is_numbered_sibling(name, str(row.get("label") or ""))
+            or is_numbered_sibling(name, str(row.get("master") or ""))
+            for name in names
+        ):
+            continue
+        if area not in found:
+            found.append(area)
+    return found or asked_keys(names)
 
 
 _PLACE_LABELS: list[str] | None = None
@@ -387,9 +399,154 @@ def place_named(text: str) -> str | None:
     return None
 
 
-def agent_projects(filters: dict, limit: int = 8, sort: str = "cheapest") -> tuple[list[dict], int]:
+def _stamp_value(value) -> float:
+    parsed = value if hasattr(value, "timestamp") else _handover(value)
+    if parsed is None:
+        return -1.0
+    try:
+        return float(parsed.timestamp())
+    except (OSError, OverflowError, ValueError, TypeError):
+        return -1.0
+
+
+def _project_sort_key(project: dict, sort: str):
+    price = project.get("price") or 0
+    handover = project.get("handover_time")
+    if sort == "priciest":
+        return (price <= 0, -(price or 0))
+    if sort == "earliest_handover":
+        return (handover is None, handover or datetime(2099, 12, 31))
+    if sort == "latest_handover":
+        return (handover is None, -_stamp_value(handover))
+    if sort == "largest":
+        size = project.get("size_max") or project.get("size_min") or 0
+        return (size <= 0, -(size or 0))
+    return (price <= 0, price or 10**18)
+
+
+def _recent_best_key(project: dict) -> tuple:
+    """Newest handover first, then latest recorded sale, then activity."""
+    sales = 0.0
+    try:
+        sales = float(project.get("sales_count") or 0)
+    except (TypeError, ValueError):
+        sales = 0.0
+    has_price = 1.0 if (project.get("price") or 0) > 0 else 0.0
+    return (
+        _stamp_value(project.get("handover_time") or project.get("handover")),
+        _stamp_value(project.get("last_sale") or project.get("last_sold_on")),
+        sales,
+        has_price,
+    )
+
+
+def _more_mix(projects: list[dict], limit: int, rng=None) -> list[dict]:
+    """Half the strongest remaining projects, half a random sample of the rest."""
+    if len(projects) <= limit:
+        return list(projects)
+    rng = rng or random
+    ranked = sorted(projects, key=_recent_best_key, reverse=True)
+    best_n = max(1, (limit + 1) // 2)
+    best = ranked[:best_n]
+    rest = ranked[best_n:]
+    rng.shuffle(rest)
+    randoms = rest[: max(0, limit - len(best))]
+    mixed = []
+    extra = list(randoms)
+    for item in best:
+        mixed.append(item)
+        if extra:
+            mixed.append(extra.pop(0))
+    mixed.extend(extra)
+    return mixed[:limit]
+
+
+def _bedroom_fit_key(project: dict, wanted: int) -> tuple:
+    """Prefer exact / narrow bedroom ranges that include the requested count."""
+    lo = project.get("bedroom_min")
+    hi = project.get("bedroom_max")
+    if lo is None:
+        return (9, 99.0, 99.0)
+    try:
+        lo_f = float(lo)
+        hi_f = float(hi) if hi is not None else lo_f
+    except (TypeError, ValueError):
+        return (9, 99.0, 99.0)
+    exact = 0 if lo_f == hi_f == float(wanted) else 1
+    span = hi_f - lo_f
+    center = abs((lo_f + hi_f) / 2.0 - float(wanted))
+    return (exact, span, center)
+
+
+def _order_projects(
+    projects: list[dict],
+    sort: str,
+    limit: int,
+    skip_names=None,
+    rng=None,
+    prefer_bedrooms=None,
+) -> list[dict]:
+    skip = {
+        str(name).strip().lower()
+        for name in (skip_names or [])
+        if str(name or "").strip()
+    }
+    remaining = [
+        project for project in projects
+        if str(project.get("name") or "").strip().lower() not in skip
+    ]
+    if prefer_bedrooms is not None:
+        wanted = int(prefer_bedrooms)
+        if sort == "more":
+            remaining.sort(key=lambda project: _bedroom_fit_key(project, wanted))
+            return _more_mix(remaining, limit, rng=rng)
+        remaining.sort(
+            key=lambda project: (
+                _bedroom_fit_key(project, wanted),
+                _project_sort_key(project, sort),
+            )
+        )
+        return remaining[:limit]
+    if sort == "more":
+        return _more_mix(remaining, limit, rng=rng)
+    remaining.sort(key=lambda project: _project_sort_key(project, sort))
+    return remaining[:limit]
+
+
+_APARTMENT_TYPES = {
+    "apartment", "apartments", "flat", "flats", "unit", "units",
+}
+
+
+def _propai_rejects_filters(filters: dict) -> bool:
+    """True when a filter has no column on Prop-AI project rows.
+
+    Apartment is the default residential stock here, so that type is not a
+    reject. Villa / townhouse / size still fall through to the older table.
+    """
+    if filters.get("min_size") or filters.get("max_size"):
+        return True
+    types = [
+        str(item).strip().lower()
+        for item in (filters.get("property_types") or [])
+        if str(item).strip()
+    ]
+    if not types:
+        return False
+    return any(
+        item not in _APARTMENT_TYPES and item.rstrip("s") not in {"apartment", "flat", "unit"}
+        for item in types
+    )
+
+
+def agent_projects(
+    filters: dict,
+    limit: int = 8,
+    sort: str = DEFAULT_PROJECT_SORT,
+    skip_names=None,
+) -> tuple[list[dict], int]:
     """New-data projects in the old project-row shape. Empty when a filter the new rows cannot answer is set."""
-    if filters.get("min_size") or filters.get("max_size") or filters.get("property_types"):
+    if _propai_rejects_filters(filters):
         return [], 0
     parts, params = ["coalesce(name, '') <> ''"], []
     if filters.get("key"):
@@ -397,9 +554,9 @@ def agent_projects(filters: dict, limit: int = 8, sort: str = "cheapest") -> tup
         params.append(filters["key"])
     communities = _expanded(filters.get("communities"))
     if communities:
-        likes = _likes(communities)
-        parts.append("(master_project ilike any(%s::text[]) or area ilike any(%s::text[]) or name ilike any(%s::text[]))")
-        params += [likes, likes, likes]
+        clause, extra = contains_place_sql(["master_project", "area", "name"], communities)
+        parts.append(clause)
+        params.extend(extra)
     developers = [str(name).strip() for name in (filters.get("developers") or []) if str(name).strip()]
     if developers:
         parts.append("developer ilike any(%s::text[])")
@@ -413,11 +570,16 @@ def agent_projects(filters: dict, limit: int = 8, sort: str = "cheapest") -> tup
         parts.append("extract(year from end_date) = %s")
         params.append(int(filters["handover_year"]))
     where = " and ".join(parts)
-    ranked = (
-        "lower(name) = lower(%s) desc, length(name), name"
-        if name else
-        "name"
-    )
+    if sort not in _PROJECT_SORTS:
+        sort = DEFAULT_PROJECT_SORT
+    if name:
+        ranked = "lower(name) = lower(%s) desc, length(name), name"
+    elif sort in {"latest_handover", "more"}:
+        ranked = "end_date desc nulls last, name"
+    elif sort == "earliest_handover":
+        ranked = "end_date asc nulls last, name"
+    else:
+        ranked = "name"
     # Cap candidates before sale stats; ranking still uses the same pool size as before.
     fetch_limit = 200
     query_params = [*params, name] if name else list(params)
@@ -473,6 +635,9 @@ def agent_projects(filters: dict, limit: int = 8, sort: str = "cheapest") -> tup
             "brochure_url": None,
         })
     _add_sale_facts(projects)
+    if communities:
+        projects = drop_numbered_siblings(projects, communities)
+        total = len(projects)
     bedrooms = filters.get("bedrooms")
     if bedrooms is not None:
         wanted = int(bedrooms)
@@ -497,28 +662,13 @@ def agent_projects(filters: dict, limit: int = 8, sort: str = "cheapest") -> tup
             if project.get(key) is not None:
                 project[key] = int(float(project[key]))
 
-    def rank(project):
-        price = project.get("price") or 0
-        handover = project.get("handover_time")
-        if sort == "priciest":
-            return (price <= 0, -(price or 0))
-        if sort == "earliest_handover":
-            return (handover is None, handover or datetime(2099, 12, 31))
-        if sort == "latest_handover":
-            return (handover is None, handover or datetime(1970, 1, 1))
-        return (price <= 0, price or 10**18)
-
-    if sort == "latest_handover":
-        projects.sort(
-            key=lambda project: (
-                project.get("handover_time") is not None,
-                project.get("handover_time") or datetime(1970, 1, 1),
-            ),
-            reverse=True,
-        )
-    else:
-        projects.sort(key=rank)
-    projects = projects[:limit]
+    projects = _order_projects(
+        projects,
+        sort,
+        limit,
+        skip_names=skip_names,
+        prefer_bedrooms=filters.get("bedrooms"),
+    )
     _attach_photos(projects)
     _attach_brochures(projects)
     for project in projects:
@@ -585,7 +735,7 @@ def recent_sales(name, limit: int = 8, per_project: int = 5, offset: int = 0) ->
     return {"count": len(sales), "sales": sales}
 
 
-def latest_sales(place=None, limit: int = 8, offset: int = 0) -> dict:
+def latest_sales(place=None, limit: int = 8, offset: int = 0, bedrooms=None) -> dict:
     """Newest recorded sales, optionally limited to one Dubai area or project name."""
     cap = max(1, min(int(limit or 8), 15))
     start = max(0, int(offset or 0))
@@ -599,13 +749,18 @@ def latest_sales(place=None, limit: int = 8, offset: int = 0) -> dict:
     params: list = []
     text = str(place or "").strip()
     if text:
-        likes = _likes(_expanded([text]))
-        parts.append(
-            "(area_name_prop_ai ilike any(%s::text[]) "
-            "or master_project_prop_ai ilike any(%s::text[]) "
-            "or project_name_prop_ai ilike any(%s::text[]))"
+        clause, extra = contains_place_sql(
+            ["area_name_prop_ai", "master_project_prop_ai", "project_name_prop_ai"],
+            _expanded([text]),
         )
-        params.extend([likes, likes, likes])
+        parts.append(clause)
+        params.extend(extra)
+    if bedrooms is not None and bedrooms != "":
+        try:
+            parts.append("bedrooms = %s")
+            params.append(int(float(bedrooms)))
+        except (OverflowError, TypeError, ValueError):
+            pass
     rows = fetch(
         f"""
         select project_name_prop_ai as project,
@@ -655,16 +810,17 @@ def agent_by_id(agent_id: str) -> dict | None:
 
 def rent_summary(areas, beds_min=None, beds_max=None) -> dict | None:
     """Median registered rent for a place. None when the question did not name a place."""
-    official = _official_areas(areas)
-    if not official:
+    asked = _expanded(areas)
+    if not asked:
         return None
+    lock, lock_params = sales_place_sql(asked, _official_areas(asked))
     clauses = [
         "deleted_at is null",
         "annual_amount > 0",
         "contract_start_date >= date '2025-09-01'",
-        "(upper(area_name_prop_ai) = any(%s) or upper(master_project_prop_ai) = any(%s))",
+        lock,
     ]
-    params: list = [official, official]
+    params: list = list(lock_params)
     if beds_min is not None:
         clauses.append("bedrooms >= %s")
         params.append(beds_min)
@@ -1036,30 +1192,32 @@ def list_brokers(name=None, brn=None, limit: int = 8, place=None, band=None) -> 
 
 def sale_summary(communities) -> dict | None:
     """Project count and median recent sale for a place in the new data."""
-    official = _official_areas(communities)
-    names = list(dict.fromkeys(official + [name.upper() for name in _expanded(communities)]))
-    if not names:
+    asked = _expanded(communities)
+    if not asked:
         return None
+    official = _official_areas(asked)
+    project_lock, project_params = contains_place_sql(["master_project", "area", "name"], asked)
+    sales_lock, sales_params = sales_place_sql(asked, official)
     try:
         projects = fetch(
-            """
+            f"""
             select count(*)::int as n
             from propai_projects
             where coalesce(name, '') <> ''
-              and (upper(master_project) = any(%s) or upper(area) = any(%s))
+              and {project_lock}
             """,
-            (names, names),
+            tuple(project_params),
         )[0]["n"]
         sales = fetch(
-            """
+            f"""
             select count(*)::int as n,
                    percentile_cont(0.5) within group (order by sale_price)::bigint as median
             from propai_sales
             where deleted_at is null and sale_price > 0
               and instance_date >= current_date - interval '24 months'
-              and (upper(area_name_prop_ai) = any(%s) or upper(master_project_prop_ai) = any(%s))
+              and {sales_lock}
             """,
-            (names, names),
+            tuple(sales_params),
         )[0]
     except Exception:
         return None

@@ -196,7 +196,18 @@ class EntityResolver:
     ) -> List[Dict[str, Any]]:
 
         return fetch(
-            f"select {self.COMMUNITY_FIELDS} from communities limit 1000"
+            """
+            select label as id, null::text as slug, label as name, 'Dubai' as city
+            from propai_places
+            where level in ('area', 'master') and coalesce(label, '') <> ''
+            union
+            select distinct coalesce(nullif(btrim(master_project), ''), area) as id,
+                   null::text as slug,
+                   coalesce(nullif(btrim(master_project), ''), area) as name,
+                   'Dubai' as city
+            from propai_projects
+            where coalesce(nullif(btrim(master_project), ''), area) <> ''
+            """
         )
 
     # ========================================================
@@ -208,7 +219,22 @@ class EntityResolver:
     ) -> List[Dict[str, Any]]:
 
         return fetch(
-            f"select {self.PROJECT_FIELDS} from projects limit 2000"
+            """
+            select key as id,
+                   null::text as slug,
+                   name,
+                   developer as developer_name,
+                   'Dubai' as city,
+                   coalesce(nullif(btrim(master_project), ''), area) as community,
+                   area as sub_community,
+                   null::float as price,
+                   null::int as bedroom_min,
+                   null::int as bedroom_max,
+                   null as property_types
+            from propai_projects
+            where coalesce(name, '') <> ''
+            limit 2000
+            """
         )
 
     def _catalog(self):
@@ -256,8 +282,18 @@ class EntityResolver:
         if q == n:
             return 1.0
 
-        # Name contained inside query
+        # Name contained inside query. A short prefix such as "Dubai Land"
+        # inside "Dubai Land Residence Complex" is not the entity.
         if n in q:
+            leftover = f" {q.replace(n, ' ', 1)} "
+            leftover_tokens = {
+                token
+                for token in leftover.split()
+                if token and token not in cls.STOP_WORDS
+            }
+            if leftover_tokens:
+                ratio = len(n) / max(len(q), 1)
+                return min(0.55 + 0.35 * ratio, 0.88)
             return 0.96
 
         q_tokens = cls.token_set(
@@ -653,6 +689,11 @@ class EntityResolver:
                     )
 
             if best_score >= 0.70:
+                if self._community_is_suffix_of_longer_name(
+                    matched_phrase or "",
+                    name,
+                ):
+                    continue
 
                 matches.append(
                     {
@@ -809,6 +850,65 @@ class EntityResolver:
         matches.sort(key=lambda x: x["score"], reverse=True)
         return matches[0] if matches else None
 
+    _PLACE_BROWSE = re.compile(
+        r"\b(?:projects?|propert(?:y|ies)|apartments?|villas?|homes?)\s+"
+        r"(?:in|at|near)\s+",
+        re.I,
+    )
+
+    @classmethod
+    def _community_is_suffix_of_longer_name(cls, phrase: str, community_name: str) -> bool:
+        """True when 'THE GARDENS' is only the tail of 'Empire Gardens'."""
+        query = cls.normalize(phrase)
+        name = cls.normalize(community_name)
+        if not query or not name:
+            return False
+        if re.search(rf"(?:^| ){re.escape(name)}(?: |$)", f" {query} "):
+            return False
+        tokens = [token for token in name.split() if token not in cls.STOP_WORDS]
+        if not tokens:
+            return False
+        last = tokens[-1]
+        match = re.search(
+            rf"((?:[a-z0-9]+ )+){re.escape(last)}(?: |$)",
+            f" {query} ",
+        )
+        if not match:
+            return False
+        prefix = [
+            token
+            for token in match.group(1).split()
+            if token and token not in cls.STOP_WORDS
+        ]
+        extra = [token for token in prefix if token not in tokens]
+        return bool(extra)
+
+    @classmethod
+    def _prefer_community(
+        cls,
+        question: str,
+        project_match: Optional[Dict[str, Any]],
+        community_match: Optional[Dict[str, Any]],
+    ) -> bool:
+        """Place browse must not lock onto a shorter project inside the place name."""
+        if not project_match or not community_match:
+            return False
+        project_name = cls.normalize(project_match.get("name") or "")
+        community_name = cls.normalize(community_match.get("name") or "")
+        if not project_name:
+            return False
+        if project_name == community_name:
+            return bool(cls._PLACE_BROWSE.search(question or ""))
+        prefix = project_name in community_name or (
+            project_name in cls.normalize(question or "")
+            and len(project_name) < len(community_name)
+        )
+        if not prefix:
+            return False
+        if cls._PLACE_BROWSE.search(question or ""):
+            return True
+        return community_match.get("score", 0) >= project_match.get("score", 0)
+
     # ========================================================
     # MAIN RESOLUTION
     # ========================================================
@@ -872,19 +972,23 @@ class EntityResolver:
         # 1. PROJECT
         # ====================================================
 
-        if entity_type in (
-            None,
-            "project"
-        ):
-
-            project_match = (
-                self._resolve_project(
-                    unique_phrases,
-                    projects
-                )
+        project_match = None
+        community_match = None
+        if entity_type in (None, "project"):
+            project_match = self._resolve_project(
+                unique_phrases,
+                projects,
             )
+        if entity_type in (None, "community") or self._PLACE_BROWSE.search(question or ""):
+            community_match = self._resolve_community(
+                unique_phrases,
+                communities,
+            )
+        if self._prefer_community(question, project_match, community_match):
+            project_match = None
+            entity_type = "community"
 
-            if project_match:
+        if project_match:
 
                 record = (
                     project_match["record"]
@@ -986,6 +1090,25 @@ class EntityResolver:
                     question,
                 )
             )
+
+            if sub_match:
+                # "Dubai Marina" is the community. A longer name such as
+                # "Dubai Marina Mall" must not win unless the user said it.
+                community_match = self._resolve_community(
+                    unique_phrases,
+                    communities,
+                )
+                sub_name = self.normalize(sub_match.get("name") or "")
+                phrase = self.normalize(sub_match.get("matched_phrase") or "")
+                asked_sub = bool(sub_name) and sub_name in self.normalize(question or "")
+                if (
+                    community_match
+                    and community_match.get("score", 0) >= 0.99
+                    and phrase
+                    and phrase != sub_name
+                    and not asked_sub
+                ):
+                    sub_match = None
 
             if sub_match:
 
