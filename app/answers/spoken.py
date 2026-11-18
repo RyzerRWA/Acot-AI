@@ -234,9 +234,110 @@ class SpokenReply:
         self._task.cancel()
 
 
+def _aed_spoken(value):
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return None
+    if amount >= 1_000_000:
+        return f"about {amount / 1_000_000:.1f}".rstrip("0").rstrip(".") + " million dirhams"
+    if amount >= 1_000:
+        return f"about {int(round(amount / 1_000))} thousand dirhams"
+    return f"about {int(round(amount))} dirhams"
+
+
+def template_spoken_reply(question, prepared, language=None):
+    """Instant English spoken line for SQL/fast answers — no second model call.
+
+    Voice mode was waiting on a spoken LLM after the screen answer was already
+    ready. Project browses and other templated answers can be spoken from the
+    same facts without that delay. Hindi still uses the model.
+    """
+    if language == "hi":
+        return None
+    if prepared.get("small_talk") and prepared.get("fast_answer"):
+        return str(prepared["fast_answer"]).strip() or None
+    if not prepared.get("use_fast"):
+        return None
+
+    summary = prepared.get("structured_summary") or {}
+    projects = [
+        item for item in (summary.get("projects") or [])
+        if isinstance(item, dict) and _record_name(item)
+    ]
+    brokers = [
+        item for item in (summary.get("brokers") or [])
+        if isinstance(item, dict) and _record_name(item)
+    ]
+    communities = [
+        item for item in (summary.get("community") or [])
+        if isinstance(item, dict) and _record_name(item)
+    ]
+
+    if projects:
+        total = summary.get("project_total") or len(projects)
+        try:
+            total = int(total)
+        except (TypeError, ValueError):
+            total = len(projects)
+        place = str(summary.get("catalog_place") or "").strip()
+        where = f" in {place}" if place else ""
+        names = [_record_name(item) for item in projects[:3]]
+        if len(names) == 1:
+            named = f" Including {names[0]}."
+        elif len(names) == 2:
+            named = f" Including {names[0]} and {names[1]}."
+        else:
+            named = f" Including {names[0]}, {names[1]}, and {names[2]}."
+        beds = None
+        match = re.search(r"\b(\d+)\s*-?\s*bedroom", str(question or ""), re.I)
+        if match:
+            beds = match.group(1)
+        bed_bit = f" with {beds}-bedroom options" if beds else ""
+        price = None
+        for item in projects:
+            price = _aed_spoken(item.get("price") or item.get("starting_price_aed"))
+            if price:
+                break
+        price_bit = f" Recent sale prices start around {price}." if price else ""
+        return (
+            f"I found {total} projects{where}{bed_bit}. "
+            f"I've put the top ones on your screen.{named}{price_bit} "
+            "Want details on any of them?"
+        )
+
+    if brokers:
+        names = [_record_name(item) for item in brokers[:3]]
+        named = ", ".join(names[:-1]) + (f" and {names[-1]}" if len(names) > 1 else names[0])
+        return (
+            f"I found {len(brokers)} licensed agents for that. "
+            f"I've put them on your screen, including {named}."
+        )
+
+    if communities and not projects:
+        total = summary.get("community_total") or len(communities)
+        names = [_record_name(item) for item in communities[:3]]
+        named = ", ".join(names)
+        return (
+            f"I found {total} communities. "
+            f"I've put some on your screen, including {named}."
+        )
+
+    answer = str(prepared.get("fast_answer") or "").strip()
+    if not answer:
+        return None
+    # Short template answers (comparisons, single facts): speak a cleaned version.
+    plain = re.sub(r"[*_`#]+", "", answer)
+    plain = re.sub(r"\s+", " ", plain).strip()
+    if len(plain) <= 320:
+        return plain
+    return plain[:300].rsplit(" ", 1)[0] + ". The full details are on your screen."
+
+
 def start_spoken_reply(llm, question, prepared, user_name=None, language=None):
-    # Greetings and small talk already have a short friendly English answer; say it as is,
-    # unless Hindi was picked, then the model says it in Hindi.
-    if prepared.get("small_talk") and prepared.get("fast_answer") and language != "hi":
-        return SpokenReply(_fixed(prepared["fast_answer"]))
+    # Fast English answers speak from a template so voice mode isn't blocked on a
+    # second model call. Hindi (and messy non-fast turns) still use the LLM.
+    templated = template_spoken_reply(question, prepared, language=language)
+    if templated:
+        return SpokenReply(_fixed(templated))
     return SpokenReply(stream_spoken_reply(llm, question, prepared, user_name, language))

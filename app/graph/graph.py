@@ -150,6 +150,30 @@ def build_agent_graph(
     def tools_node(state: AgentState) -> dict:
         messages, seen, used = list(state["messages"]), dict(state.get("seen", {})), list(state.get("used", []))
         calls = list(state["calls"] or [])
+        # One successful search_projects is enough; a second call was burning ~10s+.
+        already_searched = any(
+            item.get("name") == "search_projects" and item.get("ok")
+            for item in used
+        )
+        if already_searched:
+            kept = []
+            for item in calls:
+                call_id, name, arguments = item
+                if name == "search_projects":
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": json.dumps({
+                            "note": (
+                                "search_projects already ran this turn with matches. "
+                                "List those projects now. Do not search again."
+                            ),
+                        }),
+                    })
+                    used.append({"name": name, "ok": True})
+                    continue
+                kept.append(item)
+            calls = kept
         prior = dict(state.get("tool_cache") or {})
         first_id = {}
         unique = []

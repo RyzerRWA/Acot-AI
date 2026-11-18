@@ -521,6 +521,7 @@ def test_greeting_variants_are_small_talk():
         "Good morning!", "good morning acot", "Good morning sir", "Morning",
         "gm", "good mornin", "Good afternoon everyone", "how are you",
         "Assalamu alaikum", "good morning, how are you",
+        "Hello. So, uh,", "hi there uh",
     ):
         assert _classify_small_talk(text) == "greeting", text
     assert _classify_small_talk("good night") == "bye"
@@ -529,6 +530,26 @@ def test_greeting_variants_are_small_talk():
         "how much is a 2 bedroom", "morning view apartments",
     ):
         assert _classify_small_talk(text) is None, text
+
+
+def test_general_plan_skips_documents_without_brochure_terms():
+    plan = _planner()._rule_plan("Hello. So, uh,")
+    assert plan.intent == "general"
+    assert plan.needs_documents is False
+    assert QueryPlanner._is_simple_structured_plan(plan) is True
+
+
+def test_sql_project_browse_turn_returns_fast_answer():
+    from run import _sql_project_browse_turn
+
+    out = _sql_project_browse_turn(
+        "Show me projects in Jumeirah Village Circle.",
+        None,
+    )
+    assert out is not None
+    assert out["use_fast"] is True
+    assert "I found" in (out["fast_answer"] or "")
+    assert out["structured_summary"]["projects"]
 
 
 def test_greeting_uses_the_account_name():

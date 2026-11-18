@@ -355,12 +355,14 @@ class QueryPlanner:
             )
 
         else:
-            # General real-estate questions should still enter the intelligence
-            # pipeline rather than falling directly into free-form generation.
+            # General leftovers (unclear / greeting-ish) must not force brochure
+            # RAG + LLM planning — that was adding multi-second latency for "hi".
             plan.intent = "general"
             plan.operations.append("retrieve_and_answer")
             plan.needs_structured_data = True
-            plan.needs_documents = True
+            plan.needs_documents = self._contains_any(
+                q_lower, self.DOCUMENT_TERMS
+            )
             plan.reasoning.append(
                 "No narrow intent was detected; use grounded retrieval before generating an answer."
             )
@@ -428,11 +430,19 @@ class QueryPlanner:
         }:
             # A price or bedroom follow-up only needs the structured rows.
             # Document intent, and information questions that are not field
-            # lookups, still search brochures.
-            if (
+            # lookups, still search brochures. Bare "general" stays SQL/fast
+            # unless the user asked for brochure/document content.
+            if plan.intent == "document":
+                plan.needs_documents = True
+            elif (
                 plan.intent == "information"
                 and self._is_attribute_question(q_lower)
             ):
+                plan.needs_documents = self._contains_any(
+                    q_lower,
+                    self.DOCUMENT_TERMS,
+                )
+            elif plan.intent == "general":
                 plan.needs_documents = self._contains_any(
                     q_lower,
                     self.DOCUMENT_TERMS,

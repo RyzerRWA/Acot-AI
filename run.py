@@ -26,6 +26,7 @@ from app.answers.intent_route import (
     parse_bedrooms,
     prior_anchor_question,
     reuse_last_search,
+    wants_more_results,
 )
 from app.listings.agent import EARLIER_NAME, ListingAgent, ListingsUnavailable, _ID_TAG as _AGENT_TAG
 from app.llm.client import LLMQueueTimeoutError
@@ -649,7 +650,18 @@ _SMALL_TALK_FILLER = {
     "to", "meet", "see", "later", "take", "care", "and", "i", "am",
     "fine", "well", "great", "mornin", "alaikum", "alaykum", "aleikum",
     "wa", "everybody", "folks", "guys",
+    # Spoken false starts must stay small-talk, not full hybrid RAG.
+    "uh", "um", "erm", "ah", "oh", "hmm", "hmmm", "like", "just",
+    "please", "can", "could", "would", "will", "me", "my", "name",
+    "is", "this", "that", "here", "okay", "ok", "yeah", "yep", "yes",
 }
+_SMALL_TALK_REAL_ASK = re.compile(
+    r"\b(?:show|find|list|search|projects?|propert(?:y|ies)|apartments?|"
+    r"villas?|townhouses?|listings?|agents?|brokers?|price|prices|budget|"
+    r"bedrooms?|handover|invest|buy|rent|compare|rera|escrow|marina|jvc|"
+    r"jlt|downtown|palm|bay)\b",
+    re.I,
+)
 
 
 _TRANSACTION = re.compile(
@@ -1581,6 +1593,96 @@ def _place_detail_turn(question, conversation_memory=None):
     }
 
 
+def _sql_project_browse_turn(question, conversation_memory=None):
+    """Clear community project browse via Prop-AI SQL only — no rewrite/plan/agent.
+
+    "Show me projects in JVC" and "2 bedroom apartments in Marina" were still
+    paying hybrid planner / rewrite latency even though the answer is SQL.
+    """
+    text = question or ""
+    if not re.search(
+        r"\b(?:show|find|list|projects?|propert(?:y|ies)|apartments?|villas?|"
+        r"townhouses?|flats?)\b",
+        text,
+        re.I,
+    ):
+        return None
+    if re.search(
+        r"\b(?:agents?|brokers?|compare|versus|\bvs\b|brochure|floor ?plans?|"
+        r"invest(?:ment|ing)?|yield|roi)\b",
+        text,
+        re.I,
+    ):
+        return None
+    if is_incomplete_home_browse(text):
+        return None
+    if asks_for_listings(text):
+        return None
+
+    place = extract_place(text)
+    if not place:
+        return None
+
+    from app.retrieval.propai_catalog import agent_projects, resolve_dubai_place
+
+    try:
+        resolved = resolve_dubai_place(place) or place
+    except Exception:
+        resolved = place
+    beds = parse_bedrooms(text)
+    payload = {"communities": [resolved]}
+    if beds:
+        payload["bedrooms"] = beds[0]
+
+    skip = []
+    if wants_more_results(text):
+        items = getattr(conversation_memory, "active_candidates", None) or []
+        skip = [
+            str(item.get("name") or "").strip()
+            for item in items
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        ]
+
+    try:
+        rows, total = agent_projects(
+            payload,
+            limit=10,
+            sort="more" if skip else "latest_handover",
+            skip_names=skip or None,
+        )
+    except Exception as exc:
+        print(f"SQL project browse unavailable: {exc}")
+        return None
+    if not rows:
+        return None
+
+    summary = _empty_structured_summary()
+    summary["projects"] = rows
+    summary["project_total"] = total or len(rows)
+    summary["catalog_place"] = str(resolved).strip()
+    return {
+        "question": question,
+        "standalone_question": question,
+        "question_type": "search",
+        "structured_summary": summary,
+        "documents": [],
+        "investment_analysis": None,
+        "retrieval_result": {
+            "question_type": "search",
+            "structured_data": {
+                "community": [],
+                "projects": rows,
+                "sub_communities": [],
+            },
+            "documents": [],
+        },
+        "use_fast": True,
+        "fast_answer": _build_fast_structured_answer(question, summary),
+        "context": None,
+        "small_talk": None,
+    }
+
+
 def _community_list_turn(question):
     text = question or ""
     if not _COMMUNITY_LIST.search(text) or _COMMUNITY_NARROWED.search(text):
@@ -2046,7 +2148,11 @@ def _classify_small_talk(question):
         return "ack"
     for pattern, lead_kind in _SMALL_TALK_LEADS:
         if pattern.match(words[0]):
-            if all(word in _SMALL_TALK_FILLER for word in words[1:]):
+            rest = words[1:]
+            if all(word in _SMALL_TALK_FILLER for word in rest):
+                return lead_kind
+            # "Hello. So, uh," / "hi there please" with no real ask → greeting.
+            if len(words) <= 8 and not _SMALL_TALK_REAL_ASK.search(joined):
                 return lead_kind
             return None
     return None
@@ -2654,6 +2760,18 @@ async def _prepare_acot_turn_inner(
         if agent_first is not None:
             return agent_first
 
+    # Clear Prop-AI place browses: SQL + template only (skip rewrite/plan/RAG).
+    if _propai_sql_browse(question, conversation_memory):
+        sql_browse = await asyncio.to_thread(
+            _sql_project_browse_turn, question, conversation_memory
+        )
+        if sql_browse is not None:
+            sql_browse["timing_ms"] = timing_ms
+            sql_browse["ask_started"] = ask_started
+            sql_browse["rag_chain"] = rag_chain
+            sql_browse["conversation_memory"] = conversation_memory
+            return sql_browse
+
     # "Compare Dubai Marina and Business Bay": a table built from the database, no model call.
     areas = None
     try:
@@ -3190,7 +3308,13 @@ def _iter_typewriter_pieces(text):
             yield text
         return
 
-    group_size = 1 if len(tokens) <= 80 else max(1, len(tokens) // 40)
+    # Larger chunks: old 1-token pacing added seconds of sleep on project lists.
+    if len(tokens) <= 40:
+        group_size = 3
+    elif len(tokens) <= 120:
+        group_size = 6
+    else:
+        group_size = max(8, len(tokens) // 25)
     buffer = []
     for token in tokens:
         buffer.append(token)
@@ -3638,6 +3762,11 @@ async def stream_acot(
 
     try:
         answer_started = time.perf_counter()
+        # Voice UX stays on "Thinking…" until the first speech event. For fast
+        # answers the spoken line is templated — push it before typewriter text.
+        if speech and prepared.get("use_fast"):
+            for event in spoken_so_far():
+                yield event
         if prepared["use_fast"]:
             answer = prepared["fast_answer"] or ""
             for piece in _iter_typewriter_pieces(answer):
@@ -3647,7 +3776,7 @@ async def stream_acot(
                 )
                 for event in spoken_so_far():
                     yield event
-                await asyncio.sleep(0.02)
+                await asyncio.sleep(0.004)
         else:
             parts = []
 
@@ -3678,7 +3807,7 @@ async def stream_acot(
             tail = f"\n\n{prepared['companion_suffix']}"
             for piece in _iter_typewriter_pieces(tail):
                 yield ("delta", {"type": "delta", "text": piece})
-                await asyncio.sleep(0.02)
+                await asyncio.sleep(0.004)
             answer = f"{answer}{tail}"
 
         followups = _followup_questions(prepared)
