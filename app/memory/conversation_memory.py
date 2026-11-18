@@ -314,6 +314,11 @@ class ConversationMemory:
         if not question:
             return False
 
+        from app.answers.intent_route import is_show_more
+
+        if is_show_more(question):
+            return True
+
         q_lower = question.lower()
 
         # ---------------------------------------------------------
@@ -1214,7 +1219,19 @@ Rules:
 
         size = item.get("size_sqft")
         if isinstance(size, dict):
-            size = size.get("min")
+            size = size.get("min") if size.get("min") is not None else size.get("max")
+
+        baths = item.get("baths")
+        if baths is None:
+            baths = item.get("bathrooms")
+
+        property_type = item.get("property_type")
+        if not property_type:
+            types = item.get("property_types") or []
+            if isinstance(types, str):
+                property_type = types
+            elif isinstance(types, list):
+                property_type = next((value for value in types if value), None)
 
         cover = item.get("cover_photo")
         photos = item.get("photos")
@@ -1233,11 +1250,13 @@ Rules:
             ),
             "rent_frequency": item.get("rent_frequency"),
             "beds": beds,
-            "property_type": item.get("property_type"),
+            "baths": baths,
+            "property_type": property_type,
             "size_sqft": size,
             "cover_photo": cover,
             "url": item.get("url") or item.get("property_finder_url"),
             "community": item.get("community"),
+            "sub_community": item.get("sub_community"),
         }
 
     def _extract_candidates(
@@ -1333,6 +1352,8 @@ Rules:
         communities = (
             retrieval_result.get("communities")
             or structured_data.get("communities")
+            or structured_data.get("community")
+            or retrieval_result.get("community")
         )
 
         sub_communities = (
@@ -1348,21 +1369,18 @@ Rules:
                 "project",
             )
 
-            if candidates:
-                return candidates[
-                    : self.MAX_CANDIDATES
-                ]
-
+        # Keep communities too when both are shown (family-area turns need
+        # community names in memory so "show me more" can skip them).
         if communities:
             add_candidates(
                 communities,
                 "community",
             )
 
-            if candidates:
-                return candidates[
-                    : self.MAX_CANDIDATES
-                ]
+        if candidates:
+            return candidates[
+                : self.MAX_CANDIDATES
+            ]
 
         if sub_communities:
             add_candidates(

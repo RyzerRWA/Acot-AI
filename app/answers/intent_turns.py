@@ -4,7 +4,14 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from app.answers.intent_route import classify_intent, family_area_focus, prior_anchor_question
+from app.answers.intent_route import (
+    classify_intent,
+    family_area_focus,
+    household_size,
+    parse_bedrooms,
+    parse_budget_aed,
+    prior_anchor_question,
+)
 from app.answers.predict import (
     fetch_areas_near_budget,
     fetch_bedroom_median,
@@ -13,9 +20,13 @@ from app.answers.predict import (
     format_trend_answer,
 )
 from app.answers.recommend import (
+    RECOMMEND_POOL,
     format_afford_answer,
     fetch_family_areas,
+    fetch_recommend_projects,
+    fetch_villa_projects_under_budget,
     format_family_areas,
+    format_cheapest,
     format_open_areas,
     format_open_best,
     format_ranked_picks,
@@ -100,6 +111,8 @@ def _search(
     skip_names: set[str] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     skip = {str(name).strip().lower() for name in (skip_names or set()) if name}
+    from app.retrieval.place_lock import drop_numbered_siblings
+
     if skip or limit > 10:
         from app.retrieval.propai_catalog import agent_projects
 
@@ -115,10 +128,13 @@ def _search(
         if filters.get("handover_year") is not None:
             raw["handover_year"] = filters["handover_year"]
         rows, _ = agent_projects(raw, limit=min(limit + len(skip) + 4, 24), sort="cheapest")
-        matches = [
-            row for row in rows
-            if str(row.get("name") or "").strip().lower() not in skip
-        ][:limit]
+        matches = drop_numbered_siblings(
+            [
+                row for row in rows
+                if str(row.get("name") or "").strip().lower() not in skip
+            ],
+            filters.get("communities") or [],
+        )[:limit]
         return matches, []
 
     from app.listings.tools import search_projects
@@ -135,7 +151,10 @@ def _search(
     if filters.get("property_types"):
         raw["property_types"] = filters["property_types"]
     result = search_projects(raw)
-    matches = [card["row"] for card in (result.cards or []) if isinstance(card, dict) and card.get("row")]
+    matches = drop_numbered_siblings(
+        [card["row"] for card in (result.cards or []) if isinstance(card, dict) and card.get("row")],
+        filters.get("communities") or [],
+    )
     closest = []
     for row in (result.output or {}).get("closest_matches") or []:
         closest.append({
@@ -148,6 +167,7 @@ def _search(
             "bedroom_min": None,
             "bedroom_max": None,
         })
+    closest = drop_numbered_siblings(closest, filters.get("communities") or [])
     return matches, closest
 
 
@@ -164,8 +184,17 @@ def predict_turn(question: str, conversation_memory=None, route: dict | None = N
         projects, closest = [], []
     shown = projects or closest
     if route.get("kind") == "snapshot":
-        answer = format_snapshot_answer(place, trend, shown)
-        return _turn(question, answer, shown, question_type="fact")
+        beds = route.get("bedrooms")
+        if isinstance(beds, int):
+            beds = [beds]
+        bedroom_stats = None
+        if beds:
+            bedroom_stats = []
+            for count in beds:
+                row = fetch_bedroom_median(place, int(count))
+                bedroom_stats.append(row or {"bedrooms": int(count), "median": None, "sales": 0})
+        answer = format_snapshot_answer(place, trend, shown, bedroom_stats)
+        return _turn(question, answer, shown, question_type="search")
     answer = format_trend_answer(place, trend, shown)
     return _turn(question, answer, shown, question_type="prediction")
 
@@ -190,6 +219,8 @@ def recommend_data_turn(question: str, conversation_memory=None, route: dict | N
         return _ready_offplan_turn(question, route, conversation_memory)
     if kind == "open_best":
         return _open_best_turn(question, route, conversation_memory)
+    if kind == "cheapest":
+        return _cheapest_turn(question, route, conversation_memory)
     if kind == "afford":
         return _afford_turn(question, route, conversation_memory)
     if kind == "split":
@@ -223,8 +254,11 @@ def _open_best_turn(question: str, route: dict | None = None, conversation_memor
         except Exception:
             rows = []
         for row in rows:
-            if row not in projects:
-                projects.append(row)
+            tagged = dict(row)
+            tagged.setdefault("community", name)
+            tagged.setdefault("entity_type", "project")
+            if tagged not in projects:
+                projects.append(tagged)
     if not projects:
         matches, closest = _search({}, limit=5)
         projects = matches or closest
@@ -252,6 +286,72 @@ def _open_best_turn(question: str, route: dict | None = None, conversation_memor
                 "signals": {
                     "price_psf": row.get("median_price_per_sqft_aed"),
                     "sales_12m": row.get("sales_12m"),
+                },
+            }
+            for row in areas
+            if row.get("area")
+        ]
+    return turn
+
+
+def _cheapest_turn(question: str, route: dict | None = None, conversation_memory=None) -> dict:
+    skip = _shown_labels(conversation_memory) if (route or {}).get("more") else set()
+    place = (route or {}).get("subject")
+    areas: list[dict] = []
+    if not place:
+        try:
+            from app.listings.tools import top_areas_by_cheapest
+
+            areas = top_areas_by_cheapest(10 if skip else 5)
+            if skip:
+                areas = [
+                    row for row in areas
+                    if str(row.get("area") or "").strip().lower() not in skip
+                ][:5]
+        except Exception:
+            areas = []
+    filters: dict[str, Any] = {}
+    if place:
+        filters["communities"] = [place]
+    try:
+        matches, closest = _search(filters, limit=8, skip_names=skip)
+    except Exception:
+        matches, closest = [], []
+    projects = (matches or closest)[:5]
+    if (route or {}).get("more") and not areas and not projects:
+        answer = (
+            "Those were the main low-price matches I have from recorded sales. "
+            "Share a bedroom count or a nearby area and I’ll keep going."
+        )
+        return _turn(
+            question,
+            answer,
+            [],
+            question_type="search",
+            standalone_question=(route or {}).get("source_question") or question,
+        )
+    answer = format_cheapest(
+        areas,
+        projects,
+        place=place,
+        more=bool((route or {}).get("more")),
+    )
+    turn = _turn(
+        question,
+        answer,
+        projects[:5],
+        question_type="search",
+        standalone_question=(route or {}).get("source_question") or question,
+    )
+    if areas:
+        turn["structured_summary"]["community"] = [
+            {
+                "name": row.get("area"),
+                "official_area": row.get("official_area"),
+                "signals": {
+                    "price_psf": row.get("median_price_per_sqft_aed"),
+                    "sales_12m": row.get("sales_12m"),
+                    "median_sale_price_aed": row.get("median_sale_price_aed"),
                 },
             }
             for row in areas
@@ -297,8 +397,16 @@ def _yield_areas_turn(question: str, route: dict | None = None, conversation_mem
         except Exception:
             rows = []
         for row in rows:
-            if row not in projects:
-                projects.append(row)
+            tagged = dict(row)
+            tagged.setdefault("community", name)
+            tagged.setdefault("entity_type", "project")
+            key = str(tagged.get("name") or tagged.get("id") or "").strip().lower()
+            if key and any(
+                str(item.get("name") or item.get("id") or "").strip().lower() == key
+                for item in projects
+            ):
+                continue
+            projects.append(tagged)
         if len(projects) >= 5:
             break
     answer = format_yield_areas(areas, place=place)
@@ -316,10 +424,11 @@ def _yield_areas_turn(question: str, route: dict | None = None, conversation_mem
         standalone_question=(route or {}).get("source_question") or question,
     )
     if areas:
-        turn["structured_summary"]["community"] = [
+        communities = [
             {
                 "name": row.get("area"),
                 "official_area": row.get("official_area"),
+                "entity_type": "community",
                 "signals": {
                     "rent_contracts": row.get("rent_contracts"),
                     "median_yearly_rent_aed": row.get("median_yearly_rent_aed"),
@@ -330,6 +439,10 @@ def _yield_areas_turn(question: str, route: dict | None = None, conversation_mem
             for row in areas
             if row.get("area")
         ]
+        turn["structured_summary"]["community"] = communities
+        data = (turn.get("retrieval_result") or {}).get("structured_data") or {}
+        data["community"] = communities
+        data["communities"] = communities
     return turn
 
 
@@ -414,7 +527,7 @@ def _ready_offplan_turn(question: str, route: dict | None = None, conversation_m
         question,
         answer,
         shown[:5],
-        question_type="comparison",
+        question_type="search",
         standalone_question=(route or {}).get("source_question") or question,
     )
 
@@ -434,43 +547,86 @@ def _usable_family_project(row: dict) -> bool:
 
 def _family_areas_turn(question: str, route: dict | None = None, conversation_memory=None) -> dict:
     focus = (route or {}).get("focus") or family_area_focus(question)
+    budget = (route or {}).get("budget_aed")
+    prefer_cheaper = bool((route or {}).get("prefer_cheaper"))
+    prefer_premium = bool((route or {}).get("prefer_premium")) and not prefer_cheaper
     skip = _shown_labels(conversation_memory) if (route or {}).get("more") else set()
     areas = []
     try:
-        areas = fetch_family_areas(10 if skip else 5, focus=focus)
+        pool = 20 if (budget or prefer_cheaper or prefer_premium or skip) else 5
+        areas = fetch_family_areas(pool, focus=focus)
         if skip:
             areas = [
                 row for row in areas
                 if str(row.get("area") or "").strip().lower() not in skip
-            ][:5]
+            ]
+        if (prefer_cheaper or prefer_premium) and areas:
+            priced = [
+                row for row in areas
+                if row.get("median_family_sale")
+            ]
+            priced.sort(
+                key=lambda row: int(row["median_family_sale"]),
+                reverse=prefer_premium,
+            )
+            rest = [row for row in areas if row not in priced]
+            areas = (priced + rest)[:5]
+        else:
+            areas = areas[:5]
     except Exception:
         areas = []
+    fitting = None
+    if budget and areas:
+        fitting = [
+            row for row in areas
+            if row.get("median_family_sale") and int(row["median_family_sale"]) <= int(budget)
+        ]
+        if fitting:
+            areas = fitting[:5]
+        else:
+            areas = areas[:5]
     projects: list[dict] = []
     villa_first = bool(focus.get("want_villas") or focus.get("avoid_towers") or focus.get("kids"))
-    for area in areas[:5]:
-        name = area.get("area")
-        if not name:
-            continue
-        filters: dict[str, Any] = {"communities": [name], "bedrooms": 3}
-        if villa_first:
-            filters["property_types"] = ["VILLA"]
-        try:
-            rows, closest = _search(filters, limit=3)
-        except Exception:
-            rows, closest = [], []
-        chosen = next((row for row in (rows or closest) if _usable_family_project(row)), None)
-        if chosen is None and villa_first:
+    if fitting != []:
+        for area in areas[:5]:
+            name = area.get("area")
+            if not name:
+                continue
+            filters: dict[str, Any] = {"communities": [name], "bedrooms": 3}
+            if villa_first:
+                filters["property_types"] = ["VILLA"]
             try:
-                rows, closest = _search({"communities": [name], "bedrooms": 3}, limit=3)
+                rows, closest = _search(filters, limit=3)
             except Exception:
                 rows, closest = [], []
             chosen = next((row for row in (rows or closest) if _usable_family_project(row)), None)
-        if chosen and chosen not in projects:
-            projects.append(chosen)
-        if len(projects) >= 5:
-            break
+            if chosen is None and villa_first:
+                try:
+                    rows, closest = _search({"communities": [name], "bedrooms": 3}, limit=3)
+                except Exception:
+                    rows, closest = [], []
+                chosen = next((row for row in (rows or closest) if _usable_family_project(row)), None)
+            if chosen and chosen not in projects:
+                tagged = dict(chosen)
+                tagged.setdefault("community", name)
+                tagged.setdefault("entity_type", "project")
+                projects.append(tagged)
+            if len(projects) >= 5:
+                break
     if areas:
-        answer = format_family_areas(areas, focus=focus)
+        answer = format_family_areas(
+            areas,
+            focus=focus,
+            budget_aed=budget,
+            prefer_cheaper=prefer_cheaper,
+            prefer_premium=prefer_premium,
+        )
+    elif (route or {}).get("more"):
+        answer = (
+            "I already showed the main family communities from that ranking. "
+            "Share a budget or ask for townhouses only and I’ll narrow the next list."
+        )
+        projects = []
     else:
         matches, closest = _search({"bedrooms": 3}, limit=5)
         projects = [row for row in (matches or closest) if _usable_family_project(row)][:5]
@@ -483,7 +639,13 @@ def _family_areas_turn(question: str, route: dict | None = None, conversation_me
             ),
         )
     if (route or {}).get("more") and areas:
-        answer = "More family communities from the same ranking:\n\n" + "\n".join(
+        if prefer_cheaper:
+            lead = "Cheaper family communities from the same ranking:"
+        elif prefer_premium:
+            lead = "Higher-priced family communities from the same ranking:"
+        else:
+            lead = "More family communities from the same ranking:"
+        answer = lead + "\n\n" + "\n".join(
             answer.split("\n", 1)[-1].lstrip("\n").split("\n")
         )
     turn = _turn(
@@ -494,10 +656,11 @@ def _family_areas_turn(question: str, route: dict | None = None, conversation_me
         standalone_question=(route or {}).get("source_question") or question,
     )
     if areas:
-        turn["structured_summary"]["community"] = [
+        communities = [
             {
                 "name": row.get("area"),
                 "official_area": row.get("official_area"),
+                "entity_type": "community",
                 "signals": {
                     "existing_villas": row.get("existing_villas"),
                     "family_sales": row.get("existing_family_sales") or row.get("family_sales"),
@@ -508,7 +671,40 @@ def _family_areas_turn(question: str, route: dict | None = None, conversation_me
             for row in areas
             if row.get("area")
         ]
+        turn["structured_summary"]["community"] = communities
+        turn["structured_summary"]["communities"] = communities
+        data = (turn.get("retrieval_result") or {}).setdefault("structured_data", {})
+        data["community"] = communities
+        data["communities"] = communities
     return turn
+
+
+def _afford_evidence_rows(rows: list[dict], budget: int | None, limit: int = 4) -> list[dict]:
+    """Keep under-budget recent sales with real activity; never promote over-budget closest."""
+    under = []
+    for row in rows:
+        price = _num_price(row)
+        if price is None:
+            continue
+        if budget and price > budget:
+            continue
+        under.append(row)
+    if not under:
+        return []
+    ranked = sorted(
+        under,
+        key=lambda row: (
+            -int(row.get("sales_count") or row.get("sales") or 0),
+            _num_price(row) or 0,
+        ),
+    )
+    strong = [
+        row for row in ranked
+        if int(row.get("sales_count") or row.get("sales") or 0) >= 3
+    ]
+    # Keep handover_time for compare tables. Cards hide past completion via the UI
+    # when price_kind is recent_sale, so do not wipe the date here.
+    return (strong if len(strong) >= 2 else ranked)[:limit]
 
 
 def _afford_turn(question: str, route: dict, conversation_memory=None) -> dict:
@@ -521,21 +717,26 @@ def _afford_turn(question: str, route: dict, conversation_memory=None) -> dict:
     try:
         filters = {"communities": [place], "bedrooms": beds}
         if budget:
-            filters["max_price"] = max(budget, int((median or {}).get("median") or budget))
-        matches, closest = _search(filters, limit=4, skip_names=skip)
+            filters["max_price"] = budget
+        matches, closest = _recommend_pool(filters, skip_names=skip)
     except Exception:
         matches, closest = [], []
     nearby = []
     if budget and median and budget < median["median"] * 0.92:
         nearby = fetch_areas_near_budget(budget)
-    shown = matches or closest
+    # Afford never promotes over-budget "closest" rows into the main list.
+    shown = _afford_evidence_rows(matches, budget or None, limit=4)
     answer = format_afford_answer(
         place, budget or 0, median, shown, nearby, bedrooms=beds
     )
     if route.get("more"):
-        answer = answer.replace("For ", "More options for ", 1) if shown else (
-            f"Those were the main {beds}-bedroom matches in {place} around that budget. "
-            "I can raise the budget or check a nearby community."
+        answer = (
+            answer.replace("You're asking whether", "More options for whether", 1)
+            if shown
+            else (
+                f"Those were the main {beds}-bedroom matches in {place} around that budget. "
+                "I can raise the budget or check a nearby community."
+            )
         )
     return _turn(
         question,
@@ -561,9 +762,176 @@ def _split_turn(question: str, route: dict) -> dict:
     return _turn(question, answer, (studios + villas)[:6])
 
 
+def _num_price(row: dict) -> float | None:
+    value = row.get("price") or row.get("price_aed") or row.get("starting_price_aed")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _recommend_pool(
+    filters: dict,
+    skip_names: set[str] | None = None,
+    pool_size: int = RECOMMEND_POOL,
+) -> tuple[list[dict], list[dict]]:
+    """30–50 bedroom-sale candidates for a place, inside the budget band when given."""
+    communities = filters.get("communities") or []
+    place = communities[0] if communities else None
+    skip = {str(name).strip().lower() for name in (skip_names or set()) if name}
+    fetch_limit = max(int(pool_size), RECOMMEND_POOL) + len(skip)
+    if not place:
+        if filters.get("property_type") in {"villa", "townhouse"}:
+            rows = fetch_villa_projects_under_budget(
+                filters.get("max_price"),
+                limit=fetch_limit,
+                property_type=filters["property_type"],
+            )
+            kept = [
+                row for row in rows
+                if str(row.get("name") or "").strip().lower() not in skip
+            ]
+            return kept, []
+        return _search(filters, limit=fetch_limit, skip_names=skip)
+    try:
+        matches, closest = fetch_recommend_projects(
+            place,
+            bedrooms=filters.get("bedrooms"),
+            budget=filters.get("max_price"),
+            limit=fetch_limit,
+            property_type=filters.get("property_type"),
+        )
+    except Exception:
+        matches, closest = [], []
+    matches = [
+        row for row in matches
+        if str(row.get("name") or "").strip().lower() not in skip
+    ]
+    closest = [
+        row for row in closest
+        if str(row.get("name") or "").strip().lower() not in skip
+    ]
+    return matches, closest
+
+
+def _bed_request_label(bedrooms) -> str | None:
+    if bedrooms is None:
+        return None
+    beds = int(bedrooms)
+    if beds <= 0:
+        return "studio"
+    if beds == 1:
+        return "1-bedroom"
+    return f"{beds}-bedroom"
+
+
+def _explain_filtered_request(
+    route: dict,
+    place: str | None,
+    question: str | None = None,
+    *,
+    matched: bool = True,
+) -> str | None:
+    """Why this search: family size, bedrooms, place, and budget band.
+
+    matched=True: listed rows sit in the requested band.
+    matched=False: no in-band sales; never claim the list is 'near' that budget.
+    """
+    beds = route.get("bedrooms")
+    people = route.get("household")
+    if beds is None:
+        parsed = parse_bedrooms(question)
+        if parsed:
+            beds = parsed[0]
+    if people is None:
+        people = household_size(question)
+    if "budget_aed" in route:
+        budget = route.get("budget_aed")
+    else:
+        budget = parse_budget_aed(question)
+    label = _bed_request_label(beds)
+    where = f" in {place}" if place else ""
+    parts = []
+    if people and label:
+        if int(people) >= 4 and beds is not None and int(beds) >= 3:
+            parts.append(
+                f"A family of {int(people)} typically needs a {label}{where}: "
+                "a room for the parents and separate rooms so the children are not sharing a studio or 1-bed"
+            )
+        elif int(people) >= 2 and beds is not None and int(beds) >= 1:
+            parts.append(
+                f"For {int(people)} people, a {label}{where} is a practical live-in size"
+            )
+        else:
+            parts.append(f"You asked for a {label}{where} for {int(people)} people")
+    elif label:
+        parts.append(f"You asked for a {label}{where}")
+    ptype = route.get("property_type")
+    kind = f"{ptype}s" if ptype else None
+    if kind and not label:
+        parts.append(f"You asked for {kind}{where}")
+    if budget and label:
+        if matched:
+            parts.append(
+                f"the options below are recorded {label} sales{where} that sit near "
+                f"AED {int(budget):,}, not far cheaper homes"
+            )
+        else:
+            parts.append(
+                f"I looked for recorded {label} sales{where} near AED {int(budget):,}, "
+                f"not far cheaper homes"
+            )
+    elif budget and kind:
+        if matched:
+            parts.append(
+                f"the options below are recorded {ptype} sales{where} that sit near "
+                f"AED {int(budget):,}"
+            )
+        else:
+            parts.append(
+                f"I looked for recorded {ptype} sales{where} near AED {int(budget):,}"
+            )
+    elif budget:
+        if matched:
+            parts.append(
+                f"the options below are recorded sales{where} that sit near AED {int(budget):,}"
+            )
+        else:
+            parts.append(
+                f"I looked for recorded sales{where} near AED {int(budget):,}"
+            )
+    if not parts:
+        return None
+    text = ". ".join(part[0].upper() + part[1:] if part else part for part in parts)
+    return text.rstrip(".")
+
+
+def _nearest_above_budget(rows: list[dict], budget: int, limit: int = 3) -> list[dict]:
+    """Closest recorded sales above the ask — never treat them as in-budget matches."""
+    ranked = []
+    for row in rows:
+        price = _num_price(row)
+        if price is None or price <= budget:
+            continue
+        ranked.append((price - budget, row))
+    ranked.sort(key=lambda item: item[0])
+    return [row for _, row in ranked[:limit]]
+
+
 def _filtered_turn(question: str, route: dict, conversation_memory=None) -> dict:
     place = route.get("subject")
     skip = _shown_labels(conversation_memory) if route.get("more") else set()
+    if route.get("bedrooms") is None:
+        parsed = parse_bedrooms(question)
+        if parsed:
+            route = dict(route)
+            route["bedrooms"] = parsed[0]
+    if route.get("household") is None:
+        people = household_size(question)
+        if people:
+            route = dict(route)
+            route["household"] = people
     filters: dict[str, Any] = {}
     if place:
         filters["communities"] = [place]
@@ -571,10 +939,20 @@ def _filtered_turn(question: str, route: dict, conversation_memory=None) -> dict
         filters["bedrooms"] = route["bedrooms"]
     if route.get("budget_aed"):
         filters["max_price"] = route["budget_aed"]
-    matches, closest = _search(filters, limit=6, skip_names=skip)
+    ptype = route.get("property_type")
+    if ptype:
+        filters["property_type"] = ptype
+        if ptype == "villa":
+            filters["property_types"] = ["VILLA"]
+        elif ptype == "townhouse":
+            filters["property_types"] = ["Townhouses"]
+        elif ptype == "apartment":
+            filters["property_types"] = ["Apartments"]
+    matches, closest = _recommend_pool(filters, skip_names=skip)
     months = route.get("months")
     exact = matches
     relaxed = None
+    over_budget = False
     if months and matches:
         soon = [row for row in matches if within_months(row, int(months))]
         if soon:
@@ -582,8 +960,9 @@ def _filtered_turn(question: str, route: dict, conversation_memory=None) -> dict
         else:
             relaxed = "I can keep the 3-month window and widen the area if you want."
             exact = matches
-    rows = exact or closest
     bits = []
+    if ptype:
+        bits.append(f"{ptype}s")
     if route.get("bedrooms") is not None:
         bits.append(f"a {route['bedrooms']}-bedroom")
     if place:
@@ -592,26 +971,132 @@ def _filtered_turn(question: str, route: dict, conversation_memory=None) -> dict
         bits.append(f"at up to AED {int(route['budget_aed']):,}")
     if months and not relaxed:
         bits.append("with an early handover")
-    if route.get("more") and not rows:
-        need = " ".join(bits) if bits else "this search"
+    need = " ".join(bits) if bits else "this search"
+    if route.get("more") and not matches:
         answer = (
-            f"I already showed the closest matches for {need}. "
-            "Share a nearby area or a slightly higher budget and I’ll keep going."
+            f"I already showed the closest recorded options for {need}. "
+            "Nothing else in that area sits in the requested budget. "
+            "Share a higher budget or a nearby area and I’ll keep going."
         )
         return _turn(
             question,
             answer,
             [],
-            question_type="comparison",
+            question_type="search",
             standalone_question=route.get("source_question") or question,
         )
-    ranked = rank_projects(rows, wanted_beds=route.get("bedrooms"))
-    if route.get("more"):
-        intro = "More " + " ".join(bits) + "," if bits else "More matching projects,"
+    rows = exact
+    if not rows and closest:
+        if route.get("budget_aed"):
+            rows = _nearest_above_budget(closest, int(route["budget_aed"]), limit=3)
+            if rows:
+                over_budget = True
+                kind = f"{ptype} sales" if ptype else "sales"
+                relaxed = (
+                    f"There are no recorded {kind}"
+                    f"{' in ' + place if place else ''} in that price band. "
+                    f"These are the closest recorded {kind}, and they sit above "
+                    f"AED {int(route['budget_aed']):,}."
+                )
+        else:
+            rows = closest[:3]
+    if not rows:
+        need = " ".join(bits) if bits else "this search"
+        alts: list[dict] = []
+        if ptype in {"villa", "townhouse"} and route.get("budget_aed"):
+            try:
+                alts = fetch_villa_projects_under_budget(
+                    int(route["budget_aed"]),
+                    skip_place=place,
+                    property_type=ptype,
+                )
+            except Exception:
+                alts = []
+        if alts:
+            ranked = rank_projects(
+                alts,
+                budget_aed=route.get("budget_aed"),
+                attach_sales=False,
+            )
+            intro = (
+                f"I couldn’t find recorded {need} in recorded sales. "
+                f"{place or 'That area'} is mostly apartments and offices, not villas. "
+                f"These are recorded {ptype} sales elsewhere at or under "
+                f"AED {int(route['budget_aed']):,}"
+            )
+            answer = format_ranked_picks(ranked, intro=intro)
+            ordered = []
+            by_name = {str(row.get("name") or "").lower(): row for row in alts}
+            for item in ranked.get("ranked") or []:
+                row = by_name.get(str(item.get("name") or "").lower())
+                if row and row not in ordered:
+                    ordered.append(row)
+            return _turn(
+                question,
+                answer,
+                (ordered or alts)[:3],
+                question_type="search",
+                standalone_question=route.get("source_question") or question,
+            )
+        explain = _explain_filtered_request(route, place, question)
+        if ptype in {"villa", "townhouse"}:
+            miss = (
+                f"I couldn’t find recorded {need} in recorded sales. "
+                "That area is mostly apartments, so a villa filter has nothing to list."
+            )
+        else:
+            miss = f"I couldn’t find recorded {need} in recorded sales."
+        answer = f"{explain}. {miss}" if explain else miss
+        return _turn(
+            question,
+            answer,
+            [],
+            question_type="search",
+            standalone_question=route.get("source_question") or question,
+        )
+    # Guardrail for every filtered ask: never ship over-budget rows as band matches.
+    budget = route.get("budget_aed")
+    if budget and not over_budget:
+        rows = [
+            row for row in rows
+            if (price := _num_price(row)) is not None and price <= float(budget)
+        ]
+        if not rows:
+            return _turn(
+                question,
+                (
+                    f"{_explain_filtered_request(route, place, question, matched=False) or f'You asked for {need}'}. "
+                    f"I couldn’t find recorded {need} in recorded sales."
+                ),
+                [],
+                question_type="search",
+                standalone_question=route.get("source_question") or question,
+            )
+    ranked = rank_projects(
+        rows,
+        wanted_beds=route.get("bedrooms"),
+        budget_aed=None if over_budget else route.get("budget_aed"),
+        attach_sales=False,
+    )
+    explain = _explain_filtered_request(
+        route, place, question, matched=not over_budget
+    )
+    if over_budget:
+        intro = explain or f"You asked for {need}"
+    elif route.get("more"):
+        intro = (
+            "More options for " + " ".join(bits) + ","
+            if bits else "More matching projects,"
+        )
         if not relaxed:
             relaxed = "These are further options for the same request, beyond the ones already on screen."
+    elif explain:
+        intro = explain
+    elif bits:
+        lead = " ".join(bits)
+        intro = lead[0].upper() + lead[1:] + "," if lead[:3] in {"in ", "at "} else "For " + lead + ","
     else:
-        intro = "For " + " ".join(bits) + "," if bits else "From the matching projects,"
+        intro = "From the matching projects,"
     answer = format_ranked_picks(ranked, intro=intro, relaxed=relaxed)
     ordered = []
     by_name = {str(row.get("name") or "").lower(): row for row in rows}
@@ -622,7 +1107,7 @@ def _filtered_turn(question: str, route: dict, conversation_memory=None) -> dict
     return _turn(
         question,
         answer,
-        ordered or rows,
-        question_type="comparison",
+        (ordered or rows)[:3],
+        question_type="search",
         standalone_question=route.get("source_question") or question,
     )

@@ -34,13 +34,17 @@ _BROWSE_LEAD = re.compile(
 )
 
 _ATTRIBUTE_TOKENS = {
-    "price","prices","cost","costs",
+    "price","prices","cost","costs","budget","budgets",
     "bedroom","bedrooms","handover","handovers",
     "amenity","amenities","status","size","sizes","date","dates","developer",
 }
 
 _GROUP_REFERENCE = re.compile(
     r"\b(?:their|them|these|those|which of|which ones|"
+    r"each(?:\s+of)?(?:\s+the)?(?:\s+projects?)?|"
+    r"every(?:\s+one)?(?:\s+of)?(?:\s+the)?(?:\s+projects?)?|"
+    r"all(?:\s+of)?(?:\s+the)?(?:\s+projects?)?|"
+    r"for\s+each(?:\s+project)?|"
     r"the projects|the properties)\b"
 )
 
@@ -190,6 +194,8 @@ def _correct_domain_word(token: str) -> str:
         core, suffix = stripped, token[len(stripped):]
     lowered = core.lower()
     if lowered in _DOMAIN_WORDS or len(lowered) < 5:
+        return token
+    if any(ch.isdigit() for ch in lowered):
         return token
     if lowered in _locked_place_words():
         return token
@@ -376,46 +382,21 @@ def asks_one_fact(question: str) -> bool:
 
 
 def asks_for_listings(question: str) -> bool:
-    """True when the question is asking for rental listings, not projects."""
+    """True only for advertised listing ads, not Prop-AI rent/project browse.
+
+    "Show me 1 bedroom apartments for rent in Dubai Marina" is Prop-AI first
+    (projects, recorded rents, sales). "Show me listings in JVC" is the ads table.
+    """
 
     text = (question or "").lower()
     if not text:
         return False
 
-    # Investment and project questions stay on the project records.
     if re.search(r"\b(?:investment|yield|roi)\b", text):
         return False
     if re.search(r"\bprojects?\b", text) and not re.search(r"\blistings?\b", text):
         return False
-
-    if re.search(r"\blistings?\b|\bfor rent\b|\bto rent\b|\brenting\b", text):
-        return True
-    # "rentals" is a listing request. "rental price" stays a project fact.
-    if re.search(r"\brentals?\b", text) and not re.search(
-        r"\brental\s+(?:price|yield|income)\b",
-        text,
-    ):
-        return True
-
-    # Spots-style budget browse: "studio under 200k", "apartments below 200000"
-    if re.search(
-        r"\b(?:under|below|less than|up to)\b",
-        text,
-    ) and re.search(
-        r"\b(?:apartments?|villas?|townhouses?|penthouses?|studios?|"
-        r"units?|flats?)\b",
-        text,
-    ):
-        return True
-
-    return bool(
-        re.search(r"\brent\b", text)
-        and re.search(
-            r"\b(?:apartments?|villas?|townhouses?|penthouses?|studios?|"
-            r"bedrooms?|propert(?:y|ies)|units?|flats?)\b",
-            text,
-        )
-    )
+    return bool(re.search(r"\blistings?\b", text))
 
 
 def normalize_for_match(text: str) -> str:
@@ -733,6 +714,9 @@ def interpret_search(question: str) -> dict:
     if place_phrase and not re.search(r"\bprojects?\b", body):
         left = place_phrase.group(1).strip()
         right = _place_only(place_phrase.group(2))
+        # "1 bedroom apartments for rent in Dubai Marina" is a place browse.
+        if left and right and not _specific_tokens(left, right):
+            return {"kind": "community", "community": right}
         if left and right and _specific_tokens(left):
             return {"kind": "none"}
 
@@ -906,7 +890,7 @@ def catalog_request(question: str):
     if not (asks_community or asks_project or asks_price or asks_bedroom or place):
         return None
 
-    listings = bool(bedrooms is not None or (asks_price and not asks_project))
+    listings = bool(re.search(r"\blistings?\b", text))
     projects = bool(asks_project and bedrooms is None)
     communities = asks_community
     if place and not listings and not projects and not communities:
@@ -914,9 +898,9 @@ def catalog_request(question: str):
         communities = True
     if not listings and not projects and not communities:
         if asks_bedroom or asks_price:
-            listings = True
-        else:
-            projects = True
+            # City-wide "2 bedroom apartments" is Prop-AI projects, not ads.
+            return None
+        projects = True
 
     return {
         "place": place,

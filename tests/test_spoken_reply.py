@@ -8,6 +8,7 @@ from app.answers.spoken import (
     build_spoken_prompt,
     spoken_facts,
     start_spoken_reply,
+    template_spoken_reply,
 )
 
 
@@ -103,6 +104,34 @@ def test_small_talk_is_spoken_as_is_without_a_model_call():
     assert prompts == []
 
 
+def test_fast_project_browse_speaks_without_a_model_call():
+    llm = FakeLLM()
+    prepared = prepared_with(
+        project_total=24,
+        catalog_place="Jumeirah Village Circle",
+    )
+    prepared["structured_summary"]["project_total"] = 24
+    prepared["structured_summary"]["catalog_place"] = "Jumeirah Village Circle"
+
+    async def scenario():
+        reply = start_spoken_reply(
+            llm,
+            "Show me projects in Jumeirah Village Circle",
+            prepared,
+        )
+        return "".join([t async for t in reply.rest()]), llm.prompts
+
+    text, prompts = asyncio.run(scenario())
+    assert "24 projects" in text
+    assert "Jumeirah Village Circle" in text
+    assert "Binghatti Corner" in text
+    assert prompts == []
+    assert "24 projects" in template_spoken_reply(
+        "Show me projects in Jumeirah Village Circle",
+        prepared,
+    )
+
+
 def test_failed_spoken_reply_ends_cleanly():
     async def scenario():
         reply = SpokenReply(FakeLLM(fail=True).stream("x"))
@@ -134,7 +163,10 @@ def test_voice_mode_streams_speech_before_done(monkeypatch):
     names = [name for name, _ in events]
     speech = "".join(data["text"] for name, data in events if name == "speech")
 
-    assert speech == "I found 2 projects."  # the "Yes!" opener is dropped
+    # Fast project browse uses a template — no second model call for speech.
+    assert "2 projects" in speech
+    assert "Binghatti Corner" in speech
+    assert names.index("speech") < names.index("done")
     assert names.index("speech_done") < names.index("done")
     assert dict(events)["speech_done"]["ok"] is True
     assert dict(events)["done"]["answer"].startswith("Here are 2 projects")
@@ -148,7 +180,31 @@ def test_text_mode_has_no_speech_and_no_extra_model_call(monkeypatch):
 
 
 def test_voice_mode_still_answers_when_spoken_reply_fails(monkeypatch):
-    events = _collect("voice", monkeypatch, FakeLLM(fail=True))
+    # Non-fast turns still use the spoken LLM; a failure must not block chat.
+    prepared = prepared_with(
+        use_fast=False,
+        fast_answer=None,
+        context="Some context",
+        rag_chain=FakeRagChain(FakeLLM(fail=True)),
+    )
+
+    async def fake_prepare(question, components):
+        return prepared
+
+    monkeypatch.setattr(run, "_prepare_acot_turn", fake_prepare)
+    monkeypatch.setattr(run, "_stream_sources", lambda p: [])
+    monkeypatch.setattr(run, "_followup_questions", lambda p: [])
+    monkeypatch.setattr(run, "_finalize_acot_turn", lambda p, a, s: {"answer": a})
+
+    async def stream_answer(**kwargs):
+        yield "Here are 2 projects in JVC."
+
+    prepared["rag_chain"].stream_answer = stream_answer
+
+    async def scenario():
+        return [e async for e in run.stream_acot("Show me projects in JVC", {}, mode="voice")]
+
+    events = asyncio.run(scenario())
     assert dict(events)["speech_done"]["ok"] is False
     assert "done" in dict(events)
 
@@ -166,7 +222,14 @@ def test_stock_openers_are_dropped():
 def test_opener_is_removed_even_when_split_across_tokens():
     async def scenario():
         llm = FakeLLM(pieces=("Su", "re! Good ", "ques", "tion! ", "In JVC we have 24 projects right now. ", "Want more?"))
-        return "".join([t async for t in start_spoken_reply(llm, "JVC projects", prepared_with()).rest()])
+        # Force the LLM spoken path (no fast template) to test opener stripping.
+        return "".join([
+            t async for t in start_spoken_reply(
+                llm,
+                "JVC projects",
+                prepared_with(use_fast=False),
+            ).rest()
+        ])
 
     assert asyncio.run(scenario()) == "In JVC we have 24 projects right now. Want more?"
 
