@@ -109,7 +109,30 @@ def test_clarify_turn_payload_has_no_fake_projects():
     assert payload["use_fast"] is True
     assert payload["structured_summary"]["projects"] == []
     assert payload["structured_summary"]["clarify"] is True
+    # Finalize reads prepared["documents"] — clarify must ship the same shape.
+    assert payload.get("documents") == []
+    assert "investment_analysis" in payload
     assert "community" in payload["fast_answer"].lower() or "area" in payload["fast_answer"].lower()
+
+
+def test_clarify_payload_survives_finalize_shape():
+    """Regression: ACOT processing error KeyError 'documents' on clarify turns."""
+    from run import _ensure_prepared_turn, build_frontend_response
+
+    route = offline_resolve_turn("looking for apartments")
+    payload = clarify_turn_payload("looking for apartments", route)
+    prepared = _ensure_prepared_turn(dict(payload))
+    response = build_frontend_response(
+        question=prepared["question"],
+        standalone_question=prepared["standalone_question"],
+        answer=prepared["fast_answer"],
+        question_type=prepared["question_type"],
+        structured_summary=prepared["structured_summary"],
+        documents=prepared["documents"],
+        investment_analysis=prepared.get("investment_analysis"),
+    )
+    assert response["status"] == "success"
+    assert response["data"]["documents"] == []
 
 
 def test_understood_turn_clarifies_incomplete_browse(monkeypatch):

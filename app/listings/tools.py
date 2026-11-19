@@ -372,9 +372,10 @@ def search_listings(raw) -> ToolResult:
 
     a = _obj(raw)
     f = parse_filters(a)
-    sort = str(a.get("sort") or "cheapest")
+    # Newest rent contracts first unless the agent/user asked cheap/pricey.
+    sort = str(a.get("sort") or "newest")
     if sort not in SORTS and sort not in {"newest"}:
-        sort = "cheapest"
+        sort = ["newest","Cheapest"]
     limit = int(round(_num(a, "limit", 1, 10) or 5))
     found = list_rents(
         f.get("areas"),

@@ -560,6 +560,7 @@ def fetch_recommend_projects(
                 base + """
                 having percentile_cont(0.5) within group (order by sale_price) between %s and %s
                 order by abs(percentile_cont(0.5) within group (order by sale_price) - %s),
+                         max(instance_date) desc nulls last,
                          count(*) desc
                 limit %s
                 """,
@@ -571,6 +572,7 @@ def fetch_recommend_projects(
         closest = fetch(
             base + """
             order by abs(percentile_cont(0.5) within group (order by sale_price) - %s),
+                     max(instance_date) desc nulls last,
                      count(*) desc
             limit %s
             """,
@@ -636,7 +638,7 @@ def fetch_villa_projects_under_budget(
               {bed_sql}
             group by 1
             {having}
-            order by count(*) desc
+            order by max(instance_date) desc nulls last, count(*) desc
             limit %s
             """,
             tuple(params),
@@ -693,7 +695,7 @@ def fetch_studio_projects_under_budget(
               )
             group by 1
             {having}
-            order by count(*) desc
+            order by max(instance_date) desc nulls last, count(*) desc
             limit %s
             """,
             tuple(params),

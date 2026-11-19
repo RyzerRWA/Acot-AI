@@ -242,20 +242,24 @@ def clarify_turn_payload(
         "question": question,
         "standalone_question": question,
         "question_type": "information",
-        "retrieval_result": {
-            "structured_data": {
-                "projects": [],
-                "community": [],
-                "sub_communities": [],
-            },
-            "documents": [],
-        },
         "structured_summary": {
             "projects": [],
             "community": [],
             "sub_communities": [],
             "understood_kind": "clarify",
             "clarify": True,
+        },
+        # Top-level documents required by _finalize_acot_turn / build_frontend_response.
+        "documents": [],
+        "investment_analysis": None,
+        "retrieval_result": {
+            "question_type": "information",
+            "structured_data": {
+                "projects": [],
+                "community": [],
+                "sub_communities": [],
+            },
+            "documents": [],
         },
         "use_fast": True,
         "fast_answer": answer,

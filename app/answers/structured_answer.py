@@ -143,6 +143,12 @@ def _price_clause(record, *, sentence: bool = False) -> str | None:
     if not text:
         return None
     if _recent_sale_row(record):
+        sold = str(
+            (record or {}).get("last_sold_on") or (record or {}).get("last_sale") or ""
+        ).strip()[:10]
+        if sold and re.match(r"^\d{4}-\d{2}-\d{2}$", sold):
+            bit = f"Recent sale {text} (recorded {sold})."
+            return bit if sentence else bit.rstrip(".")
         return f"Recent sale {text}." if sentence else f"recent sale {text}"
     return f"Starting price {text}." if sentence else f"Starting price: {text}"
 
@@ -161,6 +167,22 @@ def _format_handover_month(value):
         return None
 
     return parsed.strftime("%B %Y")
+
+
+def _handover_is_upcoming(value) -> bool:
+    """True only when handover is still ahead — past completion years are not 'current'."""
+    if value is None:
+        return False
+    text = str(value).strip()
+    if not text:
+        return False
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if parsed.tzinfo is not None:
+        parsed = parsed.replace(tzinfo=None)
+    return parsed.date() >= datetime.now().date()
 
 
 def _listing_photo_urls(record):
@@ -1369,8 +1391,7 @@ def _is_project_browse_question(question: str | None) -> bool:
 
 
 def _filter_aware_browse_intro(question, projects, structured_summary) -> str | None:
-    """Open with Understood + matching count (ready / beds / place / budget)."""
-    from app.answers.explain_contract import build_understood, prepend_understood
+    """Open with matching count (ready / beds / place / budget) — no Understood line."""
     from app.answers.intent_route import parse_bedrooms, parse_budget_aed, extract_place
 
     text = question or ""
@@ -1380,12 +1401,14 @@ def _filter_aware_browse_intro(question, projects, structured_summary) -> str | 
     )
     beds = parse_bedrooms(text)
     budget = parse_budget_aed(text)
+    asked_max = structured_summary.get("asked_max_price")
+    if asked_max is None:
+        asked_max = budget
     ready = bool(re.search(r"\b(?:ready(?:\s+only)?|only\s+ready|completed)\b", text, re.I))
     under = bool(re.search(r"\b(?:under|below|up\s+to|max(?:imum)?)\b", text, re.I))
     above = bool(re.search(r"\b(?:above|over|starting)\b", text, re.I))
-    # A place-only browse keeps the plain "I found N projects in X" opener;
-    # the Understood line is added by the caller. Filter wording is for real filters.
-    if not (beds or budget is not None or ready):
+    # Place-only browse keeps the plain "I found N projects in X" opener.
+    if not (beds or budget is not None or ready or structured_summary.get("budget_miss")):
         return None
 
     bits = []
@@ -1396,8 +1419,28 @@ def _filter_aware_browse_intro(question, projects, structured_summary) -> str | 
             bits.append("studio")
         else:
             bits.append(f"{beds[0]}-bedroom")
-    bits.append("options" if len(projects) != 1 else "option")
     where = f" in {place}" if place and str(place).lower() != "dubai" else ""
+    count = len(projects)
+
+    # Budget miss: explain the miss, then show related projects near that range.
+    if structured_summary.get("budget_miss") and asked_max is not None:
+        lowest = structured_summary.get("lowest_price")
+        low_bit = (
+            f" Related recorded sales in that area start around AED {int(lowest):,}."
+            if lowest is not None
+            else " I do have related projects nearby in price."
+        )
+        bed_bit = ""
+        if beds:
+            bed_bit = "studio " if beds[0] == 0 else f"{beds[0]}-bedroom "
+        ready_bit = "ready " if ready else ""
+        return (
+            f"I don't have recorded {ready_bit}{bed_bit}sales{where} "
+            f"under AED {int(asked_max):,} in the last 12 months.{low_bit} "
+            f"Here are {count} related options in that range:"
+        )
+
+    bits.append("options" if count != 1 else "option")
     budget_bit = ""
     if budget is not None:
         budget_bit = (
@@ -1405,20 +1448,10 @@ def _filter_aware_browse_intro(question, projects, structured_summary) -> str | 
             if under or not above
             else f" from AED {int(budget):,}"
         )
-    count = len(projects)
-    facts = (
+    return (
         f"Here are {count} {' '.join(bits)}{where}{budget_bit} "
-        "from recorded sales when available:"
+        "from recorded sales in the last 12 months when available:"
     )
-    understood = build_understood(
-        place=place,
-        beds=beds[0] if beds else None,
-        budget_aed=budget,
-        ready_only=ready,
-        intent="browse",
-        under_budget=under or (budget is not None and not above),
-    )
-    return prepend_understood(facts, understood)
 
 
 def _limit_browse_projects(question, projects, structured_summary):
@@ -1745,7 +1778,12 @@ def _build_fast_structured_answer(
         if filter_intro:
             intro = filter_intro
         project_total = structured_summary.get("project_total")
-        if isinstance(project_total, int) and project_total > len(projects):
+        # Budget-miss intros must not be replaced by a generic "I found N projects" block.
+        if (
+            not structured_summary.get("budget_miss")
+            and isinstance(project_total, int)
+            and project_total > len(projects)
+        ):
             where = ""
             named_place = str(structured_summary.get("catalog_place") or "").strip()
             if named_place:
@@ -1780,36 +1818,14 @@ def _build_fast_structured_answer(
             intro = (
                 f"I found {project_total}{ready_bit} projects{where}{bed_bit}. "
                 f"Here are {len(projects)}{more} of them "
-                "(prices shown are recorded recent sales when available):\n\n"
+                "(prices from recorded sales in the last 12 months when available):\n\n"
                 + "\n\n".join(intro.split("\n\n")[1:])
             )
             if filter_intro and project_total <= len(projects):
                 intro = filter_intro
-        # Explain-first for every browse: restate the ask before the facts.
-        try:
-            from app.answers.explain_contract import (
-                build_motive,
-                build_understood,
-                prepend_understood,
-                slots_from_question,
-            )
-
-            slots = slots_from_question(question)
-            named = str(structured_summary.get("catalog_place") or "").strip() or slots.get("place")
-            if named or slots.get("beds") is not None or slots.get("budget_aed") is not None or slots.get("ready_only"):
-                intro = prepend_understood(
-                    f"{build_motive('browse')}\n\n{intro}",
-                    build_understood(
-                        place=named,
-                        beds=slots.get("beds"),
-                        budget_aed=slots.get("budget_aed"),
-                        ready_only=bool(slots.get("ready_only")),
-                        intent="browse",
-                        under_budget=bool(slots.get("under_budget", True)),
-                    ),
-                )
-        except Exception:
-            pass
+        elif structured_summary.get("budget_miss") and filter_intro:
+            intro = filter_intro
+        # Browse lists: facts only — no duplicated Understood / motive block.
         lines = [intro, ""]
 
         for project in projects:
@@ -1832,9 +1848,23 @@ def _build_fast_structured_answer(
             if bedroom_text:
                 details.append(f"{bedroom_text}.")
 
-            handover_text = _format_handover_month(project.get("handover_time"))
-            if handover_text:
-                details.append(f"Handover {handover_text}.")
+            # Ready stock: never lead with decade-old handover years — quote the
+            # recorded sale date instead. Upcoming handover stays for off-plan.
+            handover_raw = project.get("handover_time")
+            if _handover_is_upcoming(handover_raw):
+                handover_text = _format_handover_month(handover_raw)
+                if handover_text:
+                    details.append(f"Handover {handover_text}.")
+            else:
+                sold = str(
+                    project.get("last_sold_on") or project.get("last_sale") or ""
+                ).strip()[:10]
+                if sold and re.match(r"^\d{4}-\d{2}-\d{2}$", sold) and "recorded" not in (
+                    price_text or ""
+                ).lower():
+                    details.append(f"Last recorded sale {sold}.")
+                elif not price_text:
+                    details.append("Ready (completed).")
 
             community = str(project.get("community") or "").strip()
             if community and len(projects) == 1:

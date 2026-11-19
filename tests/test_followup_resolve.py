@@ -95,6 +95,27 @@ def test_family_kids_refinement_is_not_a_continue():
     assert resolution is None or resolution.get("kind") == "new"
 
 
+def test_sales_data_freshness_is_not_sticky_recommend_explain():
+    """After a recommend, meta 'most recent sales data' must not re-explain picks."""
+    state = {
+        "action": "recommend",
+        "kind": "family_areas",
+        "goal": "family",
+        "source_question": "Which Dubai areas are best for families?",
+        "budget_aed": 4000000,
+    }
+
+    async def _run(question):
+        return await resolve_followup(question, state, llm_generate=None)
+
+    for question in (
+        "What is the recent, uh, data we have for this sales? Sales.",
+        "what is themost recent data you have in the dubai sales data ?",
+    ):
+        resolution = asyncio.run(_run(question))
+        assert resolution is None or resolution.get("kind") == "new", question
+
+
 def test_show_more_followup_skips_llm():
     state = state_from_sale_filters(
         action="sales_list",

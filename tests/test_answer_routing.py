@@ -136,10 +136,11 @@ def test_browse_uses_fast_project_list():
     )
 
     answer = _build_fast_structured_answer(question, summary)
-    # Explain-first: restate the ask, then the grounded list.
-    assert answer.startswith("Understood:")
-    assert "Jumeirah Village Circle" in answer.split("\n", 1)[0]
+    # Browse lists lead with the count — no duplicated Understood block.
+    assert not answer.startswith("Understood:")
+    assert "Understood:" not in answer
     assert "I found 5" in answer
+    assert "Jumeirah Village Circle" in answer
     assert "AED 483,277" in answer
     assert "AED 840,000" in answer
     assert "Here are 1" not in answer
@@ -172,6 +173,7 @@ def test_propai_browse_says_recent_sale_not_starting_price():
             "bedroom_min": 0,
             "bedroom_max": 2,
             "handover_time": "2030-05-01",
+            "last_sold_on": "2026-10-01",
         }
     ])
     summary["project_total"] = 128
@@ -180,7 +182,96 @@ def test_propai_browse_says_recent_sale_not_starting_price():
     assert "I found 128 projects in Dubai Land Residence Complex" in answer
     assert "Recent sale AED 750,146" in answer
     assert "Starting price" not in answer
+    assert "Handover May 2030" in answer or "2030" in answer
     assert "Let me know if you need more details on any of these projects!" in answer
+
+
+def test_budget_miss_browse_shows_closest_above():
+    """Marina under 700k with no hits must show closest above-budget sales, not a dead end."""
+    question = "Show only ready 1-bedroom apartments in Dubai Marina under AED 700,000"
+    summary = _summary([
+        {
+            "name": "Pier 8",
+            "developer_name": "EMAAR",
+            "price": 741424,
+            "price_kind": "recent_sale",
+            "source": "propai",
+            "community": "Dubai Marina",
+            "bedroom_min": 1,
+            "bedroom_max": 1,
+            "handover_time": "2026-03-08",
+            "last_sold_on": "2026-03-11",
+        }
+    ])
+    summary["project_total"] = 1
+    summary["catalog_place"] = "Dubai Marina"
+    summary["budget_miss"] = True
+    summary["asked_max_price"] = 700_000
+    summary["lowest_price"] = 741_424
+    answer = _build_fast_structured_answer(question, summary)
+    assert "Understood:" not in answer
+    assert "don't have" in answer.lower() or "do not have" in answer.lower()
+    assert "700,000" in answer
+    assert "741,424" in answer
+    assert "Pier 8" in answer
+    assert "related options" in answer.lower()
+    assert "Try a higher budget" not in answer
+
+
+def test_sql_browse_marina_budget_miss_and_jvc_hit():
+    """Live path: Marina under 700k → related above; JVC under 700k → exact hits."""
+    from run import _sql_project_browse_turn
+
+    marina = _sql_project_browse_turn(
+        "Show only ready 1-bedroom apartments in dubai marina under AED 700,000",
+        None,
+    )
+    assert marina is not None
+    msum = marina["structured_summary"]
+    assert msum.get("budget_miss") is True
+    assert len(msum.get("projects") or []) >= 1
+    assert "related options" in marina["fast_answer"].lower()
+    assert "Try a higher budget" not in marina["fast_answer"]
+    assert "Pier 8" in marina["fast_answer"] or "741" in marina["fast_answer"]
+
+    jvc = _sql_project_browse_turn(
+        "Show only ready 1-bedroom apartments in JVC under AED 700,000",
+        None,
+    )
+    assert jvc is not None
+    jsum = jvc["structured_summary"]
+    assert not jsum.get("budget_miss")
+    assert len(jsum.get("projects") or []) >= 1
+    assert "under AED 700,000" in jvc["fast_answer"]
+    assert "don't have" not in jvc["fast_answer"].lower()
+
+
+def test_ready_browse_omits_ancient_handover_years():
+    """Ready stock must not lead with decade-old handover years."""
+    question = "Show only ready 1-bedroom apartments in JVC under AED 700,000"
+    summary = _summary([
+        {
+            "name": "Hanover Square",
+            "developer_name": "ACW HOLDING LTD.",
+            "price": 635000,
+            "price_kind": "recent_sale",
+            "source": "propai",
+            "community": "Jumeirah Village Circle",
+            "bedroom_min": 1,
+            "bedroom_max": 1,
+            "handover_time": "2015-12-01",
+            "last_sold_on": "2026-10-15",
+        }
+    ])
+    summary["project_total"] = 1
+    summary["catalog_place"] = "Jumeirah Village Circle"
+    answer = _build_fast_structured_answer(question, summary)
+    assert "Understood:" not in answer
+    assert answer.startswith("Here are 1 ready 1-bedroom option")
+    assert "Recent sale AED 635,000" in answer
+    assert "2026-10-15" in answer
+    assert "Handover December 2015" not in answer
+    assert "Handover November 2010" not in answer
 
 
 def test_browse_more_says_here_are_more():
@@ -867,7 +958,19 @@ def test_transaction_followup_on_listings_says_there_are_none(monkeypatch):
     assert "**Mayfair Tower**" in text
     assert "**• Recent Transactions:**" in text
     assert "• **2026-10-19**: AED 1,000,000, 1 bedroom, 807 sqft" in text
+    # Newest project activity first (Tower 2026-10-19 beats Residency 2026-09-03).
     assert text.index("Mayfair Tower") < text.index("Mayfair Residency")
+    # Even if card order listed Residency first, freshest sale still leads.
+    fresher_first = _format_transactions(
+        ["Mayfair Residency", "Mayfair Tower"],
+        {
+            "sales": [
+                {"project": "Mayfair Residency", "date": "2026-09-03", "price": 400000, "bedrooms": 1, "size_sqft": 298},
+                {"project": "Mayfair Tower", "date": "2026-11-18", "price": 1000000, "bedrooms": 1, "size_sqft": 807},
+            ],
+        },
+    )
+    assert fresher_first.index("Mayfair Tower") < fresher_first.index("Mayfair Residency")
 
 
 def test_shortlist_recommend_uses_projects_on_screen():
@@ -2168,9 +2271,38 @@ def test_data_freshness_answers_today_and_max_sale_date(monkeypatch):
     )
     assert out is not None
     assert out["use_fast"] is True
+    assert out.get("documents") == []
     assert "Today is" in out["fast_answer"]
     assert "3 Nov 2026" in out["fast_answer"] or "2026-11-03" in out["fast_answer"]
     assert "invent" in out["fast_answer"].lower()
+
+
+def test_data_freshness_paraphrases_about_recent_sales_data(monkeypatch):
+    """Spoken/meta freshness asks must not fall through to sticky recommend."""
+    from datetime import date
+    import app.retrieval.propai_catalog as catalog
+
+    monkeypatch.setattr(
+        catalog,
+        "fetch",
+        lambda sql, params=None: [{"latest": date(2026, 11, 18)}],
+    )
+    for question in (
+        "What is the recent, uh, data we have for this sales? Sales.",
+        "what is themost recent data you have in the dubai sales data ?",
+        "How recent is your sales data?",
+    ):
+        out = _data_freshness_turn(question)
+        assert out is not None, question
+        assert out["use_fast"] is True
+        assert "documents" in out
+        assert "18 Nov 2026" in out["fast_answer"] or "2026-11-18" in out["fast_answer"]
+
+
+def test_recent_sales_listing_is_not_data_freshness():
+    """'Show me recent sales' must stay on the sales-list path, not freshness."""
+    assert _data_freshness_turn("Show me recent sales in Business Bay") is None
+    assert _data_freshness_turn("Recent transactions for Hanover Square") is None
 
 
 def test_transactions_for_a_named_place_ignore_the_projects_on_screen(monkeypatch):

@@ -1175,6 +1175,9 @@ class HybridRetriever:
             "catalog_place": result.get("catalog_place") or None,
             "project_total": result.get("project_total"),
             "community_total": result.get("community_total"),
+            "budget_miss": bool(result.get("budget_miss", False)),
+            "asked_max_price": result.get("asked_max_price"),
+            "lowest_price": result.get("lowest_price"),
         }
 
     @staticmethod
@@ -1529,25 +1532,42 @@ class HybridRetriever:
             if str(name or "").strip()
         }
         try:
-            from app.retrieval.propai_catalog import agent_projects
+            from app.retrieval.propai_catalog import browse_projects_near_budget
 
             payload = {"communities": [label]}
             requested = getattr(self, "_request_filters", None) or {}
             if requested.get("bedrooms") is not None:
                 payload["bedrooms"] = requested["bedrooms"]
-            rows, total = agent_projects(
+            if requested.get("ready_only"):
+                payload["ready_only"] = True
+            max_price = requested.get("max_price_aed")
+            if max_price is None:
+                max_price = requested.get("max_price")
+            if max_price is not None:
+                payload["max_price"] = max_price
+            rows, total, budget_meta = browse_projects_near_budget(
                 payload,
                 limit=10,
-                sort="more" if skip else "latest_handover",
+                sort=(
+                    "more" if skip
+                    else "cheapest" if payload.get("max_price") is not None
+                    else "latest_handover"
+                ),
                 skip_names=skip,
             )
         except Exception as exc:
             print("Prop-AI place lookup error:", exc)
-            rows, total = [], 0
+            rows, total, budget_meta = [], 0, None
         if rows:
             result = self._project_result(rows)
-            result["project_total"] = total or len(rows)
             result["catalog_place"] = label
+            if budget_meta and budget_meta.get("budget_miss"):
+                result["budget_miss"] = True
+                result["asked_max_price"] = budget_meta.get("asked_max_price")
+                result["lowest_price"] = budget_meta.get("lowest_price")
+                result["project_total"] = len(rows)
+            else:
+                result["project_total"] = total or len(rows)
             return result
         return None
 
@@ -2887,6 +2907,15 @@ class HybridRetriever:
 
             "community_total":
                 structured_result.get("community_total"),
+
+            "budget_miss":
+                bool(structured_result.get("budget_miss", False)),
+
+            "asked_max_price":
+                structured_result.get("asked_max_price"),
+
+            "lowest_price":
+                structured_result.get("lowest_price"),
 
             "comparison":
                 bool(structured_result.get("comparison", False)),

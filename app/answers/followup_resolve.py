@@ -48,6 +48,24 @@ _NEW_TASK = re.compile(
     r"\bwhich\s+one\b",
     re.I,
 )
+# Catalog freshness / max sale date — never sticky-explain a prior recommend.
+_DATA_FRESHNESS_ASK = re.compile(
+    r"(?:"
+    r"today'?s\s+date|"
+    r"what(?:'s|\s+is)\s+today|"
+    r"current\s+date|"
+    r"latest\s+sale\s+date|"
+    r"how\s+(?:fresh|current|up[\s-]?to[\s-]?date)\s+(?:is\s+)?(?:your\s+)?data|"
+    r"how\s+recent\s+(?:is\s+)?(?:your\s+|the\s+)?(?:sales?\s+)?data\b|"
+    r"what(?:'s|\s+is)\s+the\s+(?:most\s+)?recent\s+data\b|"
+    r"(?:most\s+)?recent.{0,40}?data.{0,80}?\b(?:sales?|dubai)\b|"
+    r"(?:most\s+)?recent.{0,40}?(?:dubai\s+)?sales?\s+data\b|"
+    r"latest.{0,40}?data.{0,80}?\b(?:sales?|dubai)\b|"
+    r"data\s+(?:we|you)\s+have.{0,60}?\bsales?\b|"
+    r"sales?\s+data\b.{0,60}?\b(?:most\s+)?recent\b"
+    r")",
+    re.I | re.S,
+)
 
 
 def _is_attribute_about_shown(question: str | None) -> bool:
@@ -169,6 +187,15 @@ def _offline_resolve(question: str, state: dict[str, Any]) -> dict[str, Any]:
     split_path = _split_path_followup(text, state)
     if split_path is not None:
         return split_path
+    # "Most recent Dubai sales data?" is a catalog-freshness ask, not explain/rerun.
+    if _DATA_FRESHNESS_ASK.search(text):
+        return {
+            "kind": "new",
+            "more": False,
+            "mode": "rerun",
+            "action": state.get("action"),
+            "patch": {},
+        }
     if _family_focus_is_new_ask(text, state):
         return {
             "kind": "new",
@@ -317,6 +344,9 @@ async def resolve_followup(
     split_path = _split_path_followup(text, current)
     if split_path is not None:
         return split_path
+    # Catalog freshness must leave the sticky recommend/search thread.
+    if _DATA_FRESHNESS_ASK.search(text):
+        return None
     # Family kids / not-towers refinements must re-rank — never replay the prior list.
     if _family_focus_is_new_ask(text, current):
         return None

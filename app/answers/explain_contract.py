@@ -212,13 +212,14 @@ def build_browse_narrative(
     lines = [
         (
             f"I found {count}{ready_bit} projects{where}{bed_bit}. "
-            f"Below are {shown}{more_bit} of them, with recent recorded sale prices "
-            "when our sales data has a match — so you can scan market-backed figures, "
-            "not brochure-only starting prices."
+            f"Below are {shown}{more_bit} of them, priced from recorded sales in the "
+            "last 12 months when available — present market figures, not old catalog "
+            "starting prices or decade-old handover years."
         ),
         (
-            "Each line highlights community, recent sale level, bedroom range, and "
-            "handover when that date is still ahead. Open any card for the full project view."
+            "Each line quotes the recent sale level and bedroom range, plus the sale "
+            "date when recorded. Upcoming handover is shown only when it is still ahead. "
+            "Open any card for the full project view."
         ),
     ]
     return "\n\n".join(lines)

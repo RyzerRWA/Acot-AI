@@ -15,6 +15,7 @@ import hashlib
 import os
 import random
 import re
+import time
 from datetime import datetime
 
 from app.database.postgres import fetch
@@ -29,12 +30,15 @@ from app.retrieval.place_lock import (
 from app.retrieval.propai_vector_search import search_places
 
 MIN_SCORE = 0.55
+# Browse / recommend sale facts: present market only (not multi-year-old history).
+RECENT_SALE_MONTHS = 12
 DEFAULT_PROJECT_SORT = "latest_handover"
 _PROJECT_SORTS = {
     "cheapest",
     "priciest",
     "earliest_handover",
     "latest_handover",
+    "most_recent_sale",
     "largest",
     "more",
 }
@@ -236,9 +240,25 @@ def _projects_for(place: dict, limit: int = 8) -> list[dict]:
 
 
 _SALE_FACTS: dict[str, dict] = {}
+# Bi-daily DB loads: do not keep sale medians/last_sale forever in-process.
+_SALE_FACTS_LOADED_AT: float | None = None
+_SALE_FACTS_TTL_SEC = 6 * 3600
+
+
+def _maybe_expire_sale_facts() -> None:
+    global _SALE_FACTS_LOADED_AT
+    now = time.time()
+    if (
+        _SALE_FACTS_LOADED_AT is not None
+        and (now - _SALE_FACTS_LOADED_AT) >= _SALE_FACTS_TTL_SEC
+    ):
+        _SALE_FACTS.clear()
+        _SALE_FACTS_LOADED_AT = None
 
 
 def _add_sale_facts(projects: list[dict], bedrooms=None) -> None:
+    global _SALE_FACTS_LOADED_AT
+    _maybe_expire_sale_facts()
     names = [str(project["name"]).upper() for project in projects if project.get("name")]
     if not names:
         return
@@ -247,7 +267,10 @@ def _add_sale_facts(projects: list[dict], bedrooms=None) -> None:
         bed_key = int(float(bedrooms)) if bedrooms is not None and bedrooms != "" else None
     except (OverflowError, TypeError, ValueError):
         bed_key = None
-    cache_prefix = f"B{bed_key}|" if bed_key is not None else ""
+    cache_prefix = (
+        f"M{int(RECENT_SALE_MONTHS)}|"
+        + (f"B{bed_key}|" if bed_key is not None else "")
+    )
     missing = [
         name for name in dict.fromkeys(names)
         if f"{cache_prefix}{name}" not in _SALE_FACTS
@@ -256,7 +279,7 @@ def _add_sale_facts(projects: list[dict], bedrooms=None) -> None:
         parts = [
             "deleted_at is null",
             "sale_price between 100000 and 2000000000",
-            "instance_date >= current_date - interval '24 months'",
+            f"instance_date >= current_date - interval '{int(RECENT_SALE_MONTHS)} months'",
             "upper(project_name_prop_ai) = any(%s)",
         ]
         params: list = [missing]
@@ -284,6 +307,8 @@ def _add_sale_facts(projects: list[dict], bedrooms=None) -> None:
             _SALE_FACTS[f"{cache_prefix}{row['name']}"] = row
         for name in missing:
             _SALE_FACTS.setdefault(f"{cache_prefix}{name}", {})
+        if _SALE_FACTS_LOADED_AT is None:
+            _SALE_FACTS_LOADED_AT = time.time()
     for project in projects:
         stat = _SALE_FACTS.get(f"{cache_prefix}{str(project['name']).upper()}")
         if not stat:
@@ -450,16 +475,26 @@ def _stamp_value(value) -> float:
 def _project_sort_key(project: dict, sort: str):
     price = project.get("price") or 0
     handover = project.get("handover_time")
+    last_sale = project.get("last_sale") or project.get("last_sold_on")
     if sort == "priciest":
-        return (price <= 0, -(price or 0))
+        return (price <= 0, -(price or 0), -_stamp_value(last_sale))
     if sort == "earliest_handover":
         return (handover is None, handover or datetime(2099, 12, 31))
     if sort == "latest_handover":
         return (handover is None, -_stamp_value(handover))
+    if sort == "most_recent_sale":
+        # Present market activity first — never rank on decade-old handover alone.
+        return (
+            last_sale is None,
+            -_stamp_value(last_sale),
+            price <= 0,
+            price or 10**18,
+        )
     if sort == "largest":
         size = project.get("size_max") or project.get("size_min") or 0
         return (size <= 0, -(size or 0))
-    return (price <= 0, price or 10**18)
+    # cheapest (default price sort): budget fit, then freshest sale.
+    return (price <= 0, price or 10**18, -_stamp_value(last_sale))
 
 
 def _recent_best_key(project: dict) -> tuple:
@@ -577,6 +612,44 @@ def _propai_rejects_filters(filters: dict) -> bool:
     )
 
 
+def browse_projects_near_budget(
+    filters: dict,
+    limit: int = 8,
+    sort: str = DEFAULT_PROJECT_SORT,
+    skip_names=None,
+) -> tuple[list[dict], int, dict | None]:
+    """Run agent_projects; if a max budget yields nothing, return cheapest above it.
+
+    Third value is None on a normal hit, or a small meta dict on budget miss:
+    {budget_miss, asked_max_price, lowest_price}.
+    """
+    rows, total = agent_projects(
+        filters, limit=limit, sort=sort, skip_names=skip_names
+    )
+    asked_max = filters.get("max_price")
+    if rows or asked_max is None:
+        return rows, total, None
+    loose = {
+        key: value
+        for key, value in (filters or {}).items()
+        if key not in {"max_price", "min_price"}
+    }
+    near, near_total = agent_projects(
+        loose, limit=limit, sort="cheapest", skip_names=skip_names
+    )
+    lowest = None
+    if near and near[0].get("price") is not None:
+        try:
+            lowest = int(near[0]["price"])
+        except (TypeError, ValueError):
+            lowest = None
+    return near, near_total, {
+        "budget_miss": True,
+        "asked_max_price": int(asked_max) if asked_max is not None else None,
+        "lowest_price": lowest,
+    }
+
+
 def agent_projects(
     filters: dict,
     limit: int = 8,
@@ -608,20 +681,33 @@ def agent_projects(
         parts.append("extract(year from end_date) = %s")
         params.append(int(filters["handover_year"]))
     if filters.get("ready_only"):
-        # Ready stock only. "On Sale" / off-plan can still be Completed/FINISHED.
+        # Ready = already completed / handed over — not only rows whose status
+        # text happens to contain "ready" (most JVC towers use other labels).
         # Escape % for psycopg (%% → literal %).
         parts.append(
+            "("
             "("
             "offplan_status ilike '%%ready%%' "
             "and offplan_status not ilike '%%off-plan%%'"
             ") or ("
-            "offplan_status is null "
-            "and (status_group = 'Completed' or development_status = 'FINISHED')"
+            "status_group = 'Completed' or development_status = 'FINISHED'"
+            " or development_status ilike '%%complet%%'"
+            " or development_status ilike '%%exist%%'"
+            ") or ("
+            "end_date is not null and end_date::date <= current_date"
+            " and coalesce(offplan_status, '') not ilike '%%off-plan%%'"
+            ")"
             ")"
         )
     where = " and ".join(parts)
     if sort not in _PROJECT_SORTS:
         sort = DEFAULT_PROJECT_SORT
+    # Ready / budget browses must surface present sales activity, not old end_dates.
+    if (
+        sort == DEFAULT_PROJECT_SORT
+        and (filters.get("ready_only") or filters.get("max_price") is not None)
+    ):
+        sort = "most_recent_sale"
     if name:
         ranked = "lower(name) = lower(%s) desc, length(name), name"
     elif sort in {"latest_handover", "more"}:
@@ -629,6 +715,7 @@ def agent_projects(
     elif sort == "earliest_handover":
         ranked = "end_date asc nulls last, name"
     else:
+        # most_recent_sale / cheapest / etc. re-ranked after sale facts attach.
         ranked = "name"
     # Cap candidates before sale stats; ranking still uses the same pool size as before.
     fetch_limit = 200
@@ -688,6 +775,34 @@ def agent_projects(
     _add_sale_facts(projects, bedrooms=bedrooms)
     if communities:
         projects = drop_numbered_siblings(projects, communities)
+        # Soft reject only: drop rows that clearly name a *different* marketing
+        # place (e.g. Dubai South on a JVC ask). Do not require the marketing
+        # name inside DLD area codes — that emptied real JVC/Marina lists.
+        allowed = set(asked_keys(_expanded(communities)))
+        allowed.update(asked_keys(_official_areas(communities)))
+        rivals = {
+            asked_keys([proper])[0]
+            for proper in _static_dubai_names().values()
+            if proper and asked_keys([proper])
+        }
+        rivals -= allowed
+        # Ignore short tokens (JLT, DIFC) — too many false conflicts.
+        rivals = {key for key in rivals if len(key) >= 10}
+        if rivals:
+            kept = []
+            for project in projects:
+                blob_n = " ".join(
+                    str(project.get(field) or "")
+                    for field in ("community", "sub_community", "name")
+                ).upper()
+                blob_n = " ".join(blob_n.split())
+                if any(key in blob_n for key in allowed if len(key) >= 5):
+                    kept.append(project)
+                    continue
+                if any(rival in blob_n for rival in rivals):
+                    continue
+                kept.append(project)
+            projects = kept
         total = len(projects)
     if bedrooms is not None:
         wanted = int(bedrooms)
@@ -705,8 +820,19 @@ def agent_projects(
             if project.get("price")
             and (lo is None or project["price"] >= lo)
             and (hi is None or project["price"] <= hi)
+            # Budget answers only from recent recorded sales — never stale catalog.
+            and (project.get("last_sold_on") or project.get("last_sale"))
         ]
         total = len(projects)
+    elif filters.get("ready_only"):
+        # Ready list without budget: still prefer projects with present-window sales.
+        with_sales = [
+            project for project in projects
+            if project.get("last_sold_on") or project.get("last_sale")
+        ]
+        if with_sales:
+            projects = with_sales
+            total = len(projects)
     for project in projects:
         for key in ("bedroom_min", "bedroom_max"):
             if project.get(key) is not None:
@@ -729,7 +855,11 @@ def agent_projects(
 
 
 def recent_sales(name, limit: int = 8, per_project: int = 5, offset: int = 0) -> dict:
-    """Recent recorded sales for the named projects. One query, newest first per project."""
+    """Recent recorded sales for the named projects.
+
+    Newest sale first overall (bi-daily loads stay on top). Each project still
+    contributes its own newest page so one active project cannot crowd others out.
+    """
     raw = name if isinstance(name, (list, tuple)) else [name]
     projects = []
     for item in raw:
@@ -762,26 +892,23 @@ def recent_sales(name, limit: int = 8, per_project: int = 5, offset: int = 0) ->
               and upper(project_name_prop_ai) = any(%s)
         ) ranked
         where rn > %s and rn <= %s
+        order by sold_on desc nulls last
         """,
         (projects, start, start + per),
     )
-    by_name = {key: [] for key in projects}
-    for row in rows:
+    sales = []
+    for row in rows or []:
         sold = row.get("sold_on")
-        key = str(row.get("project") or "").upper()
-        sale = {
+        sales.append({
             "project": row.get("project"),
             "date": sold.isoformat() if hasattr(sold, "isoformat") else (str(sold)[:10] if sold else None),
             "price": None if row.get("price") is None else int(row["price"]),
             "bedrooms": None if row.get("bedrooms") is None else int(float(row["bedrooms"])),
             "size_sqft": None if row.get("size_sqft") is None else int(row["size_sqft"]),
             "property_type": row.get("property_type"),
-        }
-        if key in by_name:
-            by_name[key].append(sale)
-    sales = []
-    for key in projects:
-        sales.extend(by_name.get(key) or [])
+        })
+    # Defense in depth if the driver drops the outer order.
+    sales.sort(key=lambda sale: str(sale.get("date") or ""), reverse=True)
     return {"count": len(sales), "sales": sales}
 
 
@@ -1308,9 +1435,13 @@ def list_rents(
     beds_max=None,
     *,
     limit: int = 8,
-    sort: str = "cheapest",
+    sort: str = "newest",
 ) -> dict:
-    """Browse registered rents from propai_rents (not Bayut listings)."""
+    """Browse registered rents from propai_rents (not Bayut listings).
+
+    Default newest contracts first (bi-daily loads). Pass sort='cheapest' /
+    'priciest' when the user asks for price extremes.
+    """
     asked = _expanded(areas)
     if not asked:
         return {"matching_listings": 0, "listings": [], "note": "Name a Dubai area to search Prop-AI rents."}
@@ -1328,11 +1459,12 @@ def list_rents(
     if beds_max is not None:
         clauses.append("bedrooms <= %s")
         params.append(beds_max)
+    sort_key = str(sort or "newest").lower()
     order = {
         "cheapest": "annual_amount asc nulls last, contract_start_date desc nulls last",
         "priciest": "annual_amount desc nulls last, contract_start_date desc nulls last",
         "newest": "contract_start_date desc nulls last, annual_amount asc nulls last",
-    }.get(str(sort or "cheapest").lower(), "annual_amount asc nulls last")
+    }.get(sort_key, "contract_start_date desc nulls last, annual_amount asc nulls last")
     cap = max(1, min(int(limit or 8), 20))
     where = " and ".join(clauses)
     try:
@@ -1844,7 +1976,7 @@ def sale_summary(communities) -> dict | None:
                    percentile_cont(0.5) within group (order by sale_price)::bigint as median
             from propai_sales
             where deleted_at is null and sale_price > 0
-              and instance_date >= current_date - interval '24 months'
+              and instance_date >= current_date - interval '{int(RECENT_SALE_MONTHS)} months'
               and {sales_lock}
             """,
             tuple(sales_params),
@@ -1858,5 +1990,8 @@ def sale_summary(communities) -> dict | None:
         "projects": projects,
         "sales": sales.get("n") or 0,
         "median_recent_sale_aed": None if median is None else int(median),
-        "note": "Recorded sales from the last 24 months in the new data. Prefer this price over an older starting price.",
+        "note": (
+            f"Recorded sales from the last {int(RECENT_SALE_MONTHS)} months in the new data. "
+            "Prefer this price over an older starting price."
+        ),
     }

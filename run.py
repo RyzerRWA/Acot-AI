@@ -870,14 +870,17 @@ def _format_transactions(name, payload, label=None, more=False) -> str:
         if not key:
             continue
         grouped.setdefault(key.upper(), {"name": key, "sales": []})["sales"].append(sale)
-    order = []
-    for item in names:
-        key = str(item or "").strip().upper()
-        if key and key in grouped and key not in order:
-            order.append(key)
-    for key in grouped:
-        if key not in order:
-            order.append(key)
+    # Newest sale date first overall — project blocks follow the freshest activity.
+    for block in grouped.values():
+        block["sales"].sort(
+            key=lambda sale: str(sale.get("date") or ""),
+            reverse=True,
+        )
+    order = sorted(
+        grouped.keys(),
+        key=lambda key: str((grouped[key]["sales"][0] or {}).get("date") or ""),
+        reverse=True,
+    )
     lead = (
         f"Here are more recent transaction details for {intro}:"
         if more else
@@ -1334,7 +1337,7 @@ def _execute_sales_from_state(question, conversation_memory, *, more: bool = Fal
 
 def _execute_search_from_state(question, conversation_memory, *, more: bool = False):
     """Re-run project browse from dialogue_state slots."""
-    from app.retrieval.propai_catalog import agent_projects
+    from app.retrieval.propai_catalog import browse_projects_near_budget
 
     if hasattr(conversation_memory, "get_dialogue_state"):
         state = conversation_memory.get_dialogue_state()
@@ -1370,8 +1373,9 @@ def _execute_search_from_state(question, conversation_memory, *, more: bool = Fa
         else "priciest" if payload.get("min_price") is not None
         else "latest_handover"
     )
+
     try:
-        rows, total = agent_projects(
+        rows, total, budget_meta = browse_projects_near_budget(
             payload, limit=10, sort=sort, skip_names=skip or None
         )
     except Exception as exc:
@@ -1395,14 +1399,27 @@ def _execute_search_from_state(question, conversation_memory, *, more: bool = Fa
             "fast_answer": (
                 f"I found no more matching projects for {where} "
                 "with the same filters."
+                if more
+                else (
+                    f"I don't have projects for {where} with those exact filters "
+                    "in the last 12 months of recorded sales. "
+                    "Try a nearby area, a higher budget, or fewer filters."
+                )
             ),
             "context": None,
             "small_talk": None,
         }
     summary = _empty_structured_summary()
     summary["projects"] = rows
-    summary["project_total"] = total or len(rows)
     summary["catalog_place"] = str(place or "Dubai").strip()
+    if budget_meta and budget_meta.get("budget_miss"):
+        summary["budget_miss"] = True
+        summary["asked_max_price"] = budget_meta.get("asked_max_price")
+        summary["lowest_price"] = budget_meta.get("lowest_price")
+        # Show the related page only — keep the miss explanation, not "I found N".
+        summary["project_total"] = len(rows)
+    else:
+        summary["project_total"] = total or len(rows)
     shown = skip + [str(row.get("name") or "").strip() for row in rows if row.get("name")]
     _set_dialogue_state(
         conversation_memory,
@@ -1410,7 +1427,7 @@ def _execute_search_from_state(question, conversation_memory, *, more: bool = Fa
             **state,
             "action": "search",
             "exclude_names": [name for name in shown if name][:40],
-            "last_result": {"project_total": total or len(rows)},
+            "last_result": {"project_total": summary["project_total"]},
             "source_question": state.get("source_question") or question,
         },
         replace=True,
@@ -3064,6 +3081,8 @@ def _place_detail_turn(question, conversation_memory=None):
     }
 
 
+# Meta asks about catalog calendar / max sale date — not "show me recent sales".
+# Require "data" (or today/latest-sale-date) so listing browses stay on sales_list.
 _DATA_FRESHNESS = re.compile(
     r"(?:"
     r"today'?s\s+date|"
@@ -3073,9 +3092,16 @@ _DATA_FRESHNESS = re.compile(
     r"how\s+(?:fresh|current|up[\s-]?to[\s-]?date)\s+(?:is\s+)?(?:your\s+)?data|"
     r"as\s+of\s+when|"
     r"until\s+when\s+(?:is\s+)?(?:your\s+)?(?:sales?\s+)?data|"
-    r"latest\s+sale\s+date\s+in\s+your\s+data"
+    r"how\s+recent\s+(?:is\s+)?(?:your\s+|the\s+)?(?:sales?\s+)?data\b|"
+    r"what(?:'s|\s+is)\s+the\s+(?:most\s+)?recent\s+data\b|"
+    r"(?:most\s+)?recent.{0,40}?data.{0,80}?\b(?:sales?|dubai)\b|"
+    r"(?:most\s+)?recent.{0,40}?(?:dubai\s+)?sales?\s+data\b|"
+    r"latest.{0,40}?data.{0,80}?\b(?:sales?|dubai)\b|"
+    r"data\s+(?:we|you)\s+have.{0,60}?\bsales?\b|"
+    r"sales?\s+data\b.{0,60}?\b(?:most\s+)?recent\b|"
+    r"freshest\s+(?:sales?\s+)?data\b"
     r")",
-    re.I,
+    re.I | re.S,
 )
 
 
@@ -3305,7 +3331,10 @@ def _sql_project_browse_turn(question, conversation_memory=None):
             return None
         citywide = True
 
-    from app.retrieval.propai_catalog import agent_projects, resolve_dubai_place
+    from app.retrieval.propai_catalog import (
+        browse_projects_near_budget,
+        resolve_dubai_place,
+    )
 
     try:
         resolved = resolve_dubai_place(place) or place if place else None
@@ -3347,7 +3376,7 @@ def _sql_project_browse_turn(question, conversation_memory=None):
         sort = "latest_handover"
 
     try:
-        rows, total = agent_projects(
+        rows, total, budget_meta = browse_projects_near_budget(
             payload,
             limit=10,
             sort=sort,
@@ -3373,7 +3402,7 @@ def _sql_project_browse_turn(question, conversation_memory=None):
             answer = (
                 "I found no matching projects for "
                 + " ".join(bits)
-                + "."
+                + " in the last 12 months of recorded sales."
             )
             summary = _empty_structured_summary()
             summary["project_total"] = 0
@@ -3404,8 +3433,14 @@ def _sql_project_browse_turn(question, conversation_memory=None):
 
     summary = _empty_structured_summary()
     summary["projects"] = rows
-    summary["project_total"] = total or len(rows)
     summary["catalog_place"] = str(resolved or "Dubai").strip()
+    if budget_meta and budget_meta.get("budget_miss"):
+        summary["budget_miss"] = True
+        summary["asked_max_price"] = budget_meta.get("asked_max_price")
+        summary["lowest_price"] = budget_meta.get("lowest_price")
+        summary["project_total"] = len(rows)
+    else:
+        summary["project_total"] = total or len(rows)
     _set_dialogue_state(
         conversation_memory,
         {
@@ -3419,7 +3454,7 @@ def _sql_project_browse_turn(question, conversation_memory=None):
             "prefer_cheaper": sort == "cheapest",
             "exclude_names": skip or [],
             "offset": 0,
-            "last_result": {"project_total": total or len(rows)},
+            "last_result": {"project_total": summary["project_total"]},
             "source_question": question,
             "goal": None,
         },
@@ -4494,7 +4529,7 @@ async def _prepare_acot_turn(question, components):
     if carry and not prepared.get("broker_companion"):
         prepared["broker_companion"] = carry
         prepared["companion_suffix"] = f"**For you:** {carry['answer']}" if carry.get("answer") else ""
-    return prepared
+    return _ensure_prepared_turn(prepared)
 
 
 async def _prepare_acot_turn_inner(
@@ -5019,6 +5054,15 @@ async def _prepare_acot_turn_inner(
         "catalog_place": structured_data.get("catalog_place"),
         "project_total": structured_data.get("project_total"),
         "community_total": structured_data.get("community_total"),
+        "budget_miss": bool(
+            result.get("budget_miss", structured_data.get("budget_miss", False))
+        ),
+        "asked_max_price": result.get(
+            "asked_max_price", structured_data.get("asked_max_price")
+        ),
+        "lowest_price": result.get(
+            "lowest_price", structured_data.get("lowest_price")
+        ),
         "comparison": structured_data.get("comparison", False),
         "comparison_entities": structured_data.get("comparison_entities") or [],
         "filter_no_match": result.get(
@@ -5169,17 +5213,47 @@ async def _prepare_acot_turn_inner(
     }
 
 
-def _finalize_acot_turn(prepared, answer, answer_started):
-    timing_ms = dict(prepared["timing_ms"])
-    timing_ms["answer"] = _elapsed_ms(answer_started)
-    timing_ms["ask"] = _elapsed_ms(prepared["ask_started"])
-
-    prepared["conversation_memory"].update(
-        user_question=prepared["question"],
-        standalone_question=prepared["standalone_question"],
-        answer=answer,
-        retrieval_result=prepared["retrieval_result"],
+def _ensure_prepared_turn(prepared):
+    """Fill required finalize keys so a partial fast-turn never KeyErrors."""
+    if not isinstance(prepared, dict):
+        return prepared
+    prepared.setdefault("documents", [])
+    prepared.setdefault("investment_analysis", None)
+    prepared.setdefault("structured_summary", _empty_structured_summary())
+    prepared.setdefault(
+        "retrieval_result",
+        {
+            "question_type": prepared.get("question_type") or "general",
+            "structured_data": {
+                "community": [],
+                "projects": [],
+                "sub_communities": [],
+            },
+            "documents": [],
+        },
     )
+    prepared.setdefault("timing_ms", {})
+    prepared.setdefault("question", "")
+    prepared.setdefault("standalone_question", prepared.get("question") or "")
+    prepared.setdefault("question_type", "general")
+    return prepared
+
+
+def _finalize_acot_turn(prepared, answer, answer_started):
+    prepared = _ensure_prepared_turn(prepared)
+    timing_ms = dict(prepared.get("timing_ms") or {})
+    timing_ms["answer"] = _elapsed_ms(answer_started)
+    if prepared.get("ask_started") is not None:
+        timing_ms["ask"] = _elapsed_ms(prepared["ask_started"])
+
+    memory = prepared.get("conversation_memory")
+    if memory is not None and hasattr(memory, "update"):
+        memory.update(
+            user_question=prepared["question"],
+            standalone_question=prepared["standalone_question"],
+            answer=answer,
+            retrieval_result=prepared["retrieval_result"],
+        )
 
     response = build_frontend_response(
         question=prepared["question"],
@@ -5187,8 +5261,8 @@ def _finalize_acot_turn(prepared, answer, answer_started):
         answer=answer,
         question_type=prepared["question_type"],
         structured_summary=prepared["structured_summary"],
-        documents=prepared["documents"],
-        investment_analysis=prepared["investment_analysis"],
+        documents=prepared.get("documents") or [],
+        investment_analysis=prepared.get("investment_analysis"),
     )
     response.setdefault("meta", {})["timing_ms"] = timing_ms
     if prepared.get("agent"):

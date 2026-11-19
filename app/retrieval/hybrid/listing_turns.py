@@ -32,9 +32,24 @@ _TYPE_MAP = {
 
 
 def listing_search_args(question: str, filters: Optional[Dict[str, Any]] = None) -> dict:
-    """Tool arguments for a rent browse. No database call."""
+    """Tool arguments for a rent browse. No database call.
+
+    Newest contracts first by default (bi-daily Prop-AI loads). Price extremes
+    only when the user asks cheap/pricey/budget.
+    """
     filters = filters or {}
-    args: dict = {"limit": BROWSE_LISTING_LIMIT, "sort": "cheapest"}
+    text = question or ""
+    if re.search(
+        r"\b(?:cheapest|lowest|affordable|budget|under|below|less\s+than)\b",
+        text,
+        re.I,
+    ):
+        sort = "cheapest"
+    elif re.search(r"\b(?:priciest|most\s+expensive|highest\s+rent)\b", text, re.I):
+        sort = "priciest"
+    else:
+        sort = "newest"
+    args: dict = {"limit": BROWSE_LISTING_LIMIT, "sort": sort}
     from app.answers.intent_route import extract_place, parse_bedrooms
 
     place = extract_place(question) or filters.get("community") or filters.get("place")
@@ -146,7 +161,7 @@ def retrieve_listings(db, question: str, filters: Dict[str, Any]) -> Dict[str, A
             args.get("beds_min"),
             args.get("beds_max"),
             limit=BROWSE_LISTING_LIMIT,
-            sort=str(args.get("sort") or "cheapest"),
+            sort=str(args.get("sort") or ["newest","Cheapest"]),
         )
         rows = list(found.get("listings") or [])
         total = int(found.get("matching_listings") or len(rows))
