@@ -24,6 +24,7 @@ from app.answers.intent_route import (
     is_no_preference_reply,
     is_show_more,
     parse_bedrooms,
+    parse_budget_aed,
     prior_anchor_question,
     reuse_last_search,
     wants_more_results,
@@ -665,19 +666,28 @@ _SMALL_TALK_REAL_ASK = re.compile(
 
 
 _TRANSACTION = re.compile(
-    r"\b(?:transactions?|transcations?|trancations?|transctions?|sale history|sales history)\b",
+    r"\b(?:"
+    r"transactions?|transcations?|trancations?|transctions?|"
+    r"sale history|sales history|"
+    # Demo wording: "recent sales", "last 5 sales", "were sold in November"
+    r"(?:recent|latest|last|newest|recorded|past)\s+sales?|"
+    r"sales?\s+(?:in|of|for|from|under|over|between|with)|"
+    r"last\s+\d+\s+sales?|"
+    r"how many\b[\s\S]{0,60}?\bsold\b|"
+    r"\bsold\b[\s\S]{0,40}?\b(?:in|during|this|last|november|october|september|august|july|june|may|april|march|february|january|20\d{2})"
+    r")\b",
     re.I,
 )
 _TRANSACTION_BROWSE = re.compile(
-    r"\b(?:show|list|find|give|tell|latest|recent|last|newest|more)\b",
+    r"\b(?:show|list|find|give|tell|latest|recent|last|newest|more|how many|sold)\b",
     re.I,
 )
 _TRANSACTION_FILLER = re.compile(
     r"\b(?:show|me|tell|find|list|give|the|top|best|latest|recent|last|newest|"
-    r"recorded|please|can|you|could|what|are|is|any|all|"
-    r"transactions?|transcations?|trancations?|transctions?|"
+    r"recorded|please|can|you|could|what|are|is|any|all|how|many|"
+    r"transactions?|transcations?|trancations?|transctions?|sales?|sold|"
     r"sale history|sales history|details?|info|information|about|"
-    r"for|in|at|of|dubai)\b",
+    r"for|in|at|of|dubai|apartments?|bedroom|bedrooms?|studio|studios?)\b",
     re.I,
 )
 _MORE_TRANSACTIONS = re.compile(
@@ -686,6 +696,95 @@ _MORE_TRANSACTIONS = re.compile(
 )
 _TRANSACTION_PAGE_SIZE = 5
 _MORE_TRANSACTION_FOLLOWUP = "Can you show me more transactions"
+_LAST_N_SALES = re.compile(r"\blast\s+(\d{1,2})\s+sales?\b", re.I)
+# Bedroom-only / "same but 2 beds" after an active sales task (no "sales" word needed).
+_SALES_SLOT_TWEAK = re.compile(
+    r"\b(?:same|again|instead|also|but|now|what about|how about)\b|"
+    r"\b(?:\d+|one|two|three|four|five|studio)\s*-?\s*bed(?:room)?s?\b|"
+    r"\bstudio\b",
+    re.I,
+)
+
+
+def _parse_sale_limit(question: str | None) -> int | None:
+    """'last 5 sales' → 5; None when the user did not ask for a fixed last-N."""
+    match = _LAST_N_SALES.search(question or "")
+    if not match:
+        return None
+    return max(1, min(int(match.group(1)), 15))
+
+
+def _sale_list_limit(question: str | None = None, state: dict | None = None) -> int:
+    """Prefer explicit last-N, then carried dialogue_state.limit, else default 8."""
+    from_q = _parse_sale_limit(question)
+    if from_q is not None:
+        return from_q
+    if isinstance(state, dict) and state.get("limit") is not None:
+        try:
+            return max(1, min(int(state["limit"]), 15))
+        except (OverflowError, TypeError, ValueError):
+            pass
+    prior = None
+    if isinstance(state, dict):
+        prior = state.get("source_question")
+    from_prior = _parse_sale_limit(prior)
+    if from_prior is not None:
+        return from_prior
+    return 8
+_SALE_COUNT_ASK = re.compile(r"\bhow many\b[\s\S]{0,80}\bsold\b", re.I)
+# Extreme class only — whether this is a sales aggregate comes from
+# turn understanding + dialogue context, not from synonym lists.
+_CHEAPEST_SALE_ASK = re.compile(
+    r"\b(?:cheapest|lowest|least\s+expensive)\b",
+    re.I,
+)
+_HIGHEST_SALE_ASK = re.compile(
+    r"\b(?:highest|most\s+expensive|priciest|maximum)\b",
+    re.I,
+)
+_AVERAGE_SALE_ASK = re.compile(
+    r"\b(?:average|median|mean)\b",
+    re.I,
+)
+_WHICH_AMONG_SHOWN = re.compile(
+    r"\b(?:which\s+one|which\s+(?:project|of\s+(?:these|those|them))|"
+    r"among\s+(?:these|those)|(?:of|from)\s+(?:these|those|them))\b",
+    re.I,
+)
+_PROJECT_COUNT_ASK = re.compile(
+    r"\bhow many\b[\s\S]{0,40}\b(?:residential\s+)?projects?\b",
+    re.I,
+)
+_DEVELOPER_RANK_ASK = re.compile(
+    r"\b(?:which|top|best)\b[\s\S]{0,50}\bdevelopers?\b|"
+    r"\bdevelopers?\b[\s\S]{0,60}\b(?:highest|most|top|largest)\b[\s\S]{0,40}"
+    r"\b(?:sales?|value|volume|revenue)\b",
+    re.I,
+)
+_READY_ONLY_ASK = re.compile(
+    r"\b(?:ready(?:\s+only)?|only\s+ready|completed\s+only|only\s+completed)\b",
+    re.I,
+)
+_PRICE_FLOOR_ASK = re.compile(
+    r"\b(?:above|over|starting\s+(?:above|from|at)|greater\s+than|more\s+than)\b",
+    re.I,
+)
+_PRICE_CEILING_ASK = re.compile(
+    r"\b(?:under|below|up\s+to|max(?:imum)?|no\s+more\s+than|less\s+than)\b",
+    re.I,
+)
+# After a count/sales answer: "ok show me", "yes show", "show them", "list those sales"
+_SHOW_PRIOR_SALES = re.compile(
+    r"^\s*(?:(?:ok|okay|alright|sure|yes|yep|yeah|please|pls|then|and)\s+){0,3}"
+    r"(?:"
+    r"show(?:\s+me)?(?:\s+(?:them|those|it|the(?:\s+\w+){0,3}))?|"
+    r"list(?:\s+(?:them|those|it|the(?:\s+\w+){0,3}))?|"
+    r"see(?:\s+(?:them|those|it|the(?:\s+\w+){0,3}))?|"
+    r"(?:the\s+)?(?:sales?|transactions?|details?|list)"
+    r")"
+    r"\s*[.!]?\s*$",
+    re.I,
+)
 
 
 def _transaction_place(question):
@@ -722,15 +821,20 @@ def _transaction_subject(question, conversation_memory):
     named = [project for project in projects if str(project["name"]).lower() in asked]
     if named:
         return named[:8]
-    # "Recent transactions in Dubai Marina" with JVC projects on screen means Dubai Marina, not the screen.
-    from app.retrieval.propai_catalog import agent_projects, place_named
+    # A named area ("sales in Business Bay") must use area-wide latest_sales,
+    # not eight random projects from that area. Only on-screen projects apply
+    # when the ask does not name a different place.
+    from app.retrieval.propai_catalog import place_named
     place = place_named(question)
-    if place and not any(
-        place.lower() in " ".join(str(project.get(k) or "") for k in ("community", "sub_community", "area")).lower()
-        for project in projects
-    ):
-        rows, _ = agent_projects({"communities": [place]}, limit=8)
-        return rows or None
+    if place:
+        on_screen_same_place = any(
+            place.lower() in " ".join(
+                str(project.get(k) or "") for k in ("community", "sub_community", "area")
+            ).lower()
+            for project in projects
+        )
+        if not on_screen_same_place:
+            return None
     return projects[:8] or None
 
 
@@ -789,15 +893,77 @@ def _format_transactions(name, payload, label=None, more=False) -> str:
         for sale in block["sales"]:
             lines.append(_sale_line(sale))
         lines.append("")
+    # Grounding line: say what the list is (newest first, how many, which dates).
+    dates = sorted(
+        str(sale.get("date"))[:10] for sale in sales if sale.get("date")
+    )
+    span = ""
+    if dates:
+        span = (
+            f" from {dates[0]} to {dates[-1]}" if dates[0] != dates[-1] else f" on {dates[0]}"
+        )
+    lines.append(
+        f"These are the {len(sales)} most recent recorded sale"
+        f"{'s' if len(sales) != 1 else ''} for {intro}{span} "
+        "(newest first). Source: Dubai Land Department sale records."
+    )
     return "\n".join(lines).rstrip()
 
 
-def _transaction_reply(question, answer, sales=None, followup=True):
+def _remember_sale_projects(conversation_memory, sales) -> list[dict]:
+    """Keep unique project stubs from a sales answer for 'developer of these' follow-ups."""
+    stubs: list[dict] = []
+    seen: set[str] = set()
+    for sale in sales or []:
+        name = str((sale or {}).get("project") or "").strip()
+        if not name:
+            continue
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        stubs.append({"name": name, "entity_type": "project"})
+    if conversation_memory is not None:
+        conversation_memory.last_sale_projects = stubs
+    return stubs
+
+
+def _hydrate_projects_with_developers(projects: list[dict]) -> list[dict]:
+    """Fill developer_name from Prop-AI when stubs only have a project name."""
+    if not projects:
+        return []
+    from app.retrieval.propai_catalog import agent_projects
+
+    hydrated = []
+    for project in projects:
+        if not isinstance(project, dict):
+            continue
+        name = str(project.get("name") or "").strip()
+        if not name:
+            continue
+        row = dict(project)
+        if not str(row.get("developer_name") or row.get("developer") or "").strip():
+            try:
+                matches, _ = agent_projects({"name": name}, limit=1)
+            except Exception:
+                matches = []
+            if matches:
+                match = matches[0]
+                row["developer_name"] = match.get("developer_name") or match.get("developer")
+                row.setdefault("community", match.get("community"))
+                row.setdefault("id", match.get("id"))
+        row["entity_type"] = "project"
+        hydrated.append(row)
+    return hydrated
+
+
+def _transaction_reply(question, answer, sales=None, followup=True, conversation_memory=None):
     summary = _empty_structured_summary()
     if followup:
         summary["transaction_followup"] = True
     # The sales themselves, so the app can show them by unit type and over time (data.transactions).
     summary["transactions"] = sales or []
+    _remember_sale_projects(conversation_memory, sales)
     return {
         "question": question,
         "standalone_question": question,
@@ -817,17 +983,1217 @@ def _transaction_reply(question, answer, sales=None, followup=True):
     }
 
 
+def _bed_label(bed) -> str:
+    if bed == 0:
+        return "studio"
+    if bed is None:
+        return "homes"
+    return "1-bedroom" if int(bed) == 1 else f"{int(bed)}-bedroom"
+
+
+def _sale_query_from_question(question) -> dict | None:
+    """Place / beds / month filters from a sales or sale-count ask."""
+    from app.retrieval.propai_catalog import (
+        parse_sale_month_year,
+        place_named,
+        resolve_dubai_place,
+    )
+
+    place = (
+        extract_place(question)
+        or place_named(question)
+        or _transaction_place(question)
+    )
+    resolved = resolve_dubai_place(place) if place else None
+    place = resolved or place
+    beds = parse_bedrooms(question)
+    bed = beds[0] if beds else None
+    month, year = parse_sale_month_year(question)
+    if not place and bed is None and year is None:
+        return None
+    return {
+        "place": place,
+        "bedrooms": bed,
+        "year": year,
+        "month": month,
+        "source_question": question,
+    }
+
+
+def _set_dialogue_state(
+    conversation_memory,
+    updates: dict | None,
+    *,
+    replace: bool = False,
+) -> dict | None:
+    """Write task slots onto session memory (Phase 1 dialogue state)."""
+    if conversation_memory is None or not updates:
+        return None
+    from app.memory.dialogue_state import (
+        normalize_dialogue_state,
+        patch_dialogue_state,
+        sale_filters_from_state,
+    )
+
+    if replace:
+        state = normalize_dialogue_state(updates)
+        if hasattr(conversation_memory, "set_dialogue_state"):
+            return conversation_memory.set_dialogue_state(state)
+        conversation_memory.dialogue_state = state
+        conversation_memory.sale_query = sale_filters_from_state(state)
+        return state
+    if hasattr(conversation_memory, "patch_dialogue_state"):
+        return conversation_memory.patch_dialogue_state(updates)
+    current = getattr(conversation_memory, "dialogue_state", None)
+    state = patch_dialogue_state(current, updates)
+    conversation_memory.dialogue_state = state
+    conversation_memory.sale_query = sale_filters_from_state(state)
+    return state
+
+
+def _remember_sale_query(conversation_memory, query: dict | None, *, replace: bool = True) -> None:
+    """Persist sales filters into dialogue_state (and legacy sale_query mirror)."""
+    if conversation_memory is None or not query:
+        return
+    action = "sales_count" if query.get("count") is not None and not query.get("listed") else "sales_list"
+    if query.get("action") in {"sales_count", "sales_list"}:
+        action = query["action"]
+    updates = {
+        "action": action,
+        "place": query.get("place"),
+        "beds": query.get("bedrooms") if "bedrooms" in query else query.get("beds"),
+        "month": query.get("month"),
+        "year": query.get("year"),
+        "source_question": query.get("source_question"),
+        "offset": int(query.get("offset") or 0),
+        "budget_aed": None,
+        "ready_only": False,
+        "prefer_cheaper": False,
+        "goal": None,
+        "exclude_names": [],
+    }
+    if query.get("limit") is not None:
+        updates["limit"] = query.get("limit")
+    elif query.get("source_question"):
+        parsed_limit = _parse_sale_limit(query.get("source_question"))
+        if parsed_limit is not None:
+            updates["limit"] = parsed_limit
+    if query.get("count") is not None:
+        updates["last_result"] = {"count": query.get("count")}
+    # Follow-up list after a count: keep prior last_result count when replace=False.
+    _set_dialogue_state(conversation_memory, updates, replace=replace)
+
+
+def _prior_sale_query(conversation_memory) -> dict | None:
+    if conversation_memory is None:
+        return None
+    from app.memory.dialogue_state import sale_filters_from_state
+
+    if hasattr(conversation_memory, "get_dialogue_state"):
+        from_state = sale_filters_from_state(conversation_memory.get_dialogue_state())
+        if from_state and (
+            from_state.get("place")
+            or from_state.get("bedrooms") is not None
+            or from_state.get("year") is not None
+        ):
+            return from_state
+    stored = getattr(conversation_memory, "sale_query", None)
+    if isinstance(stored, dict) and stored:
+        return stored
+    # Plain test doubles may only have dialogue_state.
+    from_state = sale_filters_from_state(getattr(conversation_memory, "dialogue_state", None))
+    if from_state and (
+        from_state.get("place")
+        or from_state.get("bedrooms") is not None
+        or from_state.get("year") is not None
+    ):
+        return from_state
+    prior = (
+        getattr(conversation_memory, "last_user_question", None)
+        or getattr(conversation_memory, "last_standalone_question", None)
+    )
+    if not prior:
+        return None
+    if _SALE_COUNT_ASK.search(prior) or _TRANSACTION.search(prior):
+        return _sale_query_from_question(prior)
+    return None
+
+
+def _dialogue_action(conversation_memory) -> str | None:
+    if conversation_memory is None:
+        return None
+    if hasattr(conversation_memory, "get_dialogue_state"):
+        state = conversation_memory.get_dialogue_state()
+    else:
+        state = getattr(conversation_memory, "dialogue_state", None) or {}
+    action = (state or {}).get("action")
+    return str(action) if action else None
+
+
+def _sales_fingerprint(place=None, bed=None, year=None, month=None) -> str:
+    """Stable paging key for sales count/list follow-ups."""
+    return (
+        f"SALES|{(place or 'Dubai').strip().upper()}"
+        + (f"|B{bed}" if bed is not None else "")
+        + (f"|{year}-{int(month):02d}" if year and month else "")
+    )
+
+
+def _is_show_prior_sales_ask(question, conversation_memory=None) -> bool:
+    text = (question or "").strip()
+    if not text:
+        return False
+    # A fresh place/budget ask is not "show the previous sales".
+    if parse_budget_aed(text):
+        return False
+    place = extract_place(text)
+    if place and place.lower() not in {"dubai"}:
+        return False
+    if _SHOW_PRIOR_SALES.search(text):
+        return True
+    # After a sales answer, plain "show me more" continues that sales list
+    # from dialogue_state — do not rewrite it into a project-name search.
+    if _dialogue_action(conversation_memory) in {"sales_count", "sales_list"}:
+        if is_show_more(text) or wants_more_results(text):
+            return True
+        if _MORE_TRANSACTIONS.search(text) and len(text.split()) <= 8:
+            return True
+    return False
+
+
+def _sale_count_turn(question, conversation_memory=None):
+    """How many X were sold in Month Year — a count, not a sales list."""
+    if not _SALE_COUNT_ASK.search(question or ""):
+        return None
+    from app.retrieval.propai_catalog import count_sales
+
+    query = _sale_query_from_question(question) or {}
+    place = query.get("place")
+    bed = query.get("bedrooms")
+    month = query.get("month")
+    year = query.get("year")
+    stats = count_sales(place=place, bedrooms=bed, year=year, month=month)
+    n = int(stats.get("count") or 0)
+    where = place or "Dubai"
+    bed_bit = f"{_bed_label(bed)} " if bed is not None else ""
+    when = ""
+    if month and year:
+        when = f" in {datetime(year, month, 1).strftime('%B %Y')}"
+    elif year:
+        when = f" in {year}"
+    if n == 0:
+        answer = (
+            f"I found no recorded {bed_bit}sales in {where}{when}."
+        )
+    else:
+        answer = (
+            f"There were **{n:,}** recorded {bed_bit}sales in {where}{when}. "
+            "Say **show me** if you want the list."
+        )
+    _remember_sale_query(
+        conversation_memory,
+        {
+            **query,
+            "action": "sales_count",
+            "bedrooms": bed,
+            "count": n,
+            "source_question": question,
+            "offset": 0,
+        },
+    )
+    # Keep transaction paging ready for the follow-up list.
+    if conversation_memory is not None:
+        conversation_memory.transaction_names = _sales_fingerprint(
+            place, bed, year, month
+        )
+        conversation_memory.transaction_offset = 0
+    return _transaction_reply(question, answer, followup=True)
+
+
+def _execute_sales_from_state(question, conversation_memory, *, more: bool = False):
+    """Run sales_list / sales_count from dialogue_state slots."""
+    from app.retrieval.propai_catalog import count_sales, latest_sales
+
+    if hasattr(conversation_memory, "get_dialogue_state"):
+        state = conversation_memory.get_dialogue_state()
+    else:
+        state = getattr(conversation_memory, "dialogue_state", None) or {}
+    # Plain test doubles / legacy sale_query mirror.
+    prior = _prior_sale_query(conversation_memory) or {}
+    action = state.get("action") or (
+        "sales_list" if prior else None
+    )
+    place = state.get("place") or prior.get("place")
+    bed = state.get("beds")
+    if bed is None:
+        bed = prior.get("bedrooms")
+    year = state.get("year") if state.get("year") is not None else prior.get("year")
+    month = state.get("month") if state.get("month") is not None else prior.get("month")
+    if action == "sales_count" and not more:
+        stats = count_sales(place=place, bedrooms=bed, year=year, month=month)
+        n = int(stats.get("count") or 0)
+        where = place or "Dubai"
+        bed_bit = f"{_bed_label(bed)} " if bed is not None else ""
+        when = ""
+        if month and year:
+            when = f" in {datetime(year, month, 1).strftime('%B %Y')}"
+        elif year:
+            when = f" in {year}"
+        answer = (
+            f"There were **{n:,}** recorded {bed_bit}sales in {where}{when}. "
+            "Say **show me** if you want the list."
+            if n else
+            f"I found no recorded {bed_bit}sales in {where}{when}."
+        )
+        _remember_sale_query(
+            conversation_memory,
+            {
+                "action": "sales_count",
+                "place": place,
+                "bedrooms": bed,
+                "month": month,
+                "year": year,
+                "count": n,
+                "source_question": state.get("source_question") or question,
+                "offset": 0,
+            },
+        )
+        if conversation_memory is not None:
+            conversation_memory.transaction_names = _sales_fingerprint(
+                place, bed, year, month
+            )
+            conversation_memory.transaction_offset = 0
+        return _transaction_reply(question, answer, followup=True)
+
+    fingerprint = _sales_fingerprint(place, bed, year, month)
+    prev_fp = getattr(conversation_memory, "transaction_names", None)
+    prev_offset = int(getattr(conversation_memory, "transaction_offset", 0) or 0)
+    offset = prev_offset if more and prev_fp == fingerprint else 0
+    limit = _sale_list_limit(question, state)
+    payload = latest_sales(
+        place=place,
+        limit=limit,
+        offset=offset,
+        bedrooms=bed,
+        year=year,
+        month=month,
+    )
+    names = list(dict.fromkeys(
+        str(sale.get("project") or "").strip()
+        for sale in (payload.get("sales") or [])
+        if sale.get("project")
+    ))
+    intro = place or "Dubai"
+    if bed == 0:
+        intro = f"studio sales in {intro}"
+    elif bed is not None:
+        intro = f"{bed}-bedroom sales in {intro}"
+    if month and year:
+        intro = f"{intro} in {datetime(year, month, 1).strftime('%B %Y')}"
+    if state.get("limit") or _parse_sale_limit(question) or _parse_sale_limit(
+        state.get("source_question")
+    ):
+        intro = f"the last {limit} {intro}"
+    if conversation_memory is not None:
+        conversation_memory.transaction_names = fingerprint
+        next_offset = offset + limit if payload.get("sales") else offset
+        conversation_memory.transaction_offset = next_offset
+        count = None
+        if isinstance(state.get("last_result"), dict):
+            count = state["last_result"].get("count")
+        _remember_sale_query(
+            conversation_memory,
+            {
+                "action": "sales_list",
+                "listed": True,
+                "place": place,
+                "bedrooms": bed,
+                "month": month,
+                "year": year,
+                "limit": limit,
+                "source_question": state.get("source_question") or question,
+                "offset": next_offset,
+                "count": count,
+            },
+            replace=False,
+        )
+    if more and offset > 0 and not (payload.get("sales") or []):
+        return _transaction_reply(
+            question,
+            f"There are no more recorded sales for {intro} in the transaction data.",
+            followup=False,
+            conversation_memory=conversation_memory,
+        )
+    return _transaction_reply(
+        question,
+        _format_transactions(names, payload, label=intro, more=more and offset > 0),
+        payload.get("sales") or [],
+        conversation_memory=conversation_memory,
+    )
+
+
+def _execute_search_from_state(question, conversation_memory, *, more: bool = False):
+    """Re-run project browse from dialogue_state slots."""
+    from app.retrieval.propai_catalog import agent_projects
+
+    if hasattr(conversation_memory, "get_dialogue_state"):
+        state = conversation_memory.get_dialogue_state()
+    else:
+        state = getattr(conversation_memory, "dialogue_state", None) or {}
+    place = state.get("place")
+    beds = state.get("beds")
+    budget = state.get("budget_aed")
+    payload: dict = {}
+    if place and str(place).strip().lower() != "dubai":
+        payload["communities"] = [place]
+    if beds is not None:
+        payload["bedrooms"] = beds
+    if budget is not None:
+        if state.get("prefer_cheaper") or not re.search(
+            r"\b(?:above|over|starting)\b", str(state.get("source_question") or ""), re.I
+        ):
+            payload["max_price"] = budget
+        else:
+            payload["min_price"] = budget
+    if state.get("ready_only"):
+        payload["ready_only"] = True
+    skip = list(state.get("exclude_names") or [])
+    if more:
+        items = getattr(conversation_memory, "active_candidates", None) or []
+        skip = list(dict.fromkeys(skip + [
+            str(item.get("name") or "").strip()
+            for item in items
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        ]))
+    sort = "more" if skip else (
+        "cheapest" if payload.get("max_price") is not None or state.get("prefer_cheaper")
+        else "priciest" if payload.get("min_price") is not None
+        else "latest_handover"
+    )
+    try:
+        rows, total = agent_projects(
+            payload, limit=10, sort=sort, skip_names=skip or None
+        )
+    except Exception as exc:
+        print(f"dialogue-state search unavailable: {exc}")
+        return None
+    if not rows:
+        where = place or "Dubai"
+        return {
+            "question": question,
+            "standalone_question": question,
+            "question_type": "search",
+            "structured_summary": _empty_structured_summary(),
+            "documents": [],
+            "investment_analysis": None,
+            "retrieval_result": {
+                "question_type": "search",
+                "structured_data": {"community": [], "projects": [], "sub_communities": []},
+                "documents": [],
+            },
+            "use_fast": True,
+            "fast_answer": (
+                f"I found no more matching projects for {where} "
+                "with the same filters."
+            ),
+            "context": None,
+            "small_talk": None,
+        }
+    summary = _empty_structured_summary()
+    summary["projects"] = rows
+    summary["project_total"] = total or len(rows)
+    summary["catalog_place"] = str(place or "Dubai").strip()
+    shown = skip + [str(row.get("name") or "").strip() for row in rows if row.get("name")]
+    _set_dialogue_state(
+        conversation_memory,
+        {
+            **state,
+            "action": "search",
+            "exclude_names": [name for name in shown if name][:40],
+            "last_result": {"project_total": total or len(rows)},
+            "source_question": state.get("source_question") or question,
+        },
+        replace=True,
+    )
+    return {
+        "question": question,
+        "standalone_question": question,
+        "question_type": "search",
+        "structured_summary": summary,
+        "documents": [],
+        "investment_analysis": None,
+        "retrieval_result": {
+            "question_type": "search",
+            "structured_data": {
+                "community": [],
+                "projects": rows,
+                "sub_communities": [],
+            },
+            "documents": [],
+        },
+        "use_fast": True,
+        "fast_answer": _build_fast_structured_answer(question, summary),
+        "context": None,
+        "small_talk": None,
+    }
+
+
+def _explain_recommend_from_state(question, conversation_memory):
+    """Explain on-screen recommend picks from state — no fresh SQL search."""
+    from app.answers.recommend import format_explain_on_screen, rank_projects
+
+    if hasattr(conversation_memory, "get_dialogue_state"):
+        state = conversation_memory.get_dialogue_state()
+    else:
+        state = getattr(conversation_memory, "dialogue_state", None) or {}
+    items = getattr(conversation_memory, "active_candidates", None) or []
+    rows = [
+        item for item in items
+        if isinstance(item, dict)
+        and str(item.get("entity_type") or "project").lower() == "project"
+        and item.get("name")
+    ]
+    if len(rows) < 2:
+        return None
+    ranked = rank_projects(
+        rows[:12],
+        wanted_beds=state.get("beds"),
+        budget_aed=state.get("budget_aed"),
+        attach_sales=True,
+        goal=state.get("goal"),
+    )
+    answer = format_explain_on_screen(
+        ranked,
+        goal=state.get("goal"),
+        place=state.get("place"),
+        beds=state.get("beds"),
+    )
+    summary = _empty_structured_summary()
+    ordered = []
+    by_name = {str(row.get("name") or "").lower(): row for row in rows}
+    for item in ranked.get("ranked") or []:
+        row = by_name.get(str(item.get("name") or "").lower())
+        if row and row not in ordered:
+            ordered.append(row)
+    summary["projects"] = (ordered or rows)[:3]
+    summary["project_total"] = len(summary["projects"])
+    summary["recommendation"] = ranked.get("recommendation")
+    if state.get("place"):
+        summary["catalog_place"] = str(state["place"]).strip()
+    return {
+        "question": question,
+        "standalone_question": state.get("source_question") or question,
+        "question_type": "search",
+        "structured_summary": summary,
+        "documents": [],
+        "investment_analysis": None,
+        "retrieval_result": {
+            "question_type": "search",
+            "structured_data": {
+                "community": [],
+                "projects": summary["projects"],
+                "sub_communities": [],
+            },
+            "documents": [],
+        },
+        "use_fast": True,
+        "fast_answer": answer,
+        "context": None,
+        "small_talk": None,
+    }
+
+
+def _execute_recommend_from_state(
+    question, conversation_memory, *, more: bool = False, mode: str | None = None
+):
+    """Re-run or explain recommend from dialogue_state slots (Phase 3)."""
+    from app.answers.intent_route import classify_intent, goal_for_route
+    from app.answers.intent_turns import recommend_data_turn
+
+    if mode == "explain":
+        explained = _explain_recommend_from_state(question, conversation_memory)
+        if explained is not None:
+            return explained
+    if hasattr(conversation_memory, "get_dialogue_state"):
+        state = conversation_memory.get_dialogue_state()
+    else:
+        state = getattr(conversation_memory, "dialogue_state", None) or {}
+    prior = state.get("source_question") or question
+    state_kind = str(state.get("kind") or "").lower() or None
+    # After a split, user picked studios/villas → deepen that path, do not
+    # re-classify the original conflict question as split again.
+    if state_kind == "filtered" and state.get("beds") is not None:
+        beds = state.get("beds")
+        route = {
+            "intent": "recommend",
+            "kind": "filtered",
+            "subject": state.get("place"),
+            "bedrooms": beds,
+            "budget_aed": state.get("budget_aed"),
+            "source_question": prior,
+            # Path choice after a split: studio vs villa product.
+            "property_type": (
+                "apartment" if beds == 0
+                else ("villa" if isinstance(beds, int) and beds >= 3 else None)
+            ),
+        }
+    elif state_kind == "split":
+        route = {
+            "intent": "recommend",
+            "kind": "split",
+            "subject": state.get("place"),
+            "bedrooms": state.get("beds"),
+            "budget_aed": state.get("budget_aed"),
+            "source_question": prior,
+        }
+    else:
+        route = classify_intent(prior, None)
+        if route.get("intent") != "recommend":
+            route = {
+                "intent": "recommend",
+                "kind": state_kind or "filtered",
+                "subject": state.get("place"),
+                "bedrooms": state.get("beds"),
+                "budget_aed": state.get("budget_aed"),
+                "source_question": prior,
+            }
+        else:
+            route = dict(route)
+            if state.get("place"):
+                route["subject"] = state.get("place")
+            if state.get("beds") is not None:
+                route["bedrooms"] = state.get("beds")
+            if state.get("budget_aed") is not None:
+                route["budget_aed"] = state.get("budget_aed")
+            if state_kind:
+                route["kind"] = state_kind
+            route["source_question"] = prior
+    if more:
+        route["more"] = True
+    if state.get("prefer_cheaper"):
+        route["prefer_cheaper"] = True
+    if state.get("ready_only"):
+        route["ready_only"] = True
+    if isinstance(state.get("focus"), dict):
+        route["focus"] = dict(state["focus"])
+    # Latest user text can refine family ranking (kids / not towers).
+    if str(route.get("kind") or state_kind or "").lower() == "family_areas":
+        from app.answers.intent_route import merge_family_area_focus
+
+        route["focus"] = merge_family_area_focus(question, route)
+        asked = str(question or "").strip()
+        if asked and asked.lower() != str(prior or "").strip().lower():
+            from app.answers.intent_route import family_area_focus
+
+            if any(family_area_focus(asked).values()):
+                route["source_question"] = asked
+    route.setdefault("goal", goal_for_route(route) or state.get("goal"))
+    return recommend_data_turn(question, conversation_memory, route)
+
+
+def _execute_dialogue_state(
+    question, conversation_memory, *, more: bool = False, mode: str | None = None
+):
+    """Dispatch the active dialogue_state.action."""
+    action = _dialogue_action(conversation_memory)
+    if action in {"sales_list", "sales_count"}:
+        return _execute_sales_from_state(question, conversation_memory, more=more)
+    if action in {"search", "project_count"}:
+        # project_count + "show me" → list Dubai projects (same filters/slots).
+        if mode == "explain":
+            explained = _explain_recommend_from_state(question, conversation_memory)
+            if explained is not None:
+                return explained
+        return _execute_search_from_state(question, conversation_memory, more=more)
+    if action == "recommend":
+        return _execute_recommend_from_state(
+            question, conversation_memory, more=more, mode=mode
+        )
+    return None
+
+
+def _show_prior_sales_turn(question, conversation_memory):
+    """Legacy bridge: phrase continue → execute from state (Phase 2 prefers resolver)."""
+    if not _is_show_prior_sales_ask(question, conversation_memory):
+        return None
+    if not _prior_sale_query(conversation_memory):
+        return None
+    more = bool(
+        is_show_more(question)
+        or wants_more_results(question)
+        or (
+            _MORE_TRANSACTIONS.search(question or "")
+            and not _SHOW_PRIOR_SALES.search(question or "")
+        )
+    )
+    return _execute_sales_from_state(question, conversation_memory, more=more)
+
+
+def _llm_generate_from(conversation_memory, components=None):
+    """Shared LLM generate callback for turn/follow-up resolve."""
+    client = getattr(conversation_memory, "llm_client", None) if conversation_memory else None
+    if client is None and isinstance(components, dict):
+        planner = components.get("query_planner")
+        client = getattr(planner, "_llm_client", None) if planner else None
+    if client is not None and hasattr(client, "generate"):
+        return client.generate
+    return None
+
+
+async def _dialogue_followup_turn(question, conversation_memory, components=None):
+    """Phase 2: continue the active task from dialogue_state (LLM resolve + execute)."""
+    from app.answers.followup_resolve import (
+        apply_followup,
+        looks_like_state_followup,
+        resolve_followup,
+    )
+
+    if conversation_memory is None:
+        return None
+    state = (
+        conversation_memory.get_dialogue_state()
+        if hasattr(conversation_memory, "get_dialogue_state")
+        else getattr(conversation_memory, "dialogue_state", None)
+    )
+    if not looks_like_state_followup(question, state):
+        return None
+
+    resolve_started = time.perf_counter()
+    llm_generate = _llm_generate_from(conversation_memory, components)
+    resolution = await resolve_followup(
+        question, state, llm_generate=llm_generate
+    )
+    resolve_ms = _elapsed_ms(resolve_started)
+    if not resolution or resolution.get("kind") != "continue":
+        return None
+    new_state = apply_followup(state, resolution)
+    if not new_state:
+        return None
+    if hasattr(conversation_memory, "set_dialogue_state"):
+        conversation_memory.set_dialogue_state(new_state)
+    else:
+        conversation_memory.dialogue_state = new_state
+    turn = await asyncio.to_thread(
+        _execute_dialogue_state,
+        question,
+        conversation_memory,
+        more=bool(resolution.get("more")),
+        mode=resolution.get("mode"),
+    )
+    if isinstance(turn, dict):
+        timing = dict(turn.get("timing_ms") or {})
+        timing["followup_resolve"] = resolve_ms
+        turn["timing_ms"] = timing
+    return turn
+
+
+def _route_from_turn_resolution(resolution: dict, question: str | None = None) -> dict:
+    """Build a recommend route dict from Phase 5 turn resolution."""
+    from app.answers.intent_route import (
+        goal_for_route,
+        merge_family_area_focus,
+    )
+
+    if resolution.get("route") and isinstance(resolution["route"], dict):
+        route = dict(resolution["route"])
+    else:
+        route = {
+            "intent": "recommend",
+            "kind": resolution.get("kind") or "filtered",
+            "subject": resolution.get("place"),
+            "bedrooms": resolution.get("beds"),
+            "budget_aed": resolution.get("budget_aed"),
+            "source_question": resolution.get("source_question"),
+        }
+    route.setdefault("intent", "recommend")
+    if resolution.get("place"):
+        route["subject"] = resolution["place"]
+    if resolution.get("beds") is not None:
+        route["bedrooms"] = resolution["beds"]
+    if resolution.get("budget_aed") is not None:
+        route["budget_aed"] = resolution["budget_aed"]
+    if resolution.get("kind"):
+        route["kind"] = resolution["kind"]
+    route["source_question"] = (
+        resolution.get("source_question") or route.get("source_question")
+    )
+    route["goal"] = resolution.get("goal") or goal_for_route(route)
+    # LLM resolve omits focus — attach family ranking flags from the user text.
+    if str(route.get("kind") or "").lower() == "family_areas":
+        if isinstance(resolution.get("focus"), dict):
+            route["focus"] = resolution["focus"]
+        route["focus"] = merge_family_area_focus(
+            question or route.get("source_question"),
+            route,
+        )
+    return route
+
+
+async def _understood_turn(question, conversation_memory, components=None):
+    """Phase 5–7: understand → confidence gate → state → execute.
+
+    Confident search / sales / project_count / recommend run on SQL/tools.
+    Weak understanding clarifies once instead of guessing.
+    Other actions fall through to specialized paths (agents, predict, agent LLM).
+    """
+    from app.answers.clarify import clarify_turn_payload, should_clarify
+    from app.answers.turn_resolve import resolve_turn, state_updates_from_resolution
+
+    resolve_started = time.perf_counter()
+    llm_generate = _llm_generate_from(conversation_memory, components)
+    resolution = await resolve_turn(
+        question, conversation_memory, llm_generate=llm_generate
+    )
+    resolve_ms = _elapsed_ms(resolve_started)
+    if not resolution:
+        return None
+
+    def _stamp_resolve(turn):
+        if not isinstance(turn, dict):
+            return turn
+        timing = dict(turn.get("timing_ms") or {})
+        timing["turn_resolve"] = resolve_ms
+        timing.setdefault("resolve_source", resolution.get("source"))
+        turn["timing_ms"] = timing
+        return turn
+
+    # Aggregates (cheapest / highest / average sale) go to the exact SQL handler.
+    if resolution.get("action") == "sales_stat":
+        stat_slots = {
+            "stat": resolution.get("stat"),
+            "project": resolution.get("project"),
+            "place": resolution.get("place"),
+            "beds": resolution.get("beds"),
+            "months": resolution.get("months"),
+        }
+        stat_turn = await asyncio.to_thread(
+            _cheapest_or_stat_turn, question, conversation_memory, stat_slots
+        )
+        if stat_turn is not None:
+            return _stamp_resolve(stat_turn)
+
+    # Phase 7: ask before guessing when slots/confidence are weak.
+    if should_clarify(resolution, question):
+        updates = state_updates_from_resolution(
+            {**resolution, "action": "clarify"}
+        )
+        _set_dialogue_state(conversation_memory, updates, replace=True)
+        return _stamp_resolve(clarify_turn_payload(question, resolution))
+
+    action = resolution.get("action")
+    # Leave these to existing specialized turns / agent.
+    if action in {
+        None, "general", "small_talk", "predict",
+    }:
+        return None
+
+    updates = state_updates_from_resolution(resolution)
+
+    # Top agents / brokers for a community — never fall through to project browse.
+    if action == "agents":
+        _set_dialogue_state(conversation_memory, updates, replace=True)
+        return _stamp_resolve(
+            await asyncio.to_thread(_broker_turn, question, conversation_memory)
+        )
+
+    # Developer / price / handover of the projects already on screen (or last sales).
+    if action == "attribute":
+        shown = _shown_attribute_response(
+            question, conversation_memory, {}, time.perf_counter(), None
+        )
+        if shown is not None:
+            return _stamp_resolve(shown)
+        return None
+
+    if action == "developer_rank":
+        return _stamp_resolve(
+            await asyncio.to_thread(_developer_rank_turn, question)
+        )
+
+    if action == "project_count":
+        return _stamp_resolve(
+            await asyncio.to_thread(
+                _project_count_turn, question, conversation_memory
+            )
+        )
+
+    if action == "recommend":
+        from app.answers.intent_turns import recommend_data_turn
+
+        route = _route_from_turn_resolution(resolution, question=question)
+        if route.get("focus"):
+            updates = {**updates, "focus": route["focus"]}
+        _set_dialogue_state(conversation_memory, updates, replace=True)
+        turn = await asyncio.to_thread(
+            recommend_data_turn, question, conversation_memory, route
+        )
+        return _stamp_resolve(turn)
+
+    if action in {"search", "sales_list", "sales_count"}:
+        # After a project shortlist, "recent transaction details" must use the
+        # on-screen cards — not area-wide sales from an inherited place.
+        if action == "sales_list":
+            on_screen = _transaction_subject(question, conversation_memory)
+            if on_screen:
+                return _stamp_resolve(
+                    await asyncio.to_thread(
+                        _transaction_turn, question, conversation_memory
+                    )
+                )
+        # Persist last-N so follow-ups ("same … 2 bedrooms") keep that count.
+        sale_limit = _parse_sale_limit(question)
+        if sale_limit is not None:
+            updates = {**updates, "limit": sale_limit}
+        _set_dialogue_state(conversation_memory, updates, replace=True)
+        if action == "sales_count":
+            # Keep listed=False semantics via action sales_count on state.
+            _set_dialogue_state(
+                conversation_memory,
+                {"action": "sales_count"},
+                replace=False,
+            )
+        elif action == "sales_list":
+            extra = {"action": "sales_list"}
+            if sale_limit is not None:
+                extra["limit"] = sale_limit
+            _set_dialogue_state(
+                conversation_memory,
+                extra,
+                replace=False,
+            )
+        return _stamp_resolve(
+            await asyncio.to_thread(
+                _execute_dialogue_state,
+                question,
+                conversation_memory,
+                more=False,
+                mode="rerun",
+            )
+        )
+    return None
+
+
+def _sale_stat_kind(question) -> str | None:
+    """Map repaired text to a price-extreme kind. Context decides if it runs."""
+    try:
+        text = repair_typed_question(question or "")
+    except Exception:
+        text = question or ""
+    # Prefer shared understanding helper when available.
+    try:
+        from app.answers.turn_resolve import _stat_kind_from_text
+
+        return _stat_kind_from_text(text)
+    except Exception:
+        pass
+    if _CHEAPEST_SALE_ASK.search(text):
+        return "cheapest"
+    if _HIGHEST_SALE_ASK.search(text):
+        return "highest"
+    if _AVERAGE_SALE_ASK.search(text):
+        return "average"
+    return None
+
+
+def _cheapest_or_stat_turn(question, conversation_memory=None, slots=None):
+    """Exact aggregate over recorded sales (cheapest / highest / average).
+
+    `slots` is the understanding layer's output (stat / project / place / beds /
+    months). When it is present the question wording does not matter.
+    """
+    question = repair_typed_question(question)
+    return _cheapest_sale_turn(
+        question, slots=slots, conversation_memory=conversation_memory
+    )
+
+
+def _on_screen_sale_extreme(projects, *, kind: str, bedrooms=None, months=12):
+    """Lowest/highest recorded sale among the projects already on screen."""
+    from app.retrieval.propai_catalog import cheapest_sale
+
+    best = None
+    for item in projects or []:
+        name = str((item or {}).get("name") or "").strip()
+        if not name:
+            continue
+        try:
+            sale = cheapest_sale(
+                project=name,
+                bedrooms=bedrooms,
+                months=months,
+                highest=(kind == "highest"),
+            )
+        except Exception:
+            sale = None
+        if not sale or sale.get("price") is None:
+            continue
+        if best is None:
+            best = sale
+            continue
+        price = int(sale["price"])
+        champ = int(best["price"])
+        if kind == "highest" and price > champ:
+            best = sale
+        elif kind != "highest" and price < champ:
+            best = sale
+    return best
+
+
+def _cheapest_sale_turn(question, slots=None, conversation_memory=None):
+    """Cheapest / highest / average sale for a named project or place — not a list.
+
+    Slots from the LLM resolver win; phrase regexes are only the offline fallback.
+    After a sales list, "which one has cheapest transactions" compares on-screen
+    projects and names a clear winner.
+    """
+    slots = slots if isinstance(slots, dict) else {}
+    # Slots from the LLM win. Regex is only used when slots did not say.
+    kind = slots.get("stat") or _sale_stat_kind(question)
+    if kind is None and slots:
+        # Understood as sales_stat but model omitted stat → cheapest is the
+        # usual meaning of a "what would I pay / lowest" ask.
+        kind = "cheapest"
+    if kind is None:
+        return None
+    from app.retrieval.propai_catalog import (
+        cheapest_sale,
+        parse_lookback_months,
+        place_named,
+        project_named_in_question,
+        resolve_dubai_place,
+        sale_window_stats,
+    )
+
+    # Project: the model's named building, checked against the project table, so
+    # any wording works; fall back to finding a project name inside the question.
+    project = None
+    if slots.get("project"):
+        project = project_named_in_question(str(slots["project"]))
+    if not project:
+        project = project_named_in_question(question)
+    place = None
+    if not project:
+        place = (
+            slots.get("place")
+            or extract_place(question)
+            or place_named(question)
+            or _transaction_place(question)
+        )
+        place = resolve_dubai_place(place) if place else place
+    elif slots.get("place"):
+        # Keep the area for the evidence line ("... in Hanover Square (JVC)").
+        place = resolve_dubai_place(slots["place"]) or slots["place"]
+    if slots.get("beds") is not None:
+        bed = int(slots["beds"])
+    else:
+        beds = parse_bedrooms(question)
+        bed = beds[0] if beds else None
+    months = slots.get("months") or parse_lookback_months(question, default=12)
+
+    on_screen = _active_projects(conversation_memory)
+    prior_action = _dialogue_action(conversation_memory)
+    among_shown = bool(
+        not project
+        and len(on_screen) >= 2
+        and (
+            _WHICH_AMONG_SHOWN.search(question or "")
+            or (
+                prior_action in {"sales_list", "sales_count", "search", "recommend"}
+                and not place
+            )
+            or (
+                prior_action in {"sales_list", "sales_count"}
+                and _sale_stat_kind(question) is not None
+            )
+        )
+    )
+    if among_shown and kind in {"cheapest", "highest"}:
+        sale = _on_screen_sale_extreme(
+            on_screen, kind=kind, bedrooms=bed, months=months
+        )
+        names = [str(row.get("name") or "").strip() for row in on_screen if row.get("name")]
+        label = "cheapest" if kind == "cheapest" else "highest"
+        bed_bit = f"{_bed_label(bed)} " if bed is not None else ""
+        window = f" in the last {months} months" if months else ""
+        understood = (
+            f"Understood: you asked which of these {len(names)} on-screen projects "
+            f"has the {label} recorded {bed_bit}transaction{window}."
+        )
+        if not sale or sale.get("price") is None:
+            return _transaction_reply(
+                question,
+                f"{understood}\n\n"
+                "I could not find a matching recorded sale among these projects "
+                f"{window or 'in the current window'}.",
+                followup=False,
+            )
+        size = (
+            f", {int(sale['size_sqft']):,} sqft"
+            if sale.get("size_sqft")
+            else ""
+        )
+        date = str(sale.get("date") or "")[:10]
+        date_bit = f" on {date}" if date else ""
+        bed_sale = ""
+        if sale.get("bedrooms") == 0:
+            bed_sale = " (studio)"
+        elif sale.get("bedrooms") is not None:
+            bed_sale = f" ({_bed_label(sale.get('bedrooms'))})"
+        answer = (
+            f"{understood}\n\n"
+            f"**Acot Recommend:** **{sale.get('project')}** has the {label} recorded "
+            f"{bed_bit}sale among these projects{window}: "
+            f"**AED {int(sale['price']):,}**{date_bit}{size}{bed_sale}.\n\n"
+            "That is a single Dubai Land Department sale record — not a brochure "
+            "starting price. Want the highest sale next, or only studios / 1-beds?"
+        )
+        return _transaction_reply(question, answer, sales=[sale], followup=False)
+
+    # Inherit sticky place from the sales thread when the ask has no new area.
+    if not project and not place and conversation_memory is not None:
+        getter = getattr(conversation_memory, "get_dialogue_state", None)
+        state = getter() if callable(getter) else getattr(
+            conversation_memory, "dialogue_state", None
+        )
+        if isinstance(state, dict) and state.get("place"):
+            place = resolve_dubai_place(state["place"]) or state["place"]
+
+    subject = project or place or "Dubai"
+    bed_bit = f"{_bed_label(bed)} " if bed is not None else ""
+    window = f" in the last {months} months" if months else ""
+    area_bit = f" ({place})" if project and place else ""
+    word = {"cheapest": "lowest", "highest": "highest", "average": "average"}[kind]
+    # Explain-first: restate exactly what was searched before the number.
+    understood = (
+        f"Understood: the {word} recorded {bed_bit}sale price in {subject}{window}."
+    )
+    try:
+        stats = sale_window_stats(
+            project=project, place=place, bedrooms=bed, months=months
+        )
+    except Exception:
+        stats = {}
+    n = int(stats.get("count") or 0)
+    plural = "s" if n != 1 else ""
+
+    if kind == "average":
+        if not n or not stats.get("median"):
+            return _transaction_reply(
+                question,
+                f"{understood}\n\nI found no recorded {bed_bit}sales for "
+                f"{subject}{window}, so I cannot quote an average.",
+                followup=False,
+            )
+        mean_note = ""
+        answer = (
+            f"{understood}\n\n"
+            f"Across **{n:,}** recorded {bed_bit}sale{plural} in **{subject}**{window}, "
+            f"the median price is **AED {int(stats['median']):,}**{mean_note}. "
+            f"Prices ranged from AED {int(stats['low']):,} to AED {int(stats['high']):,}.\n\n"
+            "Source: Dubai Land Department sale records."
+        )
+        return _transaction_reply(question, answer, followup=False)
+
+    sale = cheapest_sale(
+        project=project,
+        place=place,
+        bedrooms=bed,
+        months=months,
+        highest=(kind == "highest"),
+    )
+    if not sale or sale.get("price") is None:
+        return _transaction_reply(
+            question,
+            f"{understood}\n\n"
+            f"I found no recorded {bed_bit}sales for {subject}{window}, "
+            f"so there is no {'cheapest' if kind == 'cheapest' else 'highest'} sale to quote. "
+            "Try a longer window or a nearby project.",
+            followup=False,
+        )
+    size = (
+        f", {int(sale['size_sqft']):,} sqft"
+        if sale.get("size_sqft")
+        else ""
+    )
+    date = str(sale.get("date") or "")[:10]
+    date_bit = f" on {date}" if date else ""
+    label = "cheapest" if kind == "cheapest" else "highest"
+    answer = (
+        f"{understood}\n\n"
+        f"**Acot Recommend:** The {label} recorded {bed_bit}sale in "
+        f"**{sale.get('project') or subject}**{window} is "
+        f"**AED {int(sale['price']):,}**{date_bit}{size}."
+    )
+    # Evidence: how many sales this is the extreme of, so the number can be trusted.
+    if n:
+        evidence = (
+            f"That is the {word} of {n:,} recorded {bed_bit}sale{plural} "
+            f"in {subject}{area_bit}"
+        )
+        if stats.get("median") and n > 1:
+            other = stats["high"] if kind == "cheapest" else stats["low"]
+            evidence += (
+                f", where prices ran {'up to' if kind == 'cheapest' else 'down to'} "
+                f"AED {int(other):,} (median AED {int(stats['median']):,})"
+            )
+        answer += f"\n\n{evidence}. Source: Dubai Land Department sale records."
+    return _transaction_reply(question, answer, sales=[sale], followup=False)
+
+
 def _transaction_turn(question, conversation_memory):
     question = repair_typed_question(question)
+    # Aggregates (cheapest / highest / average sale) never become a sales list.
+    if _sale_stat_kind(question) is not None:
+        stat_turn = _cheapest_sale_turn(
+            question, conversation_memory=conversation_memory
+        )
+        if stat_turn is not None:
+            return stat_turn
     if not _TRANSACTION.search(question or ""):
+        # Short "ok show me" after a count/sales answer — reuse stored filters.
+        show_prior = _show_prior_sales_turn(question, conversation_memory)
+        if show_prior is not None:
+            return show_prior
+        # "same give in 2 bedrooms" after sales_list — patch beds, keep place/limit.
+        if (
+            _dialogue_action(conversation_memory) in {"sales_list", "sales_count"}
+            and _SALES_SLOT_TWEAK.search(question or "")
+            and (
+                parse_bedrooms(question)
+                or re.search(r"\b(?:same|again|instead)\b", question or "", re.I)
+            )
+        ):
+            beds = parse_bedrooms(question)
+            if beds:
+                _set_dialogue_state(
+                    conversation_memory,
+                    {"beds": beds[0], "action": "sales_list", "offset": 0},
+                    replace=False,
+                )
+            return _execute_sales_from_state(
+                question, conversation_memory, more=False
+            )
         return None
+    count_turn = _sale_count_turn(question, conversation_memory)
+    if count_turn is not None:
+        return count_turn
+    cheap_turn = _cheapest_sale_turn(
+        question, conversation_memory=conversation_memory
+    )
+    if cheap_turn is not None:
+        return cheap_turn
     from app.retrieval.propai_catalog import (
         is_outside_dubai,
         latest_sales,
         recent_sales,
         resolve_dubai_place,
     )
+    # On-screen project cards beat a stale "show prior sales" continue.
     projects = _transaction_subject(question, conversation_memory)
+    if not projects:
+        show_prior = _show_prior_sales_turn(question, conversation_memory)
+        if show_prior is not None:
+            return show_prior
     more = bool(_MORE_TRANSACTIONS.search(question or ""))
     prev_fp = getattr(conversation_memory, "transaction_names", None)
     prev_offset = int(getattr(conversation_memory, "transaction_offset", 0) or 0)
@@ -861,7 +2227,15 @@ def _transaction_turn(question, conversation_memory):
     else:
         if not _TRANSACTION_BROWSE.search(question or ""):
             return None
-        asked = _transaction_place(question)
+        # Prefer extract_place / place_named — _transaction_place often keeps
+        # trailing words ("JVC, with date and price") and then resolve fails.
+        from app.retrieval.propai_catalog import place_named
+
+        asked = (
+            extract_place(question)
+            or place_named(question)
+            or _transaction_place(question)
+        )
         listings_on_screen = bool(_active_listings(conversation_memory))
         projects_on_screen = bool(_active_projects(conversation_memory))
         if listings_on_screen and not projects_on_screen and not asked:
@@ -888,25 +2262,68 @@ def _transaction_turn(question, conversation_memory):
                 fingerprint = str(asked).strip().upper()
                 offset = 0
         if payload is None:
-            fingerprint = f"LATEST|{(place or 'Dubai').strip().upper()}"
+            beds = parse_bedrooms(question)
+            bed = beds[0] if beds else None
+            # Carry beds/place/limit from an active sales task when this ask
+            # only tweaks a slot ("same give in 2 bedrooms").
+            prior = _prior_sale_query(conversation_memory) or {}
+            if bed is None and prior.get("bedrooms") is not None:
+                bed = prior.get("bedrooms")
+            if not place and prior.get("place"):
+                place = prior.get("place")
+            fingerprint = _sales_fingerprint(place, bed)
             offset = prev_offset if more and prev_fp == fingerprint else 0
-            payload = latest_sales(place=place, limit=8, offset=offset)
+            # "last 5 sales" → limit 5; carry prior limit on "same" follow-ups.
+            prior_state = (
+                conversation_memory.get_dialogue_state()
+                if conversation_memory and hasattr(conversation_memory, "get_dialogue_state")
+                else getattr(conversation_memory, "dialogue_state", None)
+            )
+            limit = _sale_list_limit(question, prior_state if isinstance(prior_state, dict) else prior)
+            payload = latest_sales(
+                place=place, limit=limit, offset=offset, bedrooms=bed
+            )
             names = list(dict.fromkeys(
                 str(sale.get("project") or "").strip()
                 for sale in (payload.get("sales") or [])
                 if sale.get("project")
             ))
             intro = place or "Dubai"
+            if bed == 0:
+                intro = f"studio sales in {intro}"
+            elif bed is not None:
+                intro = f"{bed}-bedroom sales in {intro}"
+            if _parse_sale_limit(question) or (
+                isinstance(prior_state, dict) and prior_state.get("limit")
+            ) or _parse_sale_limit(prior.get("source_question")):
+                intro = f"the last {limit} {intro}"
+            _remember_sale_query(
+                conversation_memory,
+                {
+                    "action": "sales_list",
+                    "listed": True,
+                    "place": place,
+                    "bedrooms": bed,
+                    "year": None,
+                    "month": None,
+                    "limit": limit,
+                    "source_question": question,
+                    "offset": offset,
+                },
+            )
     if conversation_memory is not None:
         conversation_memory.transaction_names = fingerprint
+        page = limit if "limit" in locals() else _TRANSACTION_PAGE_SIZE
         conversation_memory.transaction_offset = (
-            offset + _TRANSACTION_PAGE_SIZE if payload.get("sales") else offset
+            offset + page if payload.get("sales") else offset
         )
     # Text only: do not attach project rows, or the app draws property cards under the sales list.
+    # Project names are still remembered on memory for "developer of these" follow-ups.
     return _transaction_reply(
         question,
         _format_transactions(names, payload, label=intro, more=more and offset > 0),
         payload.get("sales") or [],
+        conversation_memory=conversation_memory,
     )
 
 
@@ -932,6 +2349,19 @@ _BROKER_FILTER_WORDS = re.compile(
     r"women|woman|ladies|lady|men|man|both)\b",
     re.I,
 )
+# Budget/price clauses are not place names ("Dubai starting above AED 5 million").
+_BROKER_BUDGET_TAIL = re.compile(
+    r"\b(?:starting(?:\s+(?:above|from|at))?|above|over|under|below|up\s+to|"
+    r"around|about|budget|max(?:imum)?|min(?:imum)?|price|prices|"
+    r"aed|dh|dhs)\b.*$",
+    re.I,
+)
+_BROKER_BUDGET_TOKENS = re.compile(
+    r"\b(?:starting|above|over|under|below|up\s+to|around|about|budget|"
+    r"max(?:imum)?|min(?:imum)?|price|prices|aed|dh|dhs|million|millions|"
+    r"\d[\d,]*(?:\.\d+)?)\b",
+    re.I,
+)
 _BROKER_FILLER = re.compile(
     r"\b(?:show|me|tell|find|list|the|top|best|licensed|rera|dubai|please|who|are|is|"
     r"can|help|with|this|these|those|property|properties|project|projects|community|"
@@ -953,6 +2383,12 @@ _BROKER_POINTER = re.compile(
     r"communities?|places?)\b",
     re.I,
 )
+
+
+def _strip_broker_budget(text: str | None) -> str:
+    """Drop price/budget tails so place stays 'Dubai' / 'Business Bay'."""
+    cleaned = _BROKER_BUDGET_TAIL.sub("", str(text or ""))
+    return cleaned.strip(" .?,;:'\"")
 
 
 def _broker_identity_filters(question):
@@ -982,7 +2418,8 @@ def _broker_identity_unsupported(question) -> bool:
 _BROKER_SWITCH_AWAY = re.compile(
     r"\b(?:projects?|listings?|communities?|developers?|handover|brochure|"
     r"propert(?:y|ies)|apartments?|villas?|townhouses?|penthouses?|"
-    r"rentals?|for sale|off[- ]?plan)\b",
+    r"rentals?|for sale|off[- ]?plan|"
+    r"sales?|sold|transactions?|sale history|sales history|price|prices|budget)\b",
     re.I,
 )
 
@@ -1009,10 +2446,32 @@ def _is_broker_question(question, conversation_memory=None) -> bool:
         return True
     if asks_for_listings(text) or _BROKER_SWITCH_AWAY.search(text):
         return False
-    # "plot in India" is not an agents ask. Nationality/gender words only
-    # continue an agents thread when the last turn was already about agents.
+    # A bare nationality / gender filter ("only indian female") only makes sense
+    # for agents, even with no memory of the last answer — never a project search.
+    if _broker_identity_unsupported(text):
+        leftover = _BROKER_FILTER_WORDS.sub(" ", text)
+        leftover = re.sub(
+            r"\b(?:only|just|show|me|the|and|or|also|please|with|a|an|only)\b",
+            " ",
+            leftover,
+            flags=re.I,
+        )
+        # Nothing but identity words and filler left → an agent filter.
+        if not re.findall(r"[a-z0-9]+", leftover.lower()):
+            return True
+    # After an agents answer, only short continuations stay on agents
+    # ("female", "show more", "Indians"). A new sales/project ask must leave.
     if _last_asked_about_agents(conversation_memory):
-        return True
+        words = re.findall(r"[a-z0-9]+", (text or "").lower())
+        if _broker_identity_unsupported(text):
+            return True
+        if len(words) <= 6 and not re.search(
+            r"\b(?:sales?|sold|projects?|listings?|price|budget|buy|rent)\b",
+            text,
+            re.I,
+        ):
+            return True
+        return False
     return False
 
 
@@ -1264,6 +2723,7 @@ def _broker_place(question, conversation_memory):
             maxsplit=1,
             flags=re.I,
         )[0].strip(" .?")
+        place = _strip_broker_budget(place)
         place = " ".join(_BROKER_FILTER_WORDS.sub(" ", place).split()).strip(" .?")
         # "the jvc" -> "Jumeirah Village Circle", so answers read properly and the search uses the full name.
         place = re.sub(r"^(?:the|a)\s+", "", place, flags=re.I)
@@ -1275,6 +2735,8 @@ def _broker_place(question, conversation_memory):
     leftover = " ".join(_BROKER_FILLER.sub(" ", asked).split())
     leftover = " ".join(_BROKER_FILTER_WORDS.sub(" ", leftover).split()).strip(" .?")
     leftover = " ".join(_BROKER_POINTER.sub(" ", leftover).split()).strip(" .?")
+    leftover = _strip_broker_budget(leftover)
+    leftover = " ".join(_BROKER_BUDGET_TOKENS.sub(" ", leftover).split()).strip(" .?")
     if leftover:
         from app.retrieval.propai_catalog import is_outside_dubai, known_dubai_label
         if is_outside_dubai(leftover) or known_dubai_label(leftover):
@@ -1287,6 +2749,7 @@ def _broker_lookup(question, conversation_memory):
     leftover = _BROKER_FILLER.sub(" ", question or "")
     leftover = re.sub(r"[^a-zA-Z0-9\s]", " ", leftover)
     leftover = " ".join(leftover.split())
+    leftover = " ".join(_BROKER_BUDGET_TOKENS.sub(" ", leftover).split())
     place = _broker_place(question, conversation_memory)
     if place:
         # Word by word: "the" is already gone from the leftover, so "the jvc" as a phrase would not match.
@@ -1384,37 +2847,45 @@ def _broker_reply(question, answer, brokers=None):
 
 
 def _format_brokers(rows, label=None) -> str:
+    from app.answers.explain_contract import build_agents_narrative, scrub_user_facing
+
     if not rows:
         if label:
-            return f"I couldn't find licensed agents for {label} in our DLD data."
-        return "I couldn't find licensed agents in our DLD data."
-    if label:
-        lead = f"Here are licensed agents for {label}."
-    else:
-        lead = "Here are licensed agents in our DLD data:"
-    lines = [lead, ""]
-    for row in rows:
+            return (
+                f"Understood: you asked for licensed agents for {label}.\n\n"
+                f"I could not find matching licensed agents for {label} in our DLD-linked data. "
+                "Try a nearby community such as Dubai Marina, Business Bay, or Palm Jumeirah."
+            )
+        return (
+            "Understood: you asked for licensed agents in Dubai.\n\n"
+            "I could not find matching licensed agents in our DLD-linked data right now."
+        )
+    lines = [build_agents_narrative(place=label, count=len(rows)), ""]
+    for index, row in enumerate(rows, start=1):
         name = row.get("name") or row.get("name_en") or "Agent"
         bits = []
         if row.get("agency_name"):
-            bits.append(row["agency_name"])
+            bits.append(f"agency {row['agency_name']}")
         if row.get("card_rank"):
-            bits.append(row["card_rank"])
+            bits.append(f"card rank {row['card_rank']}")
         if row.get("brn"):
             bits.append(f"BRN {row['brn']}")
         if row.get("license_number"):
-            bits.append(f"License {row['license_number']}")
+            bits.append(f"licence {row['license_number']}")
         expiry = _broker_expiry(row.get("card_expiry_date"))
         if expiry:
-            bits.append(f"card until {expiry}")
+            bits.append(f"card valid until {expiry}")
         if row.get("awards_count"):
-            bits.append(f"{int(row['awards_count'])} awards")
-        detail = " · ".join(str(bit) for bit in bits if bit)
-        lines.append(f"**{name}**")
+            bits.append(f"{int(row['awards_count'])} recorded awards")
+        detail = "; ".join(str(bit) for bit in bits if bit)
+        lines.append(f"{index}. **{name}**")
         if detail:
-            lines.append(detail)
+            lines.append(f"   {detail}.")
         lines.append("")
-    return "\n".join(lines).rstrip()
+    lines.append(
+        "Want agents for a nearby community, or should I match projects in the same area next?"
+    )
+    return scrub_user_facing("\n".join(lines).rstrip())
 
 
 def _outside_coverage_reply(question, asked=None):
@@ -1593,19 +3064,222 @@ def _place_detail_turn(question, conversation_memory=None):
     }
 
 
+_DATA_FRESHNESS = re.compile(
+    r"(?:"
+    r"today'?s\s+date|"
+    r"what(?:'s|\s+is)\s+today|"
+    r"current\s+date|"
+    r"latest\s+sale\s+date|"
+    r"how\s+(?:fresh|current|up[\s-]?to[\s-]?date)\s+(?:is\s+)?(?:your\s+)?data|"
+    r"as\s+of\s+when|"
+    r"until\s+when\s+(?:is\s+)?(?:your\s+)?(?:sales?\s+)?data|"
+    r"latest\s+sale\s+date\s+in\s+your\s+data"
+    r")",
+    re.I,
+)
+
+
+def _data_freshness_turn(question):
+    """Calendar today + max Prop-AI sale date. Never invent a scrape snapshot as today."""
+    if not _DATA_FRESHNESS.search(question or ""):
+        return None
+    from datetime import date
+    from app.retrieval.propai_catalog import fetch
+
+    today = date.today()
+    try:
+        row = fetch(
+            "select max(instance_date)::date as latest "
+            "from propai_sales where deleted_at is null"
+        )
+        latest = row[0].get("latest") if row else None
+    except Exception as exc:
+        print(f"data freshness lookup failed: {exc}")
+        latest = None
+    if hasattr(latest, "isoformat"):
+        latest_text = latest.strftime("%d %b %Y")
+        latest_iso = latest.isoformat()
+    elif latest:
+        latest_text = str(latest)[:10]
+        latest_iso = latest_text
+    else:
+        latest_text = None
+        latest_iso = None
+    today_text = today.strftime("%d %b %Y")
+    if latest_text:
+        answer = (
+            f"Today is {today_text}. "
+            f"In our recorded Dubai sales data, the latest sale date is {latest_text}. "
+            "I only quote sale dates that appear in that sales table — "
+            "I do not invent newer dates."
+        )
+    else:
+        answer = (
+            f"Today is {today_text}. "
+            "I could not read the latest sale date from the sales table right now."
+        )
+    summary = _empty_structured_summary()
+    summary["data_freshness"] = {
+        "today": today.isoformat(),
+        "latest_sale_date": latest_iso,
+    }
+    return {
+        "question": question,
+        "standalone_question": question,
+        "question_type": "general",
+        "structured_summary": summary,
+        "documents": [],
+        "investment_analysis": None,
+        "retrieval_result": {
+            "question_type": "general",
+            "structured_data": {"community": [], "projects": [], "sub_communities": []},
+            "documents": [],
+        },
+        "use_fast": True,
+        "fast_answer": answer,
+        "context": None,
+        "small_talk": None,
+    }
+
+
+def _project_count_turn(question, conversation_memory=None):
+    """How many residential projects are in Dubai — a grounded count.
+
+    Saves dialogue_state so a follow-up "show me" can list projects (same idea
+    as sales_count → show me → sales_list).
+    """
+    if not _PROJECT_COUNT_ASK.search(question or ""):
+        return None
+    if _SALE_COUNT_ASK.search(question or ""):
+        return None
+    from app.retrieval.propai_catalog import count_projects
+
+    try:
+        n = count_projects()
+    except Exception as exc:
+        print(f"project count lookup failed: {exc}")
+        return None
+    answer = (
+        f"There are **{n:,}** distinct residential projects in our Dubai data. "
+        "Say **show me** if you want the list."
+    )
+    summary = _empty_structured_summary()
+    summary["project_total"] = n
+    _set_dialogue_state(
+        conversation_memory,
+        {
+            "action": "project_count",
+            "goal": None,
+            "place": "Dubai",
+            "beds": None,
+            "budget_aed": None,
+            "month": None,
+            "year": None,
+            "ready_only": False,
+            "prefer_cheaper": False,
+            "exclude_names": [],
+            "offset": 0,
+            "last_result": {"count": n, "project_total": n},
+            "source_question": question,
+        },
+        replace=True,
+    )
+    return {
+        "question": question,
+        "standalone_question": question,
+        "question_type": "general",
+        "structured_summary": summary,
+        "documents": [],
+        "investment_analysis": None,
+        "retrieval_result": {
+            "question_type": "general",
+            "structured_data": {"community": [], "projects": [], "sub_communities": []},
+            "documents": [],
+        },
+        "use_fast": True,
+        "fast_answer": answer,
+        "context": None,
+        "small_talk": None,
+    }
+
+
+def _developer_rank_turn(question):
+    """Top developers by recorded sale value over a lookback window."""
+    if not _DEVELOPER_RANK_ASK.search(question or ""):
+        return None
+    from app.retrieval.propai_catalog import (
+        parse_lookback_months,
+        top_developers_by_value,
+    )
+
+    want = re.search(r"\b(?:top|which)\s+(\d{1,2})\b", question or "", re.I)
+    limit = max(1, min(int(want.group(1)), 20)) if want else 5
+    months = parse_lookback_months(question, default=12) or 12
+    try:
+        rows = top_developers_by_value(limit=limit, months=months)
+    except Exception as exc:
+        print(f"developer ranking unavailable: {exc}")
+        return None
+    if not rows:
+        answer = (
+            "I could not rank developers from recorded sales right now."
+        )
+    else:
+        lines = [
+            f"Here are the top {len(rows)} developers by recorded sales value "
+            f"in Dubai over the last {months} months:",
+            "",
+        ]
+        for index, row in enumerate(rows, start=1):
+            lines.append(
+                f"{index}. **{row['developer']}** — "
+                f"AED {int(row['value']):,} across {int(row['sales']):,} sales"
+            )
+        answer = "\n".join(lines)
+    return {
+        "question": question,
+        "standalone_question": question,
+        "question_type": "general",
+        "structured_summary": _empty_structured_summary(),
+        "documents": [],
+        "investment_analysis": None,
+        "retrieval_result": {
+            "question_type": "general",
+            "structured_data": {"community": [], "projects": [], "sub_communities": []},
+            "documents": [],
+        },
+        "use_fast": True,
+        "fast_answer": answer,
+        "context": None,
+        "small_talk": None,
+    }
+
+
 def _sql_project_browse_turn(question, conversation_memory=None):
     """Clear community project browse via Prop-AI SQL only — no rewrite/plan/agent.
 
     "Show me projects in JVC" and "2 bedroom apartments in Marina" were still
     paying hybrid planner / rewrite latency even though the answer is SQL.
+
+    Phase 3: buy / best / family / afford stay on the recommend path — never
+    answer those with a plain facts list.
     """
     text = question or ""
+    from app.answers.intent_route import is_recommend_intent
+
+    if is_recommend_intent(text, conversation_memory):
+        return None
     if not re.search(
         r"\b(?:show|find|list|projects?|propert(?:y|ies)|apartments?|villas?|"
         r"townhouses?|flats?)\b",
         text,
         re.I,
     ):
+        return None
+    # Sales / sold asks are transaction answers, never a project gallery.
+    if _TRANSACTION.search(text) or re.search(r"\b(?:sales?|sold)\b", text, re.I):
+        return None
+    if _PROJECT_COUNT_ASK.search(text) or _DEVELOPER_RANK_ASK.search(text):
         return None
     if re.search(
         r"\b(?:agents?|brokers?|compare|versus|\bvs\b|brochure|floor ?plans?|"
@@ -1620,19 +3294,39 @@ def _sql_project_browse_turn(question, conversation_memory=None):
         return None
 
     place = extract_place(text)
-    if not place:
-        return None
+    budget = parse_budget_aed(text)
+    citywide = bool(
+        re.search(r"\bin\s+dubai\b|\bdubai\b", text, re.I)
+        and (not place or str(place).strip().lower() == "dubai")
+    )
+    if not place and not citywide:
+        # Budget-only citywide: "projects starting above AED 5 million"
+        if not (budget and re.search(r"\b(?:projects?|propert(?:y|ies)|apartments?)\b", text, re.I)):
+            return None
+        citywide = True
 
     from app.retrieval.propai_catalog import agent_projects, resolve_dubai_place
 
     try:
-        resolved = resolve_dubai_place(place) or place
+        resolved = resolve_dubai_place(place) or place if place else None
     except Exception:
         resolved = place
+    if resolved and str(resolved).strip().lower() == "dubai":
+        resolved = None
+        citywide = True
     beds = parse_bedrooms(text)
-    payload = {"communities": [resolved]}
+    payload = {}
+    if resolved:
+        payload["communities"] = [resolved]
     if beds:
         payload["bedrooms"] = beds[0]
+    if budget is not None:
+        if _PRICE_FLOOR_ASK.search(text) and not _PRICE_CEILING_ASK.search(text):
+            payload["min_price"] = budget
+        else:
+            payload["max_price"] = budget
+    if _READY_ONLY_ASK.search(text):
+        payload["ready_only"] = True
 
     skip = []
     if wants_more_results(text):
@@ -1643,23 +3337,94 @@ def _sql_project_browse_turn(question, conversation_memory=None):
             if isinstance(item, dict) and str(item.get("name") or "").strip()
         ]
 
+    if skip:
+        sort = "more"
+    elif payload.get("min_price") is not None:
+        sort = "priciest"
+    elif payload.get("max_price") is not None or beds:
+        sort = "cheapest"
+    else:
+        sort = "latest_handover"
+
     try:
         rows, total = agent_projects(
             payload,
             limit=10,
-            sort="more" if skip else "latest_handover",
+            sort=sort,
             skip_names=skip or None,
         )
     except Exception as exc:
         print(f"SQL project browse unavailable: {exc}")
         return None
     if not rows:
+        # Honest empty answer for ready/budget filters instead of falling to the LLM.
+        if payload.get("ready_only") or payload.get("min_price") or payload.get("max_price"):
+            where = resolved or "Dubai"
+            bits = []
+            if payload.get("ready_only"):
+                bits.append("ready")
+            if beds:
+                bits.append(_bed_label(beds[0]))
+            bits.append(f"in {where}")
+            if payload.get("max_price") is not None:
+                bits.append(f"under AED {int(payload['max_price']):,}")
+            if payload.get("min_price") is not None:
+                bits.append(f"starting above AED {int(payload['min_price']):,}")
+            answer = (
+                "I found no matching projects for "
+                + " ".join(bits)
+                + "."
+            )
+            summary = _empty_structured_summary()
+            summary["project_total"] = 0
+            if resolved:
+                summary["catalog_place"] = str(resolved).strip()
+            return {
+                "question": question,
+                "standalone_question": question,
+                "question_type": "search",
+                "structured_summary": summary,
+                "documents": [],
+                "investment_analysis": None,
+                "retrieval_result": {
+                    "question_type": "search",
+                    "structured_data": {
+                        "community": [],
+                        "projects": [],
+                        "sub_communities": [],
+                    },
+                    "documents": [],
+                },
+                "use_fast": True,
+                "fast_answer": answer,
+                "context": None,
+                "small_talk": None,
+            }
         return None
 
     summary = _empty_structured_summary()
     summary["projects"] = rows
     summary["project_total"] = total or len(rows)
-    summary["catalog_place"] = str(resolved).strip()
+    summary["catalog_place"] = str(resolved or "Dubai").strip()
+    _set_dialogue_state(
+        conversation_memory,
+        {
+            "action": "search",
+            "place": resolved or ("Dubai" if citywide else None),
+            "beds": beds[0] if beds else None,
+            "budget_aed": budget,
+            "month": None,
+            "year": None,
+            "ready_only": bool(payload.get("ready_only")),
+            "prefer_cheaper": sort == "cheapest",
+            "exclude_names": skip or [],
+            "offset": 0,
+            "last_result": {"project_total": total or len(rows)},
+            "source_question": question,
+            "goal": None,
+        },
+        replace=True,
+    )
     return {
         "question": question,
         "standalone_question": question,
@@ -1689,8 +3454,7 @@ def _community_list_turn(question):
         return None
     from app.database.postgres import fetch
     try:
-        rentals = fetch("select btrim(community) as name, count(*)::int as n from listings "
-                        "where coalesce(btrim(community), '') <> '' group by 1")
+        # Prop-AI only — never the retired Bayut `listings` table.
         projects = fetch(
             "select coalesce(nullif(btrim(master_project), ''), area) as name, count(*)::int as n "
             "from propai_projects "
@@ -1698,27 +3462,31 @@ def _community_list_turn(question):
             "and coalesce(nullif(btrim(master_project), ''), area) is not null "
             "group by 1"
         )
+        places = fetch(
+            "select btrim(label) as name, coalesce(sales_count, 0)::int as n "
+            "from propai_places where level in ('area', 'master') "
+            "and coalesce(btrim(label), '') <> ''"
+        )
     except Exception:
         return None
     rows: dict[str, dict] = {}
-    for kind, found in (("rentals", rentals), ("projects", projects)):
-        for row in found:
-            # Rentals say "Jumeirah Village Circle (JVC)", projects "Jumeirah Village Circle": one community.
+    for kind, found in (("projects", projects), ("sales", places)):
+        for row in found or []:
             key = re.sub(r"\s*\([^)]*\)", "", row["name"]).strip().lower()
-            entry = rows.setdefault(key, {"name": row["name"], "rentals": 0, "projects": 0})
+            entry = rows.setdefault(key, {"name": row["name"], "projects": 0, "sales": 0})
             entry[kind] += row["n"]
     if not rows:
         return None
-    ordered = sorted(rows.values(), key=lambda r: (-r["rentals"], -r["projects"], r["name"]))
+    ordered = sorted(rows.values(), key=lambda r: (-r["projects"], -r["sales"], r["name"]))
     lines = [
-        f"We have {len(ordered)} communities with rental listings or new projects. Here is the full list, busiest first:",
+        f"We have {len(ordered)} communities in Prop-AI. Here is the full list, busiest first:",
         "",
-        "| Community | Rentals listed | New projects |",
+        "| Community | New projects | Sales signal |",
         "|---|---|---|",
     ]
     for row in ordered:
-        lines.append(f"| {row['name']} | {row['rentals'] or '-'} | {row['projects'] or '-'} |")
-    lines += ["", "Ask about any of them for prices, rents or projects, for example \"Tell me about Dubai Marina\"."]
+        lines.append(f"| {row['name']} | {row['projects'] or '-'} | {row['sales'] or '-'} |")
+    lines += ["", "Ask about any of them for prices, sales or projects, for example \"Tell me about Dubai Marina\"."]
     return {
         "question": question,
         "standalone_question": question,
@@ -1764,12 +3532,19 @@ def _broker_turn(question, conversation_memory):
         if not on_screen:
             resolved = resolve_dubai_place(place)
             if resolved is None:
+                # Retry after budget noise (AED / starting above / million).
+                cleaned = _strip_broker_budget(place)
+                resolved = resolve_dubai_place(cleaned) if cleaned else None
+            if resolved is None:
                 return _broker_reply(
                     question,
-                    "I can only show licensed agents in Dubai. "
+                    "I will show only licensed agents in Dubai. "
                     "Ask about an area such as Dubai Marina, Business Bay, or Palm Jumeirah.",
                 )
             place = resolved
+        # Whole-market Dubai: list top Prop-AI agents citywide (not a fake community).
+        if str(place).strip().lower() == "dubai":
+            place = "Dubai"
     if _broker_identity_unsupported(question):
         nationality, gender, _both = _broker_identity_filters(question)
         wanted = []
@@ -1789,6 +3564,9 @@ def _broker_turn(question, conversation_memory):
     follow_up = bool(place or re.search(r"\b(?:this|these|those|for)\b", question or "", re.I))
     limit = 5 if follow_up else 8
     band = _broker_band(conversation_memory, place) if follow_up and not name and not brn else None
+    # "top / best agents" → Five Star Prop-AI ranks even for citywide Dubai.
+    if not name and not brn and re.search(r"\b(?:top|best|five[\s-]?star)\b", question or "", re.I):
+        band = "top"
     rows = list_brokers(name=name, brn=brn, limit=limit, place=place, band=band)
     if name and not rows:
         rows = list_brokers(limit=limit, place=place, band=band)
@@ -1799,9 +3577,19 @@ def _broker_turn(question, conversation_memory):
         )
     else:
         answer = _format_brokers(rows, label=place)
-    # The app shows each agent as a licence card, so the text keeps only its lead line (no second list).
+    # Cards render each agent — keep the rich lead, drop the duplicated numbered list.
     if rows:
-        answer = answer.split("\n\n", 1)[0]
+        kept = []
+        for part in answer.split("\n\n"):
+            if re.match(r"^\d+\.\s+\*\*", (part or "").strip()):
+                break
+            kept.append(part)
+        answer = "\n\n".join(kept).rstrip()
+        if "Want agents for a nearby" not in answer:
+            answer += (
+                "\n\nWant agents for a nearby community, or should I match projects "
+                "in the same area next?"
+            )
     return _broker_reply(question, answer, rows)
 
 
@@ -1940,6 +3728,7 @@ def _compare_shown_turn(question, conversation_memory):
         rows,
         wanted_beds=wanted_bedrooms(question),
         attach_sales=(kind == "project"),
+        goal="compare",
     )
     answer = format_compare_table(rows, ranked)
     summary = _empty_structured_summary()
@@ -1977,25 +3766,71 @@ def _shortlist_recommend_turn(question, conversation_memory):
     """Rank projects or rentals already on screen and return Acot Recommend."""
     if _shown_compare_limit(question):
         return None
-    if not _SHORTLIST_RECOMMEND.search(question or ""):
-        return None
     if _TRANSACTION.search(question or ""):
+        return None
+    from app.answers.intent_route import classify_intent
+
+    route = classify_intent(question, conversation_memory)
+    pick = bool(_SHORTLIST_RECOMMEND.search(question or ""))
+    explain = bool(
+        re.search(r"\b(?:why|explain|good for|suit|fit)\b", question or "", re.I)
+    )
+    # Attribute asks ("which of these have 2 beds") stay off this path.
+    if not pick and not explain and route.get("kind") != "shortlist":
+        return None
+    if not pick and not explain:
+        # classify shortlist alone is not enough unless it is a pick/explain ask.
         return None
     kind, available = _shown_compare_rows(question, conversation_memory)
     if len(available) < 2:
         return None
-    from app.answers.recommend import format_shortlist, rank_projects, wanted_bedrooms
+    from app.answers.recommend import (
+        format_explain_on_screen,
+        format_shortlist,
+        rank_projects,
+        wanted_bedrooms,
+    )
 
     selected = available[:_COMPARE_ALL_LIMIT]
+    state = {}
+    if conversation_memory is not None:
+        if hasattr(conversation_memory, "get_dialogue_state"):
+            state = conversation_memory.get_dialogue_state() or {}
+        else:
+            state = getattr(conversation_memory, "dialogue_state", None) or {}
+    # Prefer the ask's goal over stale browse state (e.g. "best to invest").
+    q = question or ""
+    if re.search(r"\binvest\b", q, re.I):
+        goal = "invest"
+    elif re.search(r"\bfamil", q, re.I):
+        goal = "family"
+    elif re.search(r"\b(?:afford|budget|cheap)\b", q, re.I):
+        goal = "budget"
+    elif re.search(r"\b(?:ready|handover|completed)\b", q, re.I):
+        goal = "ready"
+    else:
+        goal = state.get("goal") or "compare"
     ranked = rank_projects(
         selected,
-        wanted_beds=wanted_bedrooms(question),
+        wanted_beds=wanted_bedrooms(question) or state.get("beds"),
+        budget_aed=state.get("budget_aed"),
         attach_sales=(kind == "project"),
+        goal=goal,
     )
     # Compare-style "which is best" with many options still gets a table when asked to compare.
     if _COMPARE_WORD.search(question or ""):
         from app.answers.recommend import format_compare_table
         answer = format_compare_table(selected, ranked)
+    elif re.search(r"\b(?:why|explain|good for|suit|fit)\b", question or "", re.I):
+        goal = state.get("goal")
+        if not goal and re.search(r"\bfamil", question or "", re.I):
+            goal = "family"
+        answer = format_explain_on_screen(
+            ranked,
+            goal=goal,
+            place=state.get("place"),
+            beds=state.get("beds"),
+        )
     else:
         answer = format_shortlist(ranked, question=question)
     summary = _empty_structured_summary()
@@ -2050,6 +3885,7 @@ def _shown_project_followup(question, conversation_memory):
     """Projects already on screen for "their starting prices" and the other chip follow-ups.
 
     Returns (projects, no_match) or None when this is not that kind of question.
+    After a sales_list answer there are no project cards — use last_sale_projects.
     """
     if not is_group_attribute_question(question):
         return None
@@ -2060,8 +3896,24 @@ def _shown_project_followup(question, conversation_memory):
         and str(item.get("entity_type") or "project").lower() == "project"
         and item.get("name")
     ]
+    from_sales = False
+    if not projects:
+        sale_stubs = getattr(conversation_memory, "last_sale_projects", None) or []
+        projects = [
+            item for item in sale_stubs
+            if isinstance(item, dict) and item.get("name")
+        ]
+        from_sales = bool(projects)
     if not projects:
         return None
+    # Sales stubs usually lack developer_name — hydrate from Prop-AI.
+    if from_sales or any(
+        not str(p.get("developer_name") or p.get("developer") or "").strip()
+        for p in projects
+    ):
+        # Only hydrate when the ask needs developer (or stubs are name-only).
+        if re.search(r"\bdevelopers?\b", question or "", re.I) or from_sales:
+            projects = _hydrate_projects_with_developers(projects)
     bedrooms = re.search(r"\b(\d+)\s*[- ]?\s*bed", question or "", re.I)
     if not bedrooms:
         return projects, False
@@ -2316,6 +4168,9 @@ def _propai_sql_browse(question, conversation_memory=None) -> bool:
     text = question or ""
     if re.search(r"\b(?:agents?|brokers?)\b", text, re.I):
         return False
+    # Sales / sold / transactions are handled by _transaction_turn, not the agent.
+    if _TRANSACTION.search(text):
+        return False
     if _is_dubai_guidance_question(text):
         return False
     if _is_definitional_question(text):
@@ -2512,12 +4367,16 @@ async def _try_agent_turn(question, components, timing_ms, ask_started):
     answer = re.sub(r"[ \t]{2,}", " ", answer).strip()
 
     used = {tool["name"] for tool in result.tools if tool.get("ok")}
-    # Plain browse/search should not invent an Acot Recommend section.
-    wants_recommend = bool(re.search(
-        r"\b(?:invest|buy|recommend|best|compar(?:e|ison)|which should|suggest)\b",
-        question or "",
-        re.I,
-    ))
+    # Phase 3: plain browse/search must not invent an Acot Recommend section.
+    from app.answers.intent_route import is_recommend_intent
+
+    wants_recommend = is_recommend_intent(question, conversation_memory) or bool(
+        re.search(
+            r"\b(?:invest|buy|recommend|best|compar(?:e|ison)|which should|suggest)\b",
+            question or "",
+            re.I,
+        )
+    )
     if (
         not wants_recommend
         and "compare_projects" not in used
@@ -2741,6 +4600,78 @@ async def _prepare_acot_turn_inner(
     # "show me two-bedroom apartments" after a JVC browse → keep that place on SQL.
     question = _inherit_place_for_home_browse(question, conversation_memory, prior)
 
+    # Today / latest sale date: calendar + Prop-AI max(instance_date), no LLM.
+    freshness = await asyncio.to_thread(_data_freshness_turn, question)
+    if freshness is not None:
+        freshness["timing_ms"] = timing_ms
+        freshness["ask_started"] = ask_started
+        freshness["rag_chain"] = rag_chain
+        freshness["conversation_memory"] = conversation_memory
+        return freshness
+
+    # Production RAG pattern (NVIDIA AI-Q / OpenAI tool routing / Microsoft agent
+    # routers): LLM understands the turn FIRST. Phrase regexes are only a cold
+    # fallback when the LLM is unavailable or returns nothing usable.
+    followup_turn = await _dialogue_followup_turn(
+        question, conversation_memory, components
+    )
+    if followup_turn is not None:
+        merged = dict(timing_ms)
+        merged.update(followup_turn.get("timing_ms") or {})
+        followup_turn["timing_ms"] = merged
+        followup_turn["ask_started"] = ask_started
+        followup_turn["rag_chain"] = rag_chain
+        followup_turn["conversation_memory"] = conversation_memory
+        return followup_turn
+
+    understood = await _understood_turn(
+        question, conversation_memory, components
+    )
+    if understood is not None:
+        merged = dict(timing_ms)
+        merged.update(understood.get("timing_ms") or {})
+        understood["timing_ms"] = merged
+        understood["ask_started"] = ask_started
+        understood["rag_chain"] = rag_chain
+        understood["conversation_memory"] = conversation_memory
+        return understood
+
+    # --- Offline / regex safety net only (LLM did not handle this turn) ---
+    project_count = await asyncio.to_thread(
+        _project_count_turn, question, conversation_memory
+    )
+    if project_count is not None:
+        project_count["timing_ms"] = timing_ms
+        project_count["ask_started"] = ask_started
+        project_count["rag_chain"] = rag_chain
+        project_count["conversation_memory"] = conversation_memory
+        return project_count
+
+    developer_rank = await asyncio.to_thread(_developer_rank_turn, question)
+    if developer_rank is not None:
+        developer_rank["timing_ms"] = timing_ms
+        developer_rank["ask_started"] = ask_started
+        developer_rank["rag_chain"] = rag_chain
+        developer_rank["conversation_memory"] = conversation_memory
+        return developer_rank
+
+    if is_group_attribute_question(question):
+        shown_attr = _shown_attribute_response(
+            question, conversation_memory, timing_ms, ask_started, rag_chain
+        )
+        if shown_attr is not None:
+            return shown_attr
+
+    transaction_first = await asyncio.to_thread(
+        _transaction_turn, question, conversation_memory
+    )
+    if transaction_first is not None:
+        transaction_first["timing_ms"] = timing_ms
+        transaction_first["ask_started"] = ask_started
+        transaction_first["rag_chain"] = rag_chain
+        transaction_first["conversation_memory"] = conversation_memory
+        return transaction_first
+
     # Agents for on-screen projects must beat agent-first (which often ignores cards).
     broker_first = await asyncio.to_thread(
         _broker_turn, question, conversation_memory
@@ -2752,15 +4683,8 @@ async def _prepare_acot_turn_inner(
         broker_first["conversation_memory"] = conversation_memory
         return broker_first
 
-    # Agent-first only when SQL browse should not handle this turn.
-    if _agent_enabled(components) and not _propai_sql_browse(question, conversation_memory):
-        agent_first = await _try_agent_turn(
-            question, components, timing_ms, ask_started
-        )
-        if agent_first is not None:
-            return agent_first
-
     # Clear Prop-AI place browses: SQL + template only (skip rewrite/plan/RAG).
+    # Run before agent-first so min-price / ready filters stay on SQL.
     if _propai_sql_browse(question, conversation_memory):
         sql_browse = await asyncio.to_thread(
             _sql_project_browse_turn, question, conversation_memory
@@ -2771,6 +4695,14 @@ async def _prepare_acot_turn_inner(
             sql_browse["rag_chain"] = rag_chain
             sql_browse["conversation_memory"] = conversation_memory
             return sql_browse
+
+    # Agent-first only when SQL browse should not handle this turn.
+    if _agent_enabled(components) and not _propai_sql_browse(question, conversation_memory):
+        agent_first = await _try_agent_turn(
+            question, components, timing_ms, ask_started
+        )
+        if agent_first is not None:
+            return agent_first
 
     # "Compare Dubai Marina and Business Bay": a table built from the database, no model call.
     areas = None
@@ -2974,7 +4906,12 @@ async def _prepare_acot_turn_inner(
             return shown_attr
 
     agent_question = question
-    if route.get("kind") == "show_more":
+    # Sales paging is handled by dialogue_state + _transaction_turn. Do not
+    # rewrite "show me more" into a fake project-name search string.
+    if (
+        route.get("kind") == "show_more"
+        and _dialogue_action(conversation_memory) not in {"sales_count", "sales_list"}
+    ):
         prior = prior_anchor_question(conversation_memory, question)
         if prior:
             agent_question = (
@@ -3140,6 +5077,7 @@ async def _prepare_acot_turn_inner(
         open_recommend = rank_projects(
             projects_for_rank,
             wanted_beds=wanted_bedrooms(standalone_question),
+            goal="invest",
         )
         structured_summary["recommendation"] = open_recommend.get("recommendation")
         if investment_analysis is not None:
@@ -3308,13 +5246,13 @@ def _iter_typewriter_pieces(text):
             yield text
         return
 
-    # Larger chunks: old 1-token pacing added seconds of sleep on project lists.
+    # Larger chunks cut artificial stream delay on SQL/fast answers.
     if len(tokens) <= 40:
-        group_size = 3
+        group_size = 5
     elif len(tokens) <= 120:
-        group_size = 6
+        group_size = 10
     else:
-        group_size = max(8, len(tokens) // 25)
+        group_size = max(12, len(tokens) // 18)
     buffer = []
     for token in tokens:
         buffer.append(token)
@@ -3776,7 +5714,7 @@ async def stream_acot(
                 )
                 for event in spoken_so_far():
                     yield event
-                await asyncio.sleep(0.004)
+                await asyncio.sleep(0.001)
         else:
             parts = []
 
@@ -3807,7 +5745,7 @@ async def stream_acot(
             tail = f"\n\n{prepared['companion_suffix']}"
             for piece in _iter_typewriter_pieces(tail):
                 yield ("delta", {"type": "delta", "text": piece})
-                await asyncio.sleep(0.004)
+                await asyncio.sleep(0.001)
             answer = f"{answer}{tail}"
 
         followups = _followup_questions(prepared)

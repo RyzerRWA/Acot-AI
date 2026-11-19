@@ -54,8 +54,9 @@ IMPORTANT:
 - Do not overstate conclusions.
 
 Focus on:
-locations, bedroom preferences, investment/rental yield,
+locations, bedroom preferences, investment/rental yield,Property names
 prices, handover dates, amenities, comparisons, and recent interests.
+- Do not mention the property name if it is not mentioned in the questions.
 """
 
 
@@ -144,8 +145,8 @@ Return ONLY a JSON object, no markdown fences and no commentary.
 }}
 
 RULES:
-- "summary" is read by a property broker deciding whether to contact this buyer. Write ONE sentence of
-  at most 25 words naming what they are looking for: the type of home, the areas or projects, and the
+- "summary" is read by a property broker deciding whether to contact this buyer. Write TWO sentences of
+  at most 50 words naming what they are looking for: the type of home, the areas or projects, and the
   purpose (to live in, to rent out, to invest) when the questions show it. Example:
   "A ready 1-bed in JVC or Dubai Marina to rent out, comparing handover dates and service charges."
   Do not start with "The user". Do not mention budget, timing or bedrooms unless the questions say so.

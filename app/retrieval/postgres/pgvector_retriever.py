@@ -101,13 +101,9 @@ class PGVectorRetriever:
         # Create query embedding
         # -----------------------------------------------------
 
-        query_embedding = self.create_query_embedding(
-            question
-        )
-
-        return match(
-            "match_communities", query_embedding, threshold, count
-        )
+        # Retired: old `communities` embeddings / match_communities RPC.
+        _ = threshold, count, question
+        return []
 
     # =========================================================
     # SEARCH DOCUMENT CHUNKS
@@ -119,40 +115,7 @@ class PGVectorRetriever:
         match_threshold: float = None,
         match_count: int = None
     ):
-        """
-        Semantic search over document_chunks.
+        """Retired: old `document_chunks` / match_document_chunks are not used."""
 
-        Uses:
-            match_document_chunks PostgreSQL RPC
-        """
-
-        if not question or not question.strip():
-            return []
-
-        # -----------------------------------------------------
-        # Use supplied values or defaults
-        # -----------------------------------------------------
-
-        threshold = (
-            match_threshold
-            if match_threshold is not None
-            else self.match_threshold
-        )
-
-        count = (
-            match_count
-            if match_count is not None
-            else self.match_count
-        )
-
-        # -----------------------------------------------------
-        # Create query embedding
-        # -----------------------------------------------------
-
-        query_embedding = self.create_query_embedding(
-            question
-        )
-
-        return match(
-            "match_document_chunks", query_embedding, threshold, count
-        )
+        _ = question, match_threshold, match_count
+        return []

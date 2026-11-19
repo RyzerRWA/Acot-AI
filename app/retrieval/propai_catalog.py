@@ -1,9 +1,13 @@
 """
-Read the new Prop-AI tables in the same shape as the old project rows.
+Prop-AI is the sole runtime data source for ACOT.
 
-A question is matched to a place with the alias list, then the place embedding.
-Projects, status, and a recent sale price are loaded with SQL and returned as the
-fields the current cards already show. If nothing matches, the caller keeps the old data.
+Main tables / views (all under public):
+  propai_projects, propai_places, propai_sales, propai_rents,
+  propai_brokers, propai_project_images, propai_project_plans,
+  propai_project_status, propai_raw, propai_area_stats, propai_project_prices
+
+Old Bayut tables (listings, communities, sub_communities, document_chunks)
+are not queried here.
 """
 from __future__ import annotations
 
@@ -215,7 +219,7 @@ def _projects_for(place: dict, limit: int = 8) -> list[dict]:
             "sub_community": row.get("master"),
             "city": "Dubai",
             "price": None,
-            "price_kind": "recent_sale",
+            "price_kind": None,
             "bedroom_min": None,
             "bedroom_max": None,
             "status": row.get("status"),
@@ -234,44 +238,78 @@ def _projects_for(place: dict, limit: int = 8) -> list[dict]:
 _SALE_FACTS: dict[str, dict] = {}
 
 
-def _add_sale_facts(projects: list[dict]) -> None:
+def _add_sale_facts(projects: list[dict], bedrooms=None) -> None:
     names = [str(project["name"]).upper() for project in projects if project.get("name")]
     if not names:
         return
-    missing = [name for name in dict.fromkeys(names) if name not in _SALE_FACTS]
+    bed_key = None
+    try:
+        bed_key = int(float(bedrooms)) if bedrooms is not None and bedrooms != "" else None
+    except (OverflowError, TypeError, ValueError):
+        bed_key = None
+    cache_prefix = f"B{bed_key}|" if bed_key is not None else ""
+    missing = [
+        name for name in dict.fromkeys(names)
+        if f"{cache_prefix}{name}" not in _SALE_FACTS
+    ]
     if missing:
+        parts = [
+            "deleted_at is null",
+            "sale_price between 100000 and 2000000000",
+            "instance_date >= current_date - interval '24 months'",
+            "upper(project_name_prop_ai) = any(%s)",
+        ]
+        params: list = [missing]
+        if bed_key is not None:
+            parts.append("bedrooms = %s")
+            params.append(bed_key)
         try:
             stats = fetch(
-                """
+                f"""
                 select upper(project_name_prop_ai) as name,
+                       count(*)::int as sales,
                        percentile_cont(0.5) within group (order by sale_price) as price,
                        min(bedrooms) filter (where bedrooms between 0 and 10) as bedroom_min,
                        max(bedrooms) filter (where bedrooms between 0 and 10) as bedroom_max,
                        max(instance_date) as last_sale
                 from propai_sales
-                where deleted_at is null and sale_price > 0
-                  and instance_date >= current_date - interval '24 months'
-                  and upper(project_name_prop_ai) = any(%s)
+                where {' and '.join(parts)}
                 group by 1
                 """,
-                (missing,),
+                tuple(params),
             )
         except Exception:
             stats = []
         for row in stats:
-            _SALE_FACTS[str(row["name"])] = row
+            _SALE_FACTS[f"{cache_prefix}{row['name']}"] = row
         for name in missing:
-            _SALE_FACTS.setdefault(name, {})
+            _SALE_FACTS.setdefault(f"{cache_prefix}{name}", {})
     for project in projects:
-        stat = _SALE_FACTS.get(str(project["name"]).upper())
+        stat = _SALE_FACTS.get(f"{cache_prefix}{str(project['name']).upper()}")
         if not stat:
+            # No invented recent_sale label when SQL returned no sale facts.
+            if project.get("price") is None:
+                project["price_kind"] = None
             continue
         if stat.get("price"):
             project["price"] = int(round(float(stat["price"])))
         project["bedroom_min"] = stat.get("bedroom_min")
         project["bedroom_max"] = stat.get("bedroom_max")
+        if stat.get("sales") is not None:
+            project["sales_count"] = int(stat["sales"] or 0)
         if stat.get("last_sale"):
             project["last_sale"] = stat["last_sale"]
+            # Frontend cards read last_sold_on; keep both keys in sync with the text.
+            project["last_sold_on"] = (
+                stat["last_sale"].isoformat()[:10]
+                if hasattr(stat["last_sale"], "isoformat")
+                else str(stat["last_sale"])[:10]
+            )
+        # price_kind tracks grounded sale price only — never claim sale without price.
+        if project.get("price") is not None:
+            project["price_kind"] = "recent_sale"
+        else:
+            project["price_kind"] = None
 
 
 def lookup(question: str) -> dict | None:
@@ -569,6 +607,18 @@ def agent_projects(
     if filters.get("handover_year") is not None:
         parts.append("extract(year from end_date) = %s")
         params.append(int(filters["handover_year"]))
+    if filters.get("ready_only"):
+        # Ready stock only. "On Sale" / off-plan can still be Completed/FINISHED.
+        # Escape % for psycopg (%% → literal %).
+        parts.append(
+            "("
+            "offplan_status ilike '%%ready%%' "
+            "and offplan_status not ilike '%%off-plan%%'"
+            ") or ("
+            "offplan_status is null "
+            "and (status_group = 'Completed' or development_status = 'FINISHED')"
+            ")"
+        )
     where = " and ".join(parts)
     if sort not in _PROJECT_SORTS:
         sort = DEFAULT_PROJECT_SORT
@@ -620,7 +670,7 @@ def agent_projects(
             "sub_community": row.get("area"),
             "city": "Dubai",
             "price": None,
-            "price_kind": "recent_sale",
+            "price_kind": None,
             "bedroom_min": None,
             "bedroom_max": None,
             "status": row.get("offplan_status"),
@@ -634,11 +684,11 @@ def agent_projects(
             "property_types": None,
             "brochure_url": None,
         })
-    _add_sale_facts(projects)
+    bedrooms = filters.get("bedrooms")
+    _add_sale_facts(projects, bedrooms=bedrooms)
     if communities:
         projects = drop_numbered_siblings(projects, communities)
         total = len(projects)
-    bedrooms = filters.get("bedrooms")
     if bedrooms is not None:
         wanted = int(bedrooms)
         projects = [
@@ -735,7 +785,14 @@ def recent_sales(name, limit: int = 8, per_project: int = 5, offset: int = 0) ->
     return {"count": len(sales), "sales": sales}
 
 
-def latest_sales(place=None, limit: int = 8, offset: int = 0, bedrooms=None) -> dict:
+def latest_sales(
+    place=None,
+    limit: int = 8,
+    offset: int = 0,
+    bedrooms=None,
+    year: int | None = None,
+    month: int | None = None,
+) -> dict:
     """Newest recorded sales, optionally limited to one Dubai area or project name."""
     cap = max(1, min(int(limit or 8), 15))
     start = max(0, int(offset or 0))
@@ -761,6 +818,13 @@ def latest_sales(place=None, limit: int = 8, offset: int = 0, bedrooms=None) -> 
             params.append(int(float(bedrooms)))
         except (OverflowError, TypeError, ValueError):
             pass
+    if year is not None and month is not None:
+        parts.append("extract(year from instance_date) = %s")
+        parts.append("extract(month from instance_date) = %s")
+        params.extend([int(year), int(month)])
+    elif year is not None:
+        parts.append("extract(year from instance_date) = %s")
+        params.append(int(year))
     rows = fetch(
         f"""
         select project_name_prop_ai as project,
@@ -798,6 +862,347 @@ def latest_sales(place=None, limit: int = 8, offset: int = 0, bedrooms=None) -> 
             "property_type": row.get("property_type"),
         })
     return {"count": len(sales), "sales": sales}
+
+
+_MONTH_NUMBERS = {
+    "january": 1, "jan": 1,
+    "february": 2, "feb": 2,
+    "march": 3, "mar": 3,
+    "april": 4, "apr": 4,
+    "may": 5,
+    "june": 6, "jun": 6,
+    "july": 7, "jul": 7,
+    "august": 8, "aug": 8,
+    "september": 9, "sep": 9, "sept": 9,
+    "october": 10, "oct": 10,
+    "november": 11, "nov": 11,
+    "december": 12, "dec": 12,
+}
+_MONTH_YEAR = re.compile(
+    r"\b(january|february|march|april|may|june|july|august|september|october|"
+    r"november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)"
+    r"[a-z]*\s+(20\d{2})\b",
+    re.I,
+)
+_LAST_MONTHS = re.compile(r"\b(?:last|past)\s+(\d{1,2})\s+months?\b", re.I)
+_PROJECT_HINT_FILLER = re.compile(
+    r"\b(?:what|is|the|a|an|cheapest|lowest|highest|most\s+expensive|sale|sales|"
+    r"sold|bedroom|bedrooms|bed|beds|studio|studios|apartment|apartments|"
+    r"in|at|for|of|last|past|months?|years?|year|during|this|with|and|"
+    r"dubai|date|price|prices)\b",
+    re.I,
+)
+
+
+def parse_sale_month_year(question: str | None) -> tuple[int | None, int | None]:
+    match = _MONTH_YEAR.search(question or "")
+    if not match:
+        return None, None
+    month = _MONTH_NUMBERS.get(match.group(1).lower())
+    try:
+        year = int(match.group(2))
+    except (TypeError, ValueError):
+        return month, None
+    return month, year
+
+
+def parse_lookback_months(question: str | None, default: int | None = None) -> int | None:
+    match = _LAST_MONTHS.search(question or "")
+    if match:
+        return max(1, min(int(match.group(1)), 60))
+    if re.search(r"\blast\s+(?:one\s+)?year\b|\bpast\s+year\b|\b12\s+months\b", question or "", re.I):
+        return 12
+    return default
+
+
+def project_named_in_question(question: str | None) -> str | None:
+    """Project name left after stripping communities and sale filler (e.g. Hanover Square)."""
+    text = question or ""
+    # Prefer a project name that literally appears in the ask (longest match).
+    rows = fetch(
+        """
+        select name as project
+        from propai_projects
+        where coalesce(name, '') <> ''
+          and length(name) >= 5
+          and position(upper(name) in upper(%s)) > 0
+        order by length(name) desc
+        limit 1
+        """,
+        (text,),
+    )
+    if rows:
+        return rows[0].get("project")
+
+    text = _MONTH_YEAR.sub(" ", text)
+    text = _LAST_MONTHS.sub(" ", text)
+    text = re.sub(r"\b20\d{2}\b", " ", text)
+    text = re.sub(r"\blast\s+(?:one\s+)?year\b|\bpast\s+year\b", " ", text, flags=re.I)
+    text = re.sub(
+        r"\b(?:studio|one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s*-?\s*"
+        r"(?:bed(?:room)?s?|br)\b",
+        " ",
+        text,
+        flags=re.I,
+    )
+    for key in sorted(ALIASES, key=len, reverse=True):
+        text = re.sub(rf"(?<![a-z0-9]){re.escape(key)}(?![a-z0-9])", " ", text, flags=re.I)
+    for label in sorted({str(v) for v in ALIASES.values() if v}, key=len, reverse=True):
+        text = re.sub(rf"(?<![a-z0-9]){re.escape(label)}(?![a-z0-9])", " ", text, flags=re.I)
+    text = _PROJECT_HINT_FILLER.sub(" ", text)
+    text = re.sub(r"[^a-z0-9\s@&'.-]", " ", text, flags=re.I)
+    hint = " ".join(text.split()).strip(" .?-")
+    hint = re.sub(r"^\d+\s*-?\s*", "", hint).strip(" .?-")
+    if len(hint) < 3:
+        return None
+    rows = fetch(
+        """
+        select project_name_prop_ai as project
+        from propai_sales
+        where deleted_at is null
+          and coalesce(project_name_prop_ai, '') <> ''
+          and upper(project_name_prop_ai) = upper(%s)
+        limit 1
+        """,
+        (hint,),
+    )
+    if rows:
+        return rows[0].get("project")
+    rows = fetch(
+        """
+        select project_name_prop_ai as project
+        from propai_sales
+        where deleted_at is null
+          and coalesce(project_name_prop_ai, '') <> ''
+          and upper(project_name_prop_ai) like upper(%s)
+        order by length(project_name_prop_ai)
+        limit 1
+        """,
+        (f"%{hint}%",),
+    )
+    return rows[0].get("project") if rows else None
+
+
+def count_sales(
+    place=None,
+    bedrooms=None,
+    year: int | None = None,
+    month: int | None = None,
+) -> dict:
+    """How many recorded sales match place / beds / calendar month."""
+    parts = [
+        "deleted_at is null",
+        "sale_price between 10000 and 2000000000",
+        "instance_date is not null",
+        "coalesce(project_name_prop_ai, '') <> ''",
+    ]
+    params: list = []
+    text = str(place or "").strip()
+    if text:
+        clause, extra = contains_place_sql(
+            ["area_name_prop_ai", "master_project_prop_ai", "project_name_prop_ai"],
+            _expanded([text]),
+        )
+        parts.append(clause)
+        params.extend(extra)
+    if bedrooms is not None and bedrooms != "":
+        parts.append("bedrooms = %s")
+        params.append(int(float(bedrooms)))
+    if year is not None and month is not None:
+        parts.append("extract(year from instance_date) = %s")
+        parts.append("extract(month from instance_date) = %s")
+        params.extend([int(year), int(month)])
+    elif year is not None:
+        parts.append("extract(year from instance_date) = %s")
+        params.append(int(year))
+    rows = fetch(
+        f"""
+        select count(*)::int as n,
+               min(instance_date)::date as first_sale,
+               max(instance_date)::date as last_sale
+        from propai_sales
+        where {' and '.join(parts)}
+        """,
+        tuple(params),
+    )
+    row = rows[0] if rows else {}
+    return {
+        "count": int(row.get("n") or 0),
+        "first_sale": row.get("first_sale"),
+        "last_sale": row.get("last_sale"),
+    }
+
+
+def sale_window_stats(
+    project=None,
+    place=None,
+    bedrooms=None,
+    months: int | None = 12,
+) -> dict:
+    """Evidence behind a cheapest/highest answer: how many sales, min/median/max price.
+
+    Uses the same outlier filters as cheapest_sale so the numbers agree.
+    """
+    parts = [
+        "deleted_at is null",
+        "sale_price between 100000 and 2000000000",
+        "(procedure_area_sqft is null or procedure_area_sqft between 200 and 100000)",
+        "instance_date is not null",
+        "coalesce(project_name_prop_ai, '') <> ''",
+    ]
+    params: list = []
+    project_name = str(project or "").strip()
+    if project_name:
+        parts.append("upper(project_name_prop_ai) = upper(%s)")
+        params.append(project_name)
+    else:
+        text = str(place or "").strip()
+        if text:
+            clause, extra = contains_place_sql(
+                ["area_name_prop_ai", "master_project_prop_ai", "project_name_prop_ai"],
+                _expanded([text]),
+            )
+            parts.append(clause)
+            params.extend(extra)
+    if bedrooms is not None and bedrooms != "":
+        parts.append("bedrooms = %s")
+        params.append(int(float(bedrooms)))
+    if months is not None:
+        parts.append("instance_date >= current_date - (%s * interval '1 month')")
+        params.append(int(months))
+    rows = fetch(
+        f"""
+        select count(*)::int as n,
+               min(sale_price)::bigint as low,
+               max(sale_price)::bigint as high,
+               percentile_cont(0.5) within group (order by sale_price)::bigint as median
+        from propai_sales
+        where {' and '.join(parts)}
+        """,
+        tuple(params),
+    )
+    row = rows[0] if rows else {}
+    return {
+        "count": int(row.get("n") or 0),
+        "low": None if row.get("low") is None else int(row["low"]),
+        "high": None if row.get("high") is None else int(row["high"]),
+        "median": None if row.get("median") is None else int(row["median"]),
+    }
+
+
+def cheapest_sale(
+    project=None,
+    place=None,
+    bedrooms=None,
+    months: int | None = 12,
+    highest: bool = False,
+) -> dict | None:
+    """Lowest (or, with highest=True, highest) non-outlier sale for a project or place."""
+    parts = [
+        "deleted_at is null",
+        # Floor removes clear data errors (AED 6k–60k "1-bed" rows).
+        "sale_price between 100000 and 2000000000",
+        # Tiny areas are usually bad rows, not livable 1-beds.
+        "(procedure_area_sqft is null or procedure_area_sqft between 200 and 100000)",
+        "instance_date is not null",
+        "coalesce(project_name_prop_ai, '') <> ''",
+    ]
+    params: list = []
+    project_name = str(project or "").strip()
+    if project_name:
+        parts.append("upper(project_name_prop_ai) = upper(%s)")
+        params.append(project_name)
+    else:
+        text = str(place or "").strip()
+        if text:
+            clause, extra = contains_place_sql(
+                ["area_name_prop_ai", "master_project_prop_ai", "project_name_prop_ai"],
+                _expanded([text]),
+            )
+            parts.append(clause)
+            params.extend(extra)
+    if bedrooms is not None and bedrooms != "":
+        parts.append("bedrooms = %s")
+        params.append(int(float(bedrooms)))
+    if months is not None:
+        parts.append("instance_date >= current_date - (%s * interval '1 month')")
+        params.append(int(months))
+    rows = fetch(
+        f"""
+        select project_name_prop_ai as project,
+               instance_date as sold_on,
+               sale_price::bigint as price,
+               bedrooms,
+               procedure_area_sqft as size_sqft,
+               property_type_en as property_type
+        from propai_sales
+        where {' and '.join(parts)}
+        order by sale_price {'desc' if highest else 'asc'}, instance_date desc nulls last
+        limit 1
+        """,
+        tuple(params),
+    )
+    if not rows:
+        return None
+    row = rows[0]
+    sold = row.get("sold_on")
+    size = row.get("size_sqft")
+    try:
+        size_sqft = int(round(float(size))) if size is not None else None
+    except (OverflowError, TypeError, ValueError):
+        size_sqft = None
+    beds = row.get("bedrooms")
+    try:
+        bed_n = int(float(beds)) if beds is not None else None
+    except (OverflowError, TypeError, ValueError):
+        bed_n = None
+    return {
+        "project": row.get("project"),
+        "date": sold.isoformat() if hasattr(sold, "isoformat") else (str(sold)[:10] if sold else None),
+        "price": None if row.get("price") is None else int(row["price"]),
+        "bedrooms": bed_n,
+        "size_sqft": size_sqft,
+        "property_type": row.get("property_type"),
+    }
+
+
+def top_developers_by_value(limit: int = 5, months: int = 12) -> list[dict]:
+    """Developers ranked by total recorded sale value."""
+    cap = max(1, min(int(limit or 5), 20))
+    lookback = max(1, min(int(months or 12), 60))
+    rows = fetch(
+        """
+        select developer_group as developer,
+               count(*)::int as sales,
+               sum(sale_price)::bigint as value
+        from propai_sales
+        where deleted_at is null
+          and sale_price between 100000 and 2000000000
+          and instance_date >= current_date - (%s * interval '1 month')
+          and coalesce(developer_group, '') <> ''
+        group by 1
+        order by value desc nulls last
+        limit %s
+        """,
+        (lookback, cap),
+    )
+    out = []
+    for row in rows or []:
+        out.append({
+            "developer": row.get("developer"),
+            "sales": int(row.get("sales") or 0),
+            "value": int(row.get("value") or 0),
+        })
+    return out
+
+
+def count_projects() -> int:
+    """Distinct Prop-AI project names in Dubai."""
+    rows = fetch(
+        "select count(distinct upper(name))::int as n "
+        "from propai_projects where coalesce(name, '') <> ''"
+    )
+    return int(rows[0]["n"]) if rows else 0
 
 
 def agent_by_id(agent_id: str) -> dict | None:
@@ -845,7 +1250,223 @@ def rent_summary(areas, beds_min=None, beds_max=None) -> dict | None:
     return {
         "contracts": row["n"],
         "median_annual_rent_aed": None if median is None else int(median),
-        "note": "Registered rents from the new data since September 2025. Listing cards remain advertised asking rents.",
+        "note": "Registered Prop-AI rents since September 2025 (propai_rents).",
+    }
+
+
+def _rent_row_public(row: dict) -> dict:
+    """Card-shaped rent contract from propai_rents."""
+    annual = row.get("annual_amount")
+    try:
+        annual_i = int(round(float(annual))) if annual is not None else None
+    except (TypeError, ValueError):
+        annual_i = None
+    beds = row.get("bedrooms")
+    try:
+        beds_i = int(float(beds)) if beds is not None else None
+    except (TypeError, ValueError):
+        beds_i = None
+    size = row.get("actual_area_sqft")
+    try:
+        size_i = int(round(float(size))) if size is not None else None
+    except (TypeError, ValueError):
+        size_i = None
+    start = row.get("contract_start_date")
+    title_bits = [
+        str(row.get("building_name_prop_ai") or row.get("project_name_prop_ai") or "").strip(),
+        f"{beds_i} bed" if beds_i is not None else None,
+        str(row.get("property_type") or "").strip() or None,
+    ]
+    title = " · ".join(bit for bit in title_bits if bit) or "Registered rent"
+    contract_id = str(row.get("pai_contract_id") or "").strip()
+    return {
+        "listing_id": contract_id or None,
+        "title": title,
+        "property_type": row.get("property_type"),
+        "beds": beds_i,
+        "baths": None,
+        "size_sqft": size_i,
+        "furnishing": None,
+        "community": row.get("area_name_prop_ai") or row.get("master_project_prop_ai"),
+        "sub_community": row.get("master_project_prop_ai"),
+        "agency_name": None,
+        "price_aed": annual_i,
+        "annual_rent_aed": annual_i,
+        "monthly_rent_aed": None if annual_i is None else int(round(annual_i / 12)),
+        "rent_frequency": "yearly",
+        "contract_start": start.isoformat() if hasattr(start, "isoformat") else (str(start)[:10] if start else None),
+        "project": row.get("project_name_prop_ai"),
+        "building": row.get("building_name_prop_ai"),
+        "source": "propai_rents",
+        "entity_type": "listing",
+    }
+
+
+def list_rents(
+    areas=None,
+    beds_min=None,
+    beds_max=None,
+    *,
+    limit: int = 8,
+    sort: str = "cheapest",
+) -> dict:
+    """Browse registered rents from propai_rents (not Bayut listings)."""
+    asked = _expanded(areas)
+    if not asked:
+        return {"matching_listings": 0, "listings": [], "note": "Name a Dubai area to search Prop-AI rents."}
+    lock, lock_params = sales_place_sql(asked, _official_areas(asked))
+    clauses = [
+        "deleted_at is null",
+        "annual_amount > 0",
+        "contract_start_date >= date '2025-09-01'",
+        lock,
+    ]
+    params: list = list(lock_params)
+    if beds_min is not None:
+        clauses.append("bedrooms >= %s")
+        params.append(beds_min)
+    if beds_max is not None:
+        clauses.append("bedrooms <= %s")
+        params.append(beds_max)
+    order = {
+        "cheapest": "annual_amount asc nulls last, contract_start_date desc nulls last",
+        "priciest": "annual_amount desc nulls last, contract_start_date desc nulls last",
+        "newest": "contract_start_date desc nulls last, annual_amount asc nulls last",
+    }.get(str(sort or "cheapest").lower(), "annual_amount asc nulls last")
+    cap = max(1, min(int(limit or 8), 20))
+    where = " and ".join(clauses)
+    try:
+        total = fetch(
+            f"select count(*)::int as n from propai_rents where {where}",
+            tuple(params),
+        )[0]["n"]
+        rows = fetch(
+            f"""
+            select pai_contract_id, property_type, bedrooms, actual_area_sqft, annual_amount,
+                   contract_start_date, area_name_prop_ai, master_project_prop_ai,
+                   project_name_prop_ai, building_name_prop_ai
+            from propai_rents
+            where {where}
+            order by {order}
+            limit %s
+            """,
+            tuple([*params, cap]),
+        )
+    except Exception:
+        return {"matching_listings": 0, "listings": [], "note": "Prop-AI rent search failed."}
+    listings = [_rent_row_public(row) for row in (rows or [])]
+    return {
+        "matching_listings": int(total or 0),
+        "showing": len(listings),
+        "sorted_by": sort,
+        "listings": listings,
+        "note": "Registered Prop-AI rents (propai_rents), not advertised Bayut listings.",
+    }
+
+
+def rent_stats(areas=None, beds_min=None, beds_max=None) -> dict | None:
+    """Aggregate Prop-AI rents for an area."""
+    asked = _expanded(areas)
+    if not asked:
+        return None
+    lock, lock_params = sales_place_sql(asked, _official_areas(asked))
+    clauses = [
+        "deleted_at is null",
+        "annual_amount > 0",
+        "contract_start_date >= date '2025-09-01'",
+        lock,
+    ]
+    params: list = list(lock_params)
+    if beds_min is not None:
+        clauses.append("bedrooms >= %s")
+        params.append(beds_min)
+    if beds_max is not None:
+        clauses.append("bedrooms <= %s")
+        params.append(beds_max)
+    try:
+        row = fetch(
+            f"""
+            select count(*)::int as n,
+                   round(avg(annual_amount))::bigint as avg_annual,
+                   percentile_cont(0.5) within group (order by annual_amount)::bigint as median_annual,
+                   percentile_cont(0.25) within group (order by annual_amount)::bigint as p25,
+                   percentile_cont(0.75) within group (order by annual_amount)::bigint as p75,
+                   min(annual_amount)::bigint as min_annual,
+                   max(annual_amount)::bigint as max_annual
+            from propai_rents
+            where {' and '.join(clauses)}
+            """,
+            tuple(params),
+        )[0]
+    except Exception:
+        return None
+    if not row.get("n"):
+        return None
+    return {
+        "listings": int(row["n"]),
+        "avg_annual_rent_aed": None if row.get("avg_annual") is None else int(row["avg_annual"]),
+        "median_annual_rent_aed": None if row.get("median_annual") is None else int(row["median_annual"]),
+        "typical_range_annual_aed": [
+            None if row.get("p25") is None else int(row["p25"]),
+            None if row.get("p75") is None else int(row["p75"]),
+        ],
+        "min_annual_rent_aed": None if row.get("min_annual") is None else int(row["min_annual"]),
+        "max_annual_rent_aed": None if row.get("max_annual") is None else int(row["max_annual"]),
+        "note": "Registered Prop-AI rents (propai_rents).",
+    }
+
+
+def project_payment_plans(project_key: str | None = None, name: str | None = None) -> dict | None:
+    """Payment plans from propai_project_plans for a project key or name."""
+    key = str(project_key or "").strip()
+    needle = str(name or "").strip()
+    row = None
+    try:
+        if key:
+            found = fetch(
+                "select location_key, payment_plans, property_types "
+                "from propai_project_plans where location_key = %s limit 1",
+                (key,),
+            )
+            row = found[0] if found else None
+        if row is None and needle:
+            found = fetch(
+                """
+                select p.location_key, p.payment_plans, p.property_types, pr.name
+                from propai_project_plans p
+                join propai_projects pr on pr.key = p.location_key
+                where pr.name ilike %s
+                order by jsonb_array_length(coalesce(p.payment_plans, '[]'::jsonb)) desc
+                limit 1
+                """,
+                (f"%{needle}%",),
+            )
+            row = found[0] if found else None
+    except Exception:
+        return None
+    if not row:
+        return None
+    plans = row.get("payment_plans") or []
+    if isinstance(plans, str):
+        try:
+            import json
+            plans = json.loads(plans)
+        except Exception:
+            plans = []
+    if not isinstance(plans, list) or not plans:
+        return {
+            "location_key": row.get("location_key"),
+            "name": row.get("name"),
+            "payment_plans": [],
+            "property_types": row.get("property_types"),
+            "note": "No payment plan recorded for this project in Prop-AI.",
+        }
+    return {
+        "location_key": row.get("location_key"),
+        "name": row.get("name"),
+        "payment_plans": plans,
+        "property_types": row.get("property_types"),
+        "note": "From propai_project_plans.",
     }
 
 
@@ -961,6 +1582,15 @@ _OUTSIDE_DUBAI = {
 def _normalize_place(place) -> str:
     text = re.sub(r"\s+", " ", str(place or "").strip(" .?!,;:'\""))
     text = re.sub(r"^(?:the|in|at|for)\s+", "", text, flags=re.I)
+    # Drop budget tails so "Dubai starting above AED 5 million" → "Dubai".
+    text = re.sub(
+        r"\b(?:starting(?:\s+(?:above|from|at))?|above|over|under|below|up\s+to|"
+        r"around|about|budget|max(?:imum)?|min(?:imum)?|price|prices|"
+        r"aed|dh|dhs)\b.*$",
+        "",
+        text,
+        flags=re.I,
+    )
     text = re.sub(
         r"\s+(?:area|community|city|emirate|details?|agents?|brokers?)$",
         "",

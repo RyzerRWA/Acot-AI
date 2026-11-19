@@ -106,6 +106,9 @@ _DOMAIN_WORDS = (
     "villa", "villas", "handover", "listing", "listings",
     "agent", "agents", "broker", "brokers",
     "transaction", "transactions",
+    # Superlatives — "chepest" / "lowset" must become cheapest / lowest.
+    "cheapest", "lowest", "highest", "average", "median",
+    "expensive", "priciest", "minimum", "maximum",
 )
 
 _GENERIC_WORDS = {
@@ -196,6 +199,9 @@ def _correct_domain_word(token: str) -> str:
     if lowered in _DOMAIN_WORDS or len(lowered) < 5:
         return token
     if any(ch.isdigit() for ch in lowered):
+        return token
+    # Proper nouns (Hanover Square) must not become domain words (handover).
+    if len(core) >= 2 and core[0].isupper() and core[1:].islower():
         return token
     if lowered in _locked_place_words():
         return token

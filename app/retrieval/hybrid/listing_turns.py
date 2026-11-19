@@ -131,35 +131,31 @@ def _row_from_rental_card(card: dict) -> dict:
 
 
 def retrieve_listings(db, question: str, filters: Dict[str, Any]) -> Dict[str, Any]:
-    """Search rental listings and keep project records out of the answer."""
+    """Browse registered rents from propai_rents (main Prop-AI rent data)."""
 
+    _ = db
     args = listing_search_args(question, filters)
+    place = (args.get("areas") or [None])[0]
     rows: list[dict] = []
     total = 0
-    place = (args.get("areas") or [None])[0]
     try:
-        from app.listings.tools import search_listings
+        from app.retrieval.propai_catalog import list_rents
 
-        found = search_listings(args)
-        out = found.output or {}
-        total = int(out.get("matching_listings") or 0)
-        rows = [_row_from_rental_card(card) for card in (found.cards or []) if isinstance(card, dict)]
-        place = place or out.get("catalog_place")
+        found = list_rents(
+            args.get("areas"),
+            args.get("beds_min"),
+            args.get("beds_max"),
+            limit=BROWSE_LISTING_LIMIT,
+            sort=str(args.get("sort") or "cheapest"),
+        )
+        rows = list(found.get("listings") or [])
+        total = int(found.get("matching_listings") or len(rows))
     except Exception as exc:
-        print("Listing search error:", exc)
+        print("Prop-AI rent browse error:", exc)
         rows, total = [], 0
 
-    if not rows:
-        try:
-            found = ListingRetriever(db).search(question, filters, limit=BROWSE_LISTING_LIMIT)
-            rows = found.get("listings") or []
-            total = found.get("listing_total") or len(rows)
-            place = place or found.get("subject")
-        except Exception as exc:
-            print("Listing retrieval error:", exc)
-
     rows = _prepare_listing_rows(rows, BROWSE_LISTING_LIMIT)
-    print(f"Listings retrieved: {len(rows)}")
+    print(f"Prop-AI rents retrieved: {len(rows)}")
 
     result = {
         "communities": [],
@@ -177,10 +173,10 @@ def retrieve_listings(db, question: str, filters: Dict[str, Any]) -> Dict[str, A
 
 
 def retrieve_bedroom_comparison(db, counts, place: str) -> Dict[str, Any]:
-    """Load a rental sample for each bedroom count in one place."""
+    """Retired: old Bayut listings are not compared."""
 
-    retriever = ListingRetriever(db)
-    community = retriever._match_community(place or "") or (place or "").strip()
+    _ = db
+    community = (place or "").strip()
     sides = []
     rows = []
 
@@ -188,14 +184,7 @@ def retrieve_bedroom_comparison(db, counts, place: str) -> Dict[str, Any]:
         label = f"{count} bedroom rentals"
         if community:
             label = f"{label} in {community.title()}"
-        constraints = ListingRetriever._constraints({"bedrooms": int(count)})
-        try:
-            matched, total = retriever._sql_search(community, constraints, 50)
-        except Exception as exc:
-            print("Bedroom listing comparison error:", exc)
-            matched, total = [], 0
-        if matched and matched[0].get("community"):
-            label = f"{count} bedroom rentals in {matched[0]['community']}"
+        matched, total = [], 0
         sides.append({
             "entity_type": "listing",
             "requested_name": label,
@@ -238,61 +227,10 @@ def _normalize_listing_title(value: str) -> str:
 
 
 def lookup_listing_by_title(title: str) -> Optional[Dict[str, Any]]:
-    """Resolve a pasted listing title to one listings row."""
+    """Retired: old Bayut `listings` table is not queried."""
 
-    from app.database.postgres import fetch
-
-    needle = _normalize_listing_title(title)
-    if len(needle) < 8:
-        return None
-
-    tokens = [token for token in needle.split() if len(token) > 2][:4]
-    if not tokens:
-        return None
-
-    where = " and ".join(["title ilike %s"] * len(tokens))
-    params = tuple(f"%{token}%" for token in tokens)
-    try:
-        rows = fetch(
-            "select listing_id, title, purpose, property_type, category, beds, baths, "
-            "size_sqft, price_aed, rent_frequency, furnishing, completion_status, "
-            "community, sub_community, location, agency_name, cover_photo, "
-            "image_urls, url "
-            f"from listings where {where} "
-            "order by price_aed asc nulls last "
-            "limit 40",
-            params,
-        )
-    except Exception as exc:
-        print("Listing title lookup error:", exc)
-        return None
-
-    needle_compact = needle.replace(" ", "")
-    best = None
-    best_score = 0.0
-    for row in rows or []:
-        cand = _normalize_listing_title(row.get("title"))
-        if not cand:
-            continue
-        cand_compact = cand.replace(" ", "")
-        if cand == needle or needle in cand or cand in needle:
-            score = 1.0 + min(len(cand), len(needle)) / 1000.0
-        elif needle_compact and (
-            needle_compact in cand_compact or cand_compact in needle_compact
-        ):
-            score = 0.92
-        else:
-            left = set(needle.split())
-            right = set(cand.split())
-            if not left or not right:
-                continue
-            score = len(left & right) / max(len(left), len(right))
-            if score < 0.72:
-                continue
-        if score > best_score:
-            best_score = score
-            best = row
-    return best
+    _ = title
+    return None
 
 
 def payment_plan_subject(question: str) -> str:

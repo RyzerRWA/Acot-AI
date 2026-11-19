@@ -3,6 +3,7 @@
 import re
 from datetime import datetime, timezone
 
+from app.answers.grounding import ground_project_row, ground_project_rows
 from app.retrieval.hybrid.question_text import collapse_stretched_letters
 
 
@@ -124,9 +125,17 @@ def _format_aed(value):
 
 
 def _recent_sale_row(record) -> bool:
-    kind = str((record or {}).get("price_kind") or "").lower()
-    source = str((record or {}).get("source") or "").lower()
-    return kind in {"recent_sale", "latest_sale"} or source == "propai"
+    """True only when sale kind is set and a grounded price (or sale date) exists."""
+    record = record or {}
+    kind = str(record.get("price_kind") or "").lower()
+    if kind not in {"recent_sale", "latest_sale"}:
+        return False
+    try:
+        has_price = record.get("price") is not None and float(record["price"]) > 0
+    except (TypeError, ValueError):
+        has_price = False
+    has_sale_date = bool(record.get("last_sold_on") or record.get("last_sale"))
+    return has_price or has_sale_date
 
 
 def _price_clause(record, *, sentence: bool = False) -> str | None:
@@ -242,6 +251,11 @@ def _format_project_card(record):
     investment metrics are invented here.
     """
 
+    record = ground_project_row(record)
+    price_kind = record.get("price_kind")
+    if not price_kind and _recent_sale_row(record):
+        price_kind = "recent_sale"
+
     return {
         "id": _json_safe(record.get("id")),
         "name": record.get("name"),
@@ -251,9 +265,7 @@ def _format_project_card(record):
         "community": record.get("community"),
         "sub_community": record.get("sub_community"),
         "price": _json_safe(record.get("price")),
-        "price_kind": record.get("price_kind") or (
-            "recent_sale" if _recent_sale_row(record) else None
-        ),
+        "price_kind": price_kind,
         "price_label": (
             _price_clause(record)
             if record.get("price") is not None
@@ -277,8 +289,10 @@ def _format_project_card(record):
         "handover_time": _json_safe(
             record.get("handover_time")
         ),
-        "last_sold_on": _json_safe(
-            record.get("last_sold_on") or record.get("last_sale")
+        # Sale facts use last_sale; cards and chat text must show the same date.
+        "last_sold_on": _json_safe(record.get("last_sold_on")),
+        "last_sale": _json_safe(
+            record.get("last_sale") or record.get("last_sold_on")
         ),
         "sales_count": _json_safe(
             record.get("sales_count") or record.get("sales")
@@ -1011,10 +1025,12 @@ def build_frontend_response(
     Structured database records are exposed as frontend-friendly `data`.
     """
 
-    projects = structured_summary.get(
-        "projects",
-        []
-    ) or []
+    # Phase 6: ground before cards so price_kind / last_sold_on match answer text.
+    projects = ground_project_rows(
+        structured_summary.get("projects", []) or []
+    )
+    if isinstance(structured_summary, dict):
+        structured_summary["projects"] = projects
 
     communities = structured_summary.get(
         "community",
@@ -1029,7 +1045,6 @@ def build_frontend_response(
     formatted_projects = [
         _format_project_card(project)
         for project in projects
-        if isinstance(project, dict)
     ]
 
     formatted_communities = [
@@ -1327,13 +1342,83 @@ def _listing_answer(listings, structured_summary, question=None):
 
 
 _BROWSE_REQUEST = re.compile(
-    r"\b(?:i want|i need|looking for|interested in|show me|give me|list|find|suggest)\b"
+    r"\b(?:i want|i need|looking for|interested in|"
+    r"show(?:\s+me|\s+only)?|give me|list|find|suggest|browse)\b",
+    re.I,
 )
 _REQUESTED_COUNT = re.compile(
     r"\b(?:want|need|show me|give me|list|find|top|any|suggest)\s+(\d{1,2})\b"
     r"(?!\s*-?\s*(?:bed|bedroom|bedrooms|br|bath|sqft|million|m|k)\b)"
 )
 DEFAULT_BROWSE_COUNT = 10
+
+
+def _is_project_browse_question(question: str | None) -> bool:
+    """True when the user is searching/filtering projects, not asking one field about a shortlist."""
+    text = question or ""
+    if _BROWSE_REQUEST.search(text):
+        return True
+    return bool(
+        re.search(r"\b(?:show|find|list)\b", text, re.I)
+        and re.search(
+            r"\b(?:apartments?|projects?|villas?|townhouses?|homes?|propert(?:y|ies)|flats?)\b",
+            text,
+            re.I,
+        )
+    )
+
+
+def _filter_aware_browse_intro(question, projects, structured_summary) -> str | None:
+    """Open with Understood + matching count (ready / beds / place / budget)."""
+    from app.answers.explain_contract import build_understood, prepend_understood
+    from app.answers.intent_route import parse_bedrooms, parse_budget_aed, extract_place
+
+    text = question or ""
+    place = (
+        str(structured_summary.get("catalog_place") or "").strip()
+        or extract_place(text)
+    )
+    beds = parse_bedrooms(text)
+    budget = parse_budget_aed(text)
+    ready = bool(re.search(r"\b(?:ready(?:\s+only)?|only\s+ready|completed)\b", text, re.I))
+    under = bool(re.search(r"\b(?:under|below|up\s+to|max(?:imum)?)\b", text, re.I))
+    above = bool(re.search(r"\b(?:above|over|starting)\b", text, re.I))
+    # A place-only browse keeps the plain "I found N projects in X" opener;
+    # the Understood line is added by the caller. Filter wording is for real filters.
+    if not (beds or budget is not None or ready):
+        return None
+
+    bits = []
+    if ready:
+        bits.append("ready")
+    if beds:
+        if beds[0] == 0:
+            bits.append("studio")
+        else:
+            bits.append(f"{beds[0]}-bedroom")
+    bits.append("options" if len(projects) != 1 else "option")
+    where = f" in {place}" if place and str(place).lower() != "dubai" else ""
+    budget_bit = ""
+    if budget is not None:
+        budget_bit = (
+            f" under AED {int(budget):,}"
+            if under or not above
+            else f" from AED {int(budget):,}"
+        )
+    count = len(projects)
+    facts = (
+        f"Here are {count} {' '.join(bits)}{where}{budget_bit} "
+        "from recorded sales when available:"
+    )
+    understood = build_understood(
+        place=place,
+        beds=beds[0] if beds else None,
+        budget_aed=budget,
+        ready_only=ready,
+        intent="browse",
+        under_budget=under or (budget is not None and not above),
+    )
+    return prepend_understood(facts, understood)
 
 
 def _limit_browse_projects(question, projects, structured_summary):
@@ -1343,7 +1428,7 @@ def _limit_browse_projects(question, projects, structured_summary):
     (the conversation memory keeps the full list in the same order). The summary is cut in place, so the
     cards the app draws match the text, and it gains project_total ("I found 165 projects. Here are 10").
     """
-    if len(projects) <= 1 or not _BROWSE_REQUEST.search(question):
+    if len(projects) <= 1 or not _is_project_browse_question(question):
         return projects, structured_summary, False
 
     match = _REQUESTED_COUNT.search(question)
@@ -1433,7 +1518,9 @@ def _build_fast_structured_answer(
             lines.append(f"- **{title}**. {bedroom_text}.")
         return "\n".join(lines)
 
-    projects = structured_summary.get("projects", []) or []
+    projects = ground_project_rows(structured_summary.get("projects", []) or [])
+    if isinstance(structured_summary, dict):
+        structured_summary["projects"] = projects
     communities = structured_summary.get("community", []) or []
     sub_communities = structured_summary.get("sub_communities", []) or []
 
@@ -1448,13 +1535,15 @@ def _build_fast_structured_answer(
     # filter. `filter_evidence_projects` contains the previous candidates
     # so we can explain the result using the PostgreSQL data.
     if structured_summary.get("filter_no_match"):
-        evidence_projects = (
-            structured_summary.get(
-                "filter_evidence_projects",
-                []
-            )
-            or []
+        # Honest empty: never leave stale matched cards when the filter failed.
+        if isinstance(structured_summary, dict):
+            structured_summary["projects"] = []
+        projects = []
+        evidence_projects = ground_project_rows(
+            structured_summary.get("filter_evidence_projects", []) or []
         )
+        if isinstance(structured_summary, dict):
+            structured_summary["filter_evidence_projects"] = evidence_projects
 
         bedroom_match = re.search(
             r"\b(\d+)\s*(?:-?\s*)bed(?:room)?s?\b",
@@ -1494,6 +1583,10 @@ def _build_fast_structured_answer(
                 "Share the area, budget, or bedroom count again and I’ll search fresh "
                 "instead of filtering the old list."
             )
+        return (
+            "None of the projects I have matched that filter. "
+            "Share the area, budget, or bedroom count again and I’ll search fresh."
+        )
 
     if projects:
         lines = []
@@ -1519,11 +1612,20 @@ def _build_fast_structured_answer(
             for term in ("price", "prices", "cost", "budget", "budgets")
         )
 
-        if browsing:
-            # "I want 1-bedroom apartments" names a bedroom FILTER; it is not a question
-            # about the bedroom field, so show the normal list (price, bedrooms, handover).
+        # Browse/filter asks ("show only ready 1-bedroom…") must explain the match
+        # with price/ready facts — never collapse to a bedrooms-only stub list.
+        if browsing or _is_project_browse_question(question):
             wants_bedrooms = wants_handover = wants_developer = False
             wants_status = wants_price = False
+        else:
+            try:
+                from app.retrieval.hybrid.question_text import is_group_attribute_question
+
+                if not is_group_attribute_question(question):
+                    wants_bedrooms = wants_handover = wants_developer = False
+                    wants_status = wants_price = False
+            except Exception:
+                pass
 
         # Field-specific follow-up answers.
         if len(projects) == 1:
@@ -1632,11 +1734,16 @@ def _build_fast_structured_answer(
                 )
             return "\n".join(lines)
 
-        # Default browse answer.
+        # Default browse answer — explain the ask, then grounded project facts.
         intro = _browse_intro(
             projects,
             ambiguous_label=structured_summary.get("ambiguous_label"),
         )
+        filter_intro = _filter_aware_browse_intro(
+            question, projects, structured_summary
+        )
+        if filter_intro:
+            intro = filter_intro
         project_total = structured_summary.get("project_total")
         if isinstance(project_total, int) and project_total > len(projects):
             where = ""
@@ -1653,10 +1760,56 @@ def _build_fast_structured_answer(
                 else:
                     bed_bit = f" that include {beds[0]}-bedroom units"
             more = " more" if wants_more_results(question) else ""
-            intro = (
-                f"I found {project_total} projects{where}{bed_bit}. "
-                f"Here are {len(projects)}{more} of them:"
+            ready_bit = (
+                " ready"
+                if re.search(r"\b(?:ready(?:\s+only)?|only\s+ready)\b", q, re.I)
+                else ""
             )
+            from app.answers.explain_contract import build_browse_narrative
+
+            named_for_narrative = str(structured_summary.get("catalog_place") or "").strip() or None
+            intro = build_browse_narrative(
+                place=named_for_narrative,
+                total=project_total,
+                shown=len(projects),
+                beds=beds[0] if beds else None,
+                ready_only=bool(ready_bit),
+                more=bool(more),
+            )
+            # Keep the classic count sentence for downstream asserts / scanners.
+            intro = (
+                f"I found {project_total}{ready_bit} projects{where}{bed_bit}. "
+                f"Here are {len(projects)}{more} of them "
+                "(prices shown are recorded recent sales when available):\n\n"
+                + "\n\n".join(intro.split("\n\n")[1:])
+            )
+            if filter_intro and project_total <= len(projects):
+                intro = filter_intro
+        # Explain-first for every browse: restate the ask before the facts.
+        try:
+            from app.answers.explain_contract import (
+                build_motive,
+                build_understood,
+                prepend_understood,
+                slots_from_question,
+            )
+
+            slots = slots_from_question(question)
+            named = str(structured_summary.get("catalog_place") or "").strip() or slots.get("place")
+            if named or slots.get("beds") is not None or slots.get("budget_aed") is not None or slots.get("ready_only"):
+                intro = prepend_understood(
+                    f"{build_motive('browse')}\n\n{intro}",
+                    build_understood(
+                        place=named,
+                        beds=slots.get("beds"),
+                        budget_aed=slots.get("budget_aed"),
+                        ready_only=bool(slots.get("ready_only")),
+                        intent="browse",
+                        under_budget=bool(slots.get("under_budget", True)),
+                    ),
+                )
+        except Exception:
+            pass
         lines = [intro, ""]
 
         for project in projects:

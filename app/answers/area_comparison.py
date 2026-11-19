@@ -76,8 +76,9 @@ def _known_areas() -> dict[str, str]:
     """lower-case name -> proper name, for every community that has projects or rentals."""
     global _names
     if _names is None:
-        rows = fetch("select btrim(label) as n from propai_places where level in ('area', 'master') union "
-                     "select btrim(community) from listings where community is not null")
+        rows = fetch(
+            "select btrim(label) as n from propai_places where level in ('area', 'master')"
+        )
         _names = {r["n"].lower(): r["n"] for r in rows if r.get("n")}
     return _names
 
