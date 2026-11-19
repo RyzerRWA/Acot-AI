@@ -54,23 +54,28 @@ def retrieve_catalog(client, request: dict) -> dict:
     }
 
     if request.get("communities"):
-        where, params = _place_clause("city, name", place)
-        total = _query(
-            client,
-            f"select count(*) as total from public.communities where {where}",
-            params,
-        )
-        rows = _query(
-            client,
-            f"""
-            select {_COMMUNITY_COLUMNS}
-            from public.communities
-            where {where}
-            order by name
-            limit {_LIMIT}
-            """,
-            params,
-        )
+        # Prop-AI places only — never the retired `communities` table.
+        where, params = _place_clause("label", place)
+        try:
+            total = _query(
+                client,
+                f"select count(*) as total from public.propai_places "
+                f"where level in ('area', 'master') and {where}",
+                params,
+            )
+            rows = _query(
+                client,
+                f"""
+                select label as name, level, sales_count
+                from public.propai_places
+                where level in ('area', 'master') and {where}
+                order by sales_count desc nulls last, label
+                limit {_LIMIT}
+                """,
+                params,
+            )
+        except Exception:
+            total, rows = [], []
         result["communities"] = rows
         result["community_total"] = int(total[0]["total"]) if total else 0
 
@@ -87,29 +92,9 @@ def retrieve_catalog(client, request: dict) -> dict:
         result["project_total"] = int(total or len(rows))
 
     if request.get("listings"):
-        where, params = _place_clause("community, location", place)
-        bed_sql = ""
-        if bedrooms is not None:
-            bed_sql = " and beds = %s"
-            params = [*params, int(bedrooms)]
-        total = _query(
-            client,
-            f"select count(*) as total from public.listings where {where}{bed_sql}",
-            params,
-        )
-        rows = _query(
-            client,
-            f"""
-            select {_LISTING_COLUMNS}
-            from public.listings
-            where {where}{bed_sql}
-            order by price_aed asc nulls last
-            limit {_LIMIT}
-            """,
-            params,
-        )
-        result["listings"] = rows
-        result["listing_total"] = int(total[0]["total"]) if total else 0
+        # Retired: old Bayut `listings` table is not queried.
+        result["listings"] = []
+        result["listing_total"] = 0
         result["listing_query"] = True
 
     if not result["communities"] and not result["projects"] and not result["listings"]:

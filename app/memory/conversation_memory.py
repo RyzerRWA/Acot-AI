@@ -102,6 +102,46 @@ class ConversationMemory:
         self.last_standalone_question: Optional[str] = None
         self.pending_place_choice: Optional[str] = None
 
+        # Active task slots (place, beds, action…) — not sentence patterns.
+        from app.memory.dialogue_state import empty_dialogue_state
+
+        self.dialogue_state: Dict[str, Any] = empty_dialogue_state()
+        # Kept in sync for older sales follow-up readers during Phase 1.
+        self.sale_query: Optional[Dict[str, Any]] = None
+        self.transaction_names: Optional[str] = None
+        self.transaction_offset: int = 0
+        # Project names from the last sales_list answer ("developer of these").
+        self.last_sale_projects: List[Dict[str, Any]] = []
+
+    # =============================================================
+    # DIALOGUE STATE
+    # =============================================================
+
+    def get_dialogue_state(self) -> Dict[str, Any]:
+        from app.memory.dialogue_state import normalize_dialogue_state
+
+        return normalize_dialogue_state(self.dialogue_state)
+
+    def set_dialogue_state(self, state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        from app.memory.dialogue_state import (
+            normalize_dialogue_state,
+            sale_filters_from_state,
+        )
+
+        self.dialogue_state = normalize_dialogue_state(state)
+        self.sale_query = sale_filters_from_state(self.dialogue_state)
+        return dict(self.dialogue_state)
+
+    def patch_dialogue_state(self, updates: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        from app.memory.dialogue_state import (
+            patch_dialogue_state,
+            sale_filters_from_state,
+        )
+
+        self.dialogue_state = patch_dialogue_state(self.dialogue_state, updates)
+        self.sale_query = sale_filters_from_state(self.dialogue_state)
+        return dict(self.dialogue_state)
+
     # =============================================================
     # BASIC HELPERS
     # =============================================================
@@ -175,6 +215,7 @@ class ConversationMemory:
             "recent_turns": list(self.turns[-self.MAX_TURNS :]),
             "last_user_question": self.last_user_question,
             "last_standalone_question": self.last_standalone_question,
+            "dialogue_state": self.get_dialogue_state(),
         }
 
     # =============================================================
@@ -1808,6 +1849,13 @@ Rules:
         self.last_user_question = None
         self.last_standalone_question = None
         self.pending_place_choice = None
+        from app.memory.dialogue_state import empty_dialogue_state
+
+        self.dialogue_state = empty_dialogue_state()
+        self.sale_query = None
+        self.transaction_names = None
+        self.transaction_offset = 0
+        self.last_sale_projects = []
 
     # =============================================================
     # DEBUG
@@ -1829,5 +1877,6 @@ Rules:
             "last_standalone_question": (
                 self.last_standalone_question
             ),
+            "dialogue_state": self.get_dialogue_state(),
             "turn_count": len(self.turns),
         }

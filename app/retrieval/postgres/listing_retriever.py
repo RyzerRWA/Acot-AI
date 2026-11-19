@@ -1,8 +1,7 @@
-"""Search public.listings for rental questions.
+"""Retired Bayut listing search.
 
-Structured filters (community, bedrooms, price, type) use SQL.
-Vague wording also uses match_listings, the same cosine search as the
-other tables. Results are individual rental listings, not projects.
+The old `public.listings` table is no longer queried at runtime.
+All search methods return empty results; use Prop-AI instead.
 """
 
 import re
@@ -29,73 +28,22 @@ class ListingRetriever:
         self.client = client or PostgresClient()
 
     def search(self, question: str, filters: dict = None, limit: int = 10) -> dict:
-        filters = filters or {}
-        community = self._match_community(question)
-        constraints = self._constraints(filters)
-        limit = max(1, int(limit))
-
-        vector_rows = self._vector_search(
-            question,
-            community,
-            constraints,
-            limit,
-        )
-        sql_rows = []
-        total = None
-        if community or constraints["active"]:
-            sql_rows, total = self._sql_search(
-                community,
-                constraints,
-                limit,
-            )
-
-        merged = []
-        seen = set()
-        for row in vector_rows + sql_rows:
-            key = str(row.get("listing_id") or "")
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            merged.append(row)
-            if len(merged) >= limit:
-                break
-
-        if total is None:
-            total = len(merged)
-
+        """Retired: old Bayut `listings` table is not queried."""
+        _ = question, filters, limit
         return {
-            "listings": merged,
-            "listing_total": total,
-            "subject": community or "that request",
+            "listings": [],
+            "listing_total": 0,
+            "subject": "that request",
         }
 
     def _match_community(self, question: str) -> str:
-        text = (question or "").lower()
-        best = ""
-        for name in self._communities():
-            needle = re.sub(r"\s*\([^)]*\)", "", name or "")
-            needle = re.sub(r"\s+", " ", needle).strip().lower()
-            if len(needle) < 4:
-                continue
-            if needle in text and len(needle) > len(best):
-                best = needle
-        return best
+        _ = question
+        return ""
 
     def _communities(self):
+        # Do not scan public.listings — table is retired.
         if ListingRetriever._shared_communities is None:
-            with self.client.pool.connection() as connection:
-                with connection.cursor() as cursor:
-                    cursor.execute(
-                        """
-                        select distinct community
-                        from public.listings
-                        where community is not null
-                          and btrim(community) <> ''
-                        """
-                    )
-                    ListingRetriever._shared_communities = [
-                        row["community"] for row in cursor.fetchall()
-                    ]
+            ListingRetriever._shared_communities = []
         return ListingRetriever._shared_communities
 
     @staticmethod
@@ -126,62 +74,12 @@ class ListingRetriever:
         return constraints
 
     def _sql_search(self, community: str, constraints: dict, limit: int):
-        clauses = ["true"]
-        params = []
-
-        if community:
-            clauses.append("community ilike %s")
-            params.append(f"%{community}%")
-
-        self._append_filter_clauses(clauses, params, constraints)
-        where = " and ".join(clauses)
-
-        count_sql = f"select count(*) as total from public.listings where {where}"
-        row_sql = f"""
-            select {_LISTING_COLUMNS}
-            from public.listings
-            where {where}
-            order by price_aed asc nulls last
-            limit %s
-        """
-
-        with self.client.pool.connection() as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(count_sql, params)
-                total = int(cursor.fetchone()["total"])
-                cursor.execute(row_sql, [*params, limit])
-                rows = [self._public_row(row) for row in cursor.fetchall()]
-        return rows, total
+        _ = community, constraints, limit
+        return [], 0
 
     def _vector_search(self, question, community, constraints, limit):
-        if not question:
-            return []
-
-        if ListingRetriever._shared_model is None:
-            from app.rag.embeddings.embedding_model import EmbeddingModel
-            ListingRetriever._shared_model = EmbeddingModel()
-
-        embedding = ListingRetriever._shared_model.embed_query(question)
-        values = embedding.tolist() if hasattr(embedding, "tolist") else list(embedding)
-        response = self.client.rpc(
-            "match_listings",
-            {
-                "query_embedding": values,
-                "match_threshold": 0.35,
-                "match_count": max(limit * 3, 24),
-            },
-        ).execute()
-
-        matched = []
-        for row in response.data or []:
-            if not isinstance(row, dict):
-                continue
-            if not self._row_matches(row, community, constraints):
-                continue
-            matched.append(self._public_row(row))
-            if len(matched) >= limit:
-                break
-        return matched
+        _ = question, community, constraints, limit
+        return []
 
     @staticmethod
     def _append_filter_clauses(clauses, params, constraints):

@@ -16,7 +16,9 @@ from run import (
     _broker_place,
     _broker_turn,
     _classify_small_talk,
+    _data_freshness_turn,
     _detect_response_type,
+    _developer_rank_turn,
     _followup_questions,
     _is_broker_question,
     _is_fast_structured_question,
@@ -25,11 +27,15 @@ from run import (
     _listing_question,
     _compare_shown_turn,
     _place_choice_turn,
+    _project_count_turn,
     _project_is_full,
     _shortlist_recommend_turn,
     _shown_project_followup,
+    _sql_project_browse_turn,
+    _TRANSACTION,
     _transaction_subject,
     _transaction_turn,
+    _cheapest_sale_turn,
     _small_talk_answer,
     build_frontend_response,
 )
@@ -130,7 +136,11 @@ def test_browse_uses_fast_project_list():
     )
 
     answer = _build_fast_structured_answer(question, summary)
-    assert answer.startswith("I found 5")
+    # Browse lists lead with the count — no duplicated Understood block.
+    assert not answer.startswith("Understood:")
+    assert "Understood:" not in answer
+    assert "I found 5" in answer
+    assert "Jumeirah Village Circle" in answer
     assert "AED 483,277" in answer
     assert "AED 840,000" in answer
     assert "Here are 1" not in answer
@@ -163,6 +173,7 @@ def test_propai_browse_says_recent_sale_not_starting_price():
             "bedroom_min": 0,
             "bedroom_max": 2,
             "handover_time": "2030-05-01",
+            "last_sold_on": "2026-10-01",
         }
     ])
     summary["project_total"] = 128
@@ -171,7 +182,96 @@ def test_propai_browse_says_recent_sale_not_starting_price():
     assert "I found 128 projects in Dubai Land Residence Complex" in answer
     assert "Recent sale AED 750,146" in answer
     assert "Starting price" not in answer
+    assert "Handover May 2030" in answer or "2030" in answer
     assert "Let me know if you need more details on any of these projects!" in answer
+
+
+def test_budget_miss_browse_shows_closest_above():
+    """Marina under 700k with no hits must show closest above-budget sales, not a dead end."""
+    question = "Show only ready 1-bedroom apartments in Dubai Marina under AED 700,000"
+    summary = _summary([
+        {
+            "name": "Pier 8",
+            "developer_name": "EMAAR",
+            "price": 741424,
+            "price_kind": "recent_sale",
+            "source": "propai",
+            "community": "Dubai Marina",
+            "bedroom_min": 1,
+            "bedroom_max": 1,
+            "handover_time": "2026-03-08",
+            "last_sold_on": "2026-03-11",
+        }
+    ])
+    summary["project_total"] = 1
+    summary["catalog_place"] = "Dubai Marina"
+    summary["budget_miss"] = True
+    summary["asked_max_price"] = 700_000
+    summary["lowest_price"] = 741_424
+    answer = _build_fast_structured_answer(question, summary)
+    assert "Understood:" not in answer
+    assert "don't have" in answer.lower() or "do not have" in answer.lower()
+    assert "700,000" in answer
+    assert "741,424" in answer
+    assert "Pier 8" in answer
+    assert "related options" in answer.lower()
+    assert "Try a higher budget" not in answer
+
+
+def test_sql_browse_marina_budget_miss_and_jvc_hit():
+    """Live path: Marina under 700k → related above; JVC under 700k → exact hits."""
+    from run import _sql_project_browse_turn
+
+    marina = _sql_project_browse_turn(
+        "Show only ready 1-bedroom apartments in dubai marina under AED 700,000",
+        None,
+    )
+    assert marina is not None
+    msum = marina["structured_summary"]
+    assert msum.get("budget_miss") is True
+    assert len(msum.get("projects") or []) >= 1
+    assert "related options" in marina["fast_answer"].lower()
+    assert "Try a higher budget" not in marina["fast_answer"]
+    assert "Pier 8" in marina["fast_answer"] or "741" in marina["fast_answer"]
+
+    jvc = _sql_project_browse_turn(
+        "Show only ready 1-bedroom apartments in JVC under AED 700,000",
+        None,
+    )
+    assert jvc is not None
+    jsum = jvc["structured_summary"]
+    assert not jsum.get("budget_miss")
+    assert len(jsum.get("projects") or []) >= 1
+    assert "under AED 700,000" in jvc["fast_answer"]
+    assert "don't have" not in jvc["fast_answer"].lower()
+
+
+def test_ready_browse_omits_ancient_handover_years():
+    """Ready stock must not lead with decade-old handover years."""
+    question = "Show only ready 1-bedroom apartments in JVC under AED 700,000"
+    summary = _summary([
+        {
+            "name": "Hanover Square",
+            "developer_name": "ACW HOLDING LTD.",
+            "price": 635000,
+            "price_kind": "recent_sale",
+            "source": "propai",
+            "community": "Jumeirah Village Circle",
+            "bedroom_min": 1,
+            "bedroom_max": 1,
+            "handover_time": "2015-12-01",
+            "last_sold_on": "2026-10-15",
+        }
+    ])
+    summary["project_total"] = 1
+    summary["catalog_place"] = "Jumeirah Village Circle"
+    answer = _build_fast_structured_answer(question, summary)
+    assert "Understood:" not in answer
+    assert answer.startswith("Here are 1 ready 1-bedroom option")
+    assert "Recent sale AED 635,000" in answer
+    assert "2026-10-15" in answer
+    assert "Handover December 2015" not in answer
+    assert "Handover November 2010" not in answer
 
 
 def test_browse_more_says_here_are_more():
@@ -184,7 +284,7 @@ def test_browse_more_says_here_are_more():
     summary["catalog_place"] = "Dubai Marina"
     answer = _build_fast_structured_answer(question, summary)
     assert "I found 133 projects in Dubai Marina." in answer
-    assert "Here are 5 more of them:" in answer
+    assert "Here are 5 more of them" in answer
 
 
 def test_investment_answer_with_projects_shows_cards():
@@ -231,7 +331,8 @@ def test_price_follow_up_is_written_information():
 
     assert plan.intent == "information"
     assert plan.needs_documents is False
-    assert not _is_fast_structured_question(
+    # Field asks with rows already retrieved use the grounded template.
+    assert _is_fast_structured_question(
         question,
         plan.intent,
         summary,
@@ -261,7 +362,7 @@ def test_handover_follow_up_stays_on_the_current_projects():
     plan = _planner()._rule_plan(rewritten)
     summary = _summary()
     assert plan.intent == "information"
-    assert not _is_fast_structured_question(
+    assert _is_fast_structured_question(
         rewritten,
         plan.intent,
         summary,
@@ -308,12 +409,12 @@ def test_yield_community_question_keeps_projects():
     assert "projects" in scope
 
 
-def test_bedroom_follow_up_skips_fast_path():
+def test_bedroom_follow_up_uses_fast_path_when_rows_exist():
     question = "Which of these have 2-bedroom options?"
     plan = _planner()._rule_plan(question)
 
     assert plan.intent == "information"
-    assert not _is_fast_structured_question(
+    assert _is_fast_structured_question(
         question,
         plan.intent,
         _summary(),
@@ -321,7 +422,7 @@ def test_bedroom_follow_up_skips_fast_path():
     )
 
 
-def test_comparison_skips_fast_path():
+def test_comparison_uses_fast_path_when_rows_exist():
     question = (
         "Compare the first and second ones based on price, "
         "bedroom range, and handover date."
@@ -330,7 +431,7 @@ def test_comparison_skips_fast_path():
     plan = _planner()._rule_plan(question)
 
     assert plan.intent == "comparison"
-    assert not _is_fast_structured_question(
+    assert _is_fast_structured_question(
         question,
         plan.intent,
         summary,
@@ -549,7 +650,57 @@ def test_sql_project_browse_turn_returns_fast_answer():
     assert out is not None
     assert out["use_fast"] is True
     assert "I found" in (out["fast_answer"] or "")
+    assert "Acot Recommend" not in (out["fast_answer"] or "")
     assert out["structured_summary"]["projects"]
+
+
+def test_phase3_sql_browse_defers_buy_to_recommend():
+    from run import _sql_project_browse_turn
+
+    assert _sql_project_browse_turn(
+        "I want a 3-bedroom apartment in JVC for a family of 4 to buy around AED 1.8M.",
+        None,
+    ) is None
+    assert _sql_project_browse_turn(
+        "Show me the best apartments in Dubai Marina",
+        None,
+    ) is None
+
+
+def test_phase3_recommend_turn_has_winner_and_why(monkeypatch):
+    from app.answers import intent_turns
+
+    rows = [
+        {
+            "name": "Alpha Towers",
+            "community": "Jumeirah Village Circle",
+            "price": 1_750_000,
+            "bedrooms": "3",
+            "size_sqft": 1400,
+            "sales_count": 12,
+        },
+        {
+            "name": "Beta Residences",
+            "community": "Jumeirah Village Circle",
+            "price": 1_820_000,
+            "bedrooms": "3",
+            "size_sqft": 1500,
+            "sales_count": 8,
+        },
+    ]
+    monkeypatch.setattr(
+        intent_turns,
+        "_recommend_pool",
+        lambda filters, skip_names=None: (rows, []),
+    )
+    turn = intent_turns.recommend_data_turn(
+        "I want a 3-bedroom in JVC for a family of 4 to buy around AED 1.8M."
+    )
+    assert turn is not None
+    text = turn["fast_answer"]
+    assert "**Acot Recommend:**" in text
+    assert "**Why" in text
+    assert turn.get("structured_summary", {}).get("projects")
 
 
 def test_greeting_uses_the_account_name():
@@ -807,7 +958,19 @@ def test_transaction_followup_on_listings_says_there_are_none(monkeypatch):
     assert "**Mayfair Tower**" in text
     assert "**• Recent Transactions:**" in text
     assert "• **2026-10-19**: AED 1,000,000, 1 bedroom, 807 sqft" in text
+    # Newest project activity first (Tower 2026-10-19 beats Residency 2026-09-03).
     assert text.index("Mayfair Tower") < text.index("Mayfair Residency")
+    # Even if card order listed Residency first, freshest sale still leads.
+    fresher_first = _format_transactions(
+        ["Mayfair Residency", "Mayfair Tower"],
+        {
+            "sales": [
+                {"project": "Mayfair Residency", "date": "2026-09-03", "price": 400000, "bedrooms": 1, "size_sqft": 298},
+                {"project": "Mayfair Tower", "date": "2026-11-18", "price": 1000000, "bedrooms": 1, "size_sqft": 807},
+            ],
+        },
+    )
+    assert fresher_first.index("Mayfair Tower") < fresher_first.index("Mayfair Residency")
 
 
 def test_shortlist_recommend_uses_projects_on_screen():
@@ -1419,6 +1582,27 @@ def test_public_broker_omits_contact_fields():
     assert set(shown) == set(_BROKER_PUBLIC)
 
 
+def test_broker_turn_dubai_with_budget_still_lists_agents(monkeypatch):
+    """'Top agents for Dubai starting above AED 5M' must not be treated as outside Dubai."""
+    called = []
+
+    def fake_list(**kwargs):
+        called.append(kwargs)
+        return _broker_rows()[: kwargs.get("limit", 8)]
+
+    monkeypatch.setattr("app.retrieval.propai_catalog.list_brokers", fake_list)
+    question = "Tell me the top agents for Dubai starting above AED 5 million"
+    assert _broker_place(question, None) in {"Dubai", "dubai"} or str(
+        _broker_place(question, None)
+    ).lower() == "dubai"
+    turn = _broker_turn(question, None)
+    assert turn is not None
+    assert turn["structured_summary"]["brokers"]
+    assert "only show licensed agents in dubai" not in turn["fast_answer"].lower()
+    assert called and called[0].get("band") == "top"
+    assert str(called[0].get("place") or "").lower() in {"dubai", ""}
+
+
 def test_broker_turn_lists_top_brokers(monkeypatch):
     rows = _broker_rows()
     monkeypatch.setattr(
@@ -1772,7 +1956,8 @@ def test_broker_followup_uses_the_community_on_screen(monkeypatch):
     assert "broker" not in turn["fast_answer"].lower()
     assert "Here are licensed agents for Jumeirah Village Circle." in turn["fast_answer"]
     assert captured.get("place") == "Jumeirah Village Circle"
-    assert captured.get("band") == "mid"
+    # An explicit "top brokers" ask gets the top (Five Star) band.
+    assert captured.get("band") == "top"
     assert memory.active_candidates[0]["name"] == "Serenz"
     assert turn["structured_summary"]["projects"] == []
     text = _format_brokers(_broker_rows(), label="Jumeirah Village Circle")
@@ -1967,6 +2152,7 @@ def test_tools_for_keeps_search_brokers_on_broker_questions():
     assert agents == {"search_brokers", "update_profile"}
     rent = {tool["function"]["name"] for tool in tools_for("apartments for rent in marina")}
     assert "search_brokers" not in rent
+    # Rent asks use Prop-AI rent tools (propai_rents), not project-only tools.
     assert "search_listings" in rent
 
 
@@ -1991,8 +2177,136 @@ def test_tools_for_open_buy_does_not_send_market_stats_stack():
     assert "area_sales" in buy
 
 
+def test_recent_sales_wording_is_a_transaction_ask():
+    assert _TRANSACTION.search("Show me recent sales in Business Bay")
+    assert _TRANSACTION.search("Show the last 5 sales of 1-bedroom apartments in JVC")
+    assert _TRANSACTION.search("How many 1-bedroom apartments in JVC were sold in November 2026?")
+
+
+def test_last_5_sales_uses_limit_five(monkeypatch):
+    """Understood/sales path must honor 'last 5', not hardcode 8."""
+    import app.retrieval.propai_catalog as catalog
+
+    seen = {}
+
+    def fake_latest_sales(**kwargs):
+        seen.update(kwargs)
+        return {
+            "count": 1,
+            "sales": [{
+                "project": "Luma Park Views",
+                "date": "2026-11-03",
+                "price": 1_319_424,
+                "bedrooms": 1,
+                "size_sqft": 880,
+                "property_type": "Unit",
+            }],
+        }
+
+    monkeypatch.setattr(catalog, "latest_sales", fake_latest_sales)
+    monkeypatch.setattr(
+        catalog, "resolve_dubai_place", lambda place: "Jumeirah Village Circle"
+    )
+    monkeypatch.setattr(
+        catalog,
+        "place_named",
+        lambda text: "Jumeirah Village Circle" if "jvc" in (text or "").lower() else None,
+    )
+
+    class _Memory:
+        dialogue_state = {}
+        sale_query = None
+        transaction_names = None
+        transaction_offset = 0
+        active_candidates = []
+
+        def get_dialogue_state(self):
+            return self.dialogue_state
+
+        def set_dialogue_state(self, state):
+            self.dialogue_state = state
+            return state
+
+        def patch_dialogue_state(self, updates):
+            from app.memory.dialogue_state import patch_dialogue_state
+
+            self.dialogue_state = patch_dialogue_state(self.dialogue_state, updates)
+            return self.dialogue_state
+
+    memory = _Memory()
+    out = _transaction_turn(
+        "Show the last 5 sales of 1-bedroom apartments in JVC",
+        memory,
+    )
+    assert out is not None
+    assert seen.get("limit") == 5
+    assert seen.get("bedrooms") == 1
+    assert memory.dialogue_state.get("limit") == 5
+    assert "last 5" in out["fast_answer"].lower()
+
+
+def test_sales_followup_after_agents_is_not_sticky_broker():
+    class _Memory:
+        last_user_question = "Who are the top agents in Business Bay?"
+        last_standalone_question = "Who are the top agents in Business Bay?"
+        turns = [{"user_question": "Who are the top agents in Business Bay?"}]
+        active_candidates = []
+
+    q = "Show me recent sales in Business Bay"
+    assert _is_broker_question(q, _Memory()) is False
+    assert _sql_project_browse_turn(q, _Memory()) is None
+
+
+def test_data_freshness_answers_today_and_max_sale_date(monkeypatch):
+    from datetime import date
+    import app.retrieval.propai_catalog as catalog
+
+    monkeypatch.setattr(
+        catalog,
+        "fetch",
+        lambda sql, params=None: [{"latest": date(2026, 11, 3)}],
+    )
+    out = _data_freshness_turn(
+        "What is today's date, and what is the latest sale date in your data?"
+    )
+    assert out is not None
+    assert out["use_fast"] is True
+    assert out.get("documents") == []
+    assert "Today is" in out["fast_answer"]
+    assert "3 Nov 2026" in out["fast_answer"] or "2026-11-03" in out["fast_answer"]
+    assert "invent" in out["fast_answer"].lower()
+
+
+def test_data_freshness_paraphrases_about_recent_sales_data(monkeypatch):
+    """Spoken/meta freshness asks must not fall through to sticky recommend."""
+    from datetime import date
+    import app.retrieval.propai_catalog as catalog
+
+    monkeypatch.setattr(
+        catalog,
+        "fetch",
+        lambda sql, params=None: [{"latest": date(2026, 11, 18)}],
+    )
+    for question in (
+        "What is the recent, uh, data we have for this sales? Sales.",
+        "what is themost recent data you have in the dubai sales data ?",
+        "How recent is your sales data?",
+    ):
+        out = _data_freshness_turn(question)
+        assert out is not None, question
+        assert out["use_fast"] is True
+        assert "documents" in out
+        assert "18 Nov 2026" in out["fast_answer"] or "2026-11-18" in out["fast_answer"]
+
+
+def test_recent_sales_listing_is_not_data_freshness():
+    """'Show me recent sales' must stay on the sales-list path, not freshness."""
+    assert _data_freshness_turn("Show me recent sales in Business Bay") is None
+    assert _data_freshness_turn("Recent transactions for Hanover Square") is None
+
+
 def test_transactions_for_a_named_place_ignore_the_projects_on_screen(monkeypatch):
-    """'Recent transactions in Dubai Marina' with JVC projects on screen must not answer for JVC."""
+    """'Recent sales in Dubai Marina' with JVC on screen must not use JVC projects."""
     import app.retrieval.propai_catalog as catalog
 
     class _Memory:
@@ -2000,11 +2314,10 @@ def test_transactions_for_a_named_place_ignore_the_projects_on_screen(monkeypatc
             {"name": "HANOVER SQUARE", "entity_type": "project", "community": "Jumeirah Village Circle"},
         ]
 
-    marina = [{"name": "Marina Diamond", "community": "Dubai Marina"}]
     monkeypatch.setattr(catalog, "place_named", lambda text: "Dubai Marina" if "marina" in text.lower() else None)
-    monkeypatch.setattr(catalog, "agent_projects", lambda filters, limit=8: (marina, 1))
 
-    assert _transaction_subject("Show me the recent transactions in the dubai marina", _Memory()) == marina
+    # Named place → None so _transaction_turn uses latest_sales(place=Marina).
+    assert _transaction_subject("Show me the recent transactions in the dubai marina", _Memory()) is None
     # No place named: the projects on screen, as before.
     on_screen = _transaction_subject("Show me the recent transactions", _Memory())
     assert on_screen and on_screen[0]["name"] == "HANOVER SQUARE"
@@ -2013,21 +2326,117 @@ def test_transactions_for_a_named_place_ignore_the_projects_on_screen(monkeypatc
     assert named and named[0]["name"] == "HANOVER SQUARE"
 
 
+def test_transaction_details_after_recommend_uses_on_screen_projects(monkeypatch):
+    """After best-in-JVC cards, transaction details must not jump to random JVC sales."""
+    import asyncio
+
+    import app.retrieval.propai_catalog as catalog
+    from app.memory.conversation_memory import ConversationMemory
+
+    calls = {"recent": [], "latest": []}
+
+    def fake_recent(names, per_project=5, offset=0):
+        calls["recent"].append(list(names or []))
+        return {
+            "sales": [
+                {
+                    "project": "Hanover Square",
+                    "date": "2026-10-15",
+                    "price": 430_000,
+                    "bedrooms": 0,
+                    "size_sqft": 400,
+                },
+                {
+                    "project": "The Square",
+                    "date": "2026-10-10",
+                    "price": 555_000,
+                    "bedrooms": 1,
+                    "size_sqft": 650,
+                },
+            ]
+        }
+
+    def fake_latest(**kwargs):
+        calls["latest"].append(kwargs)
+        return {
+            "sales": [
+                {
+                    "project": "SQUAREX ONE",
+                    "date": "2026-11-03",
+                    "price": 1_291_709,
+                    "bedrooms": 1,
+                    "size_sqft": 764,
+                }
+            ]
+        }
+
+    monkeypatch.setattr(catalog, "recent_sales", fake_recent)
+    monkeypatch.setattr(catalog, "latest_sales", fake_latest)
+
+    memory = ConversationMemory(llm_client=None)
+    memory.set_dialogue_state({
+        "action": "recommend",
+        "goal": "invest",
+        "place": "Jumeirah Village Circle",
+        "source_question": "i am looking best projects in jvc",
+    })
+    memory.active_candidates = [
+        {
+            "name": "Hanover Square",
+            "entity_type": "project",
+            "community": "Jumeirah Village Circle",
+        },
+        {
+            "name": "Q Gardens Lofts 2",
+            "entity_type": "project",
+            "community": "Jumeirah Village Circle",
+        },
+        {
+            "name": "The Square",
+            "entity_type": "project",
+            "community": "Jumeirah Village Circle",
+        },
+    ]
+
+    out = asyncio.run(
+        __import__("run")._understood_turn(
+            "Show me the recent transaction details",
+            memory,
+            {},
+        )
+    )
+    assert out is not None
+    answer = out["fast_answer"]
+    assert "Hanover Square" in answer
+    assert "The Square" in answer
+    assert "SQUAREX ONE" not in answer
+    assert calls["recent"], "expected recent_sales for on-screen projects"
+    assert not calls["latest"], "must not fall back to area-wide latest_sales"
+
+
 def test_full_community_list_is_answered_from_the_data(monkeypatch):
     """'Full list of communities' gets every community (not a top 10), even with a typo."""
     import app.database.postgres as postgres
     from run import _community_list_turn
 
     def fake_fetch(sql, *args):
-        if "from listings" in sql:
-            return [{"name": "Jumeirah Village Circle (JVC)", "n": 259}, {"name": "Dubai Marina", "n": 122}]
-        return [{"name": "Jumeirah Village Circle", "n": 5}, {"name": "Dubai Creek Harbour", "n": 4}]
+        # Prop-AI only — never the retired listings table.
+        assert "from listings" not in sql
+        if "from propai_places" in sql:
+            return [
+                {"name": "Jumeirah Village Circle", "n": 100},
+                {"name": "Dubai Marina", "n": 80},
+            ]
+        return [
+            {"name": "Jumeirah Village Circle", "n": 5},
+            {"name": "Dubai Creek Harbour", "n": 4},
+        ]
 
     monkeypatch.setattr(postgres, "fetch", fake_fetch)
     answer = _community_list_turn("i need full list of the communintes")["fast_answer"]
     assert answer.startswith("We have 3 communities")
-    assert "| Jumeirah Village Circle (JVC) | 259 | 5 |" in answer
-    assert "| Dubai Creek Harbour | - | 4 |" in answer
+    assert "| Jumeirah Village Circle | 5 | 100 |" in answer
+    assert "| Dubai Creek Harbour | 4 |" in answer
     assert _community_list_turn("what are the communties we have") is not None
     # Questions that narrow the list go to the normal answer.
     assert _community_list_turn("best communities for families") is None
@@ -2047,7 +2456,9 @@ def test_broker_question_with_a_place_is_not_read_as_a_name(monkeypatch):
     turn = _broker_turn("can you find me a broker for the jvc", None)
     assert seen[0].get("name") is None
     assert seen[0].get("place") == "Jumeirah Village Circle"
-    assert turn["fast_answer"] == "Here are licensed agents for Jumeirah Village Circle."
+    assert "Here are licensed agents for Jumeirah Village Circle." in turn["fast_answer"]
+    assert "Understood:" in turn["fast_answer"]
+    assert "licence" in turn["fast_answer"].lower() or "licensed" in turn["fast_answer"].lower()
 
 
 def test_agency_question_goes_to_the_broker_cards():
@@ -2056,3 +2467,612 @@ def test_agency_question_goes_to_the_broker_cards():
 
     assert run._BROKER.search("tell me top agency JVC")
     assert run._BROKER.search("best real estate agencies in Dubai Marina")
+
+
+def test_repair_does_not_rewrite_hanover_into_handover():
+    fixed = repair_typed_question(
+        "What is the cheapest 1-bedroom sale in Hanover Square JVC?"
+    )
+    assert "Hanover Square" in fixed
+    assert "handover Square" not in fixed
+
+
+def test_sale_count_turn_answers_how_many_sold(monkeypatch):
+    import app.retrieval.propai_catalog as catalog
+
+    monkeypatch.setattr(
+        catalog,
+        "count_sales",
+        lambda **kwargs: {"count": 47, "first_sale": None, "last_sale": None},
+    )
+    monkeypatch.setattr(catalog, "resolve_dubai_place", lambda place: "Jumeirah Village Circle")
+    monkeypatch.setattr(catalog, "place_named", lambda text: "Jumeirah Village Circle")
+    memory = type("M", (), {"sale_query": None, "transaction_names": None, "transaction_offset": 0})()
+    out = _transaction_turn(
+        "How many 1-bedroom apartments in JVC were sold in November 2026?",
+        memory,
+    )
+    assert out is not None
+    assert "47" in out["fast_answer"]
+    assert "November 2026" in out["fast_answer"]
+    assert "Recent Transactions" not in out["fast_answer"]
+    assert memory.sale_query["place"] == "Jumeirah Village Circle"
+    assert memory.sale_query["bedrooms"] == 1
+    assert memory.sale_query["month"] == 11
+    assert memory.sale_query["year"] == 2026
+
+
+def test_ok_show_me_after_sale_count_lists_those_sales(monkeypatch):
+    import app.retrieval.propai_catalog as catalog
+
+    class _Memory:
+        sale_query = {
+            "place": "Jumeirah Village Circle",
+            "bedrooms": 1,
+            "year": 2026,
+            "month": 11,
+            "count": 47,
+        }
+        transaction_names = "COUNT|JUMEIRAH VILLAGE CIRCLE|B1|2026-11"
+        transaction_offset = 0
+        last_user_question = (
+            "How many 1-bedroom apartments in JVC were sold in November 2026?"
+        )
+        active_candidates = []
+
+    seen = {}
+
+    def fake_latest_sales(**kwargs):
+        seen.update(kwargs)
+        return {
+            "count": 2,
+            "sales": [
+                {
+                    "project": "HANOVER SQUARE",
+                    "date": "2026-11-03",
+                    "price": 700000,
+                    "bedrooms": 1,
+                    "size_sqft": 660,
+                    "property_type": "Unit",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(catalog, "latest_sales", fake_latest_sales)
+    out = _transaction_turn("ok show me", _Memory())
+    assert out is not None
+    assert seen.get("place") == "Jumeirah Village Circle"
+    assert seen.get("bedrooms") == 1
+    assert seen.get("year") == 2026
+    assert seen.get("month") == 11
+    assert "HANOVER SQUARE" in out["fast_answer"]
+    assert "2026-11-03" in out["fast_answer"]
+
+    yes = _transaction_turn("yes show", _Memory())
+    assert yes is not None
+    assert "HANOVER SQUARE" in yes["fast_answer"]
+
+
+def test_show_me_more_after_sales_pages_from_dialogue_state(monkeypatch):
+    import app.retrieval.propai_catalog as catalog
+    from app.memory.conversation_memory import ConversationMemory
+
+    calls = []
+
+    def fake_latest_sales(**kwargs):
+        calls.append(kwargs)
+        offset = int(kwargs.get("offset") or 0)
+        if offset > 0:
+            return {
+                "count": 1,
+                "sales": [{
+                    "project": "NEXT PROJECT",
+                    "date": "2026-10-01",
+                    "price": 900000,
+                    "bedrooms": 1,
+                    "size_sqft": 700,
+                    "property_type": "Unit",
+                }],
+            }
+        return {
+            "count": 1,
+            "sales": [{
+                "project": "FIRST PROJECT",
+                "date": "2026-11-03",
+                "price": 1000000,
+                "bedrooms": 1,
+                "size_sqft": 800,
+                "property_type": "Unit",
+            }],
+        }
+
+    monkeypatch.setattr(catalog, "latest_sales", fake_latest_sales)
+    memory = ConversationMemory(llm_client=None)
+    first = _transaction_turn("Show me recent sales in Business Bay", memory)
+    assert first is not None
+    assert "FIRST PROJECT" in first["fast_answer"]
+    assert memory.get_dialogue_state()["action"] == "sales_list"
+    assert memory.get_dialogue_state()["place"] == "Business Bay"
+
+    more = _transaction_turn("show me more", memory)
+    assert more is not None
+    assert "NEXT PROJECT" in more["fast_answer"]
+    assert calls[-1].get("offset", 0) > 0
+    assert "I don't have a project called" not in more["fast_answer"]
+
+
+def test_cheapest_sale_turn_uses_named_project(monkeypatch):
+    import app.retrieval.propai_catalog as catalog
+
+    monkeypatch.setattr(
+        catalog,
+        "project_named_in_question",
+        lambda text: "HANOVER SQUARE",
+    )
+    monkeypatch.setattr(
+        catalog,
+        "cheapest_sale",
+        lambda **kwargs: {
+            "project": "HANOVER SQUARE",
+            "date": "2025-12-22",
+            "price": 530000,
+            "bedrooms": 1,
+            "size_sqft": 660,
+            "property_type": "Unit",
+        },
+    )
+    monkeypatch.setattr(
+        catalog,
+        "sale_window_stats",
+        lambda **kwargs: {"count": 42, "low": 530000, "high": 910000, "median": 700000},
+    )
+    out = _transaction_turn(
+        "What is the cheapest 1-bedroom sale in Hanover Square JVC in the last 12 months?",
+        None,
+    )
+    assert out is not None
+    answer = out["fast_answer"]
+    assert "530,000" in answer
+    assert "HANOVER SQUARE" in answer
+    assert out["structured_summary"]["transactions"][0]["price"] == 530000
+    # Explain-first: restates the ask, then gives evidence for the number.
+    assert answer.startswith("Understood:")
+    assert "lowest" in answer.split("\n", 1)[0]
+    assert "lowest of 42 recorded" in answer
+    assert "median AED 700,000" in answer
+    assert "Dubai Land Department" in answer
+    # Never the generic sales list.
+    assert "recent transaction details" not in answer
+
+
+def test_which_one_has_cheapest_transactions_picks_on_screen_winner(monkeypatch):
+    """After a sales dump, compare asks use context — not a transaction synonym bank."""
+    import asyncio
+
+    import app.retrieval.propai_catalog as catalog
+    from app.answers.turn_resolve import offline_resolve_turn
+    from app.memory.conversation_memory import ConversationMemory
+    from app.retrieval.hybrid.question_text import repair_typed_question
+    from run import _cheapest_sale_turn, _sale_stat_kind, _understood_turn
+
+    typed = "which one has chepest transcations"
+    fixed = repair_typed_question(typed)
+    assert "cheapest" in fixed.lower()
+    # Typo repair is vocabulary edit-distance — routing uses dialogue context.
+    memory_probe = ConversationMemory(llm_client=None)
+    memory_probe.set_dialogue_state({
+        "action": "sales_list",
+        "place": "Jumeirah Village Circle",
+        "limit": 5,
+    })
+    # Even without the word "transaction", prior sales + "which one is cheapest" → sales_stat.
+    bare = offline_resolve_turn("which one is cheapest?", memory_probe)
+    assert bare["action"] == "sales_stat"
+    assert bare["stat"] == "cheapest"
+    assert offline_resolve_turn(fixed, memory_probe)["action"] == "sales_stat"
+    assert _sale_stat_kind(fixed) == "cheapest"
+
+    prices = {
+        "SERENZ BY DANUBE": 972400,
+        "ALTA VIEW SKYHOMES": 1108896,
+        "SKY LEVEL 1": 928857,
+        "THE HUDSON": 669000,
+        "SKY HARMONY BY PEACE HOMES": 650000,
+    }
+
+    def fake_cheapest(**kwargs):
+        name = str(kwargs.get("project") or "").strip().upper()
+        price = prices.get(name)
+        if price is None:
+            return None
+        return {
+            "project": kwargs.get("project"),
+            "date": "2026-10-29",
+            "price": price,
+            "bedrooms": 0,
+            "size_sqft": 394,
+            "property_type": "Unit",
+        }
+
+    monkeypatch.setattr(catalog, "cheapest_sale", fake_cheapest)
+    monkeypatch.setattr(catalog, "project_named_in_question", lambda text: None)
+    monkeypatch.setattr(
+        catalog,
+        "sale_window_stats",
+        lambda **kwargs: {"count": 25, "low": 650000, "high": 2915000, "median": 1100000},
+    )
+
+    memory = ConversationMemory(llm_client=None)
+    memory.active_candidates = [
+        {"name": name, "entity_type": "project", "community": "Jumeirah Village Circle"}
+        for name in prices
+    ]
+    memory.set_dialogue_state({
+        "action": "sales_list",
+        "place": "Jumeirah Village Circle",
+        "limit": 5,
+    })
+
+    out = _cheapest_sale_turn(
+        typed,
+        slots={"stat": "cheapest"},
+        conversation_memory=memory,
+    )
+    assert out is not None
+    answer = out["fast_answer"]
+    assert "SKY HARMONY" in answer.upper()
+    assert "650,000" in answer
+    assert "recent transaction details" not in answer.lower()
+    assert "Acot Recommend" in answer
+
+    # Full understood path with typos must not re-dump the sales list.
+    full = asyncio.run(_understood_turn(typed, memory, {}))
+    assert full is not None
+    assert "650,000" in full["fast_answer"]
+    assert "recent transaction details" not in full["fast_answer"].lower()
+
+
+def test_cheapest_question_is_sales_stat_not_sales_list_even_after_sales_list(monkeypatch):
+    """Regression: 'cheapest ... in Hanover Square' returned a JVC sales list."""
+    import asyncio
+
+    import app.retrieval.propai_catalog as catalog
+    from app.answers.followup_resolve import looks_like_state_followup, resolve_followup
+    from app.answers.turn_resolve import offline_resolve_turn
+    from app.memory.conversation_memory import ConversationMemory
+    from run import _dialogue_followup_turn, _understood_turn
+
+    question = (
+        "What is the cheapest 1-bedroom sale in Hanover Square JVC in the last 12 months?"
+    )
+    resolution = offline_resolve_turn(question)
+    assert resolution["action"] == "sales_stat"
+    assert resolution["beds"] == 1
+
+    memory = ConversationMemory(llm_client=None)
+    memory.set_dialogue_state({
+        "action": "sales_list",
+        "place": "Jumeirah Village Circle",
+        "beds": 1,
+        "limit": 5,
+    })
+    # The sticky sales task must not swallow a fresh superlative question.
+    resolved = asyncio.run(
+        resolve_followup(question, memory.get_dialogue_state(), llm_generate=None)
+    )
+    assert resolved is None or resolved["kind"] == "new"
+    assert asyncio.run(_dialogue_followup_turn(question, memory, {})) is None
+
+    monkeypatch.setattr(catalog, "project_named_in_question", lambda text: "HANOVER SQUARE")
+    monkeypatch.setattr(
+        catalog,
+        "cheapest_sale",
+        lambda **kwargs: {
+            "project": "HANOVER SQUARE",
+            "date": "2025-12-22",
+            "price": 530000,
+            "bedrooms": 1,
+            "size_sqft": 660,
+            "property_type": "Unit",
+        },
+    )
+    monkeypatch.setattr(
+        catalog,
+        "sale_window_stats",
+        lambda **kwargs: {"count": 42, "low": 530000, "high": 910000, "median": 700000},
+    )
+    out = asyncio.run(_understood_turn(question, memory, {}))
+    assert out is not None
+    assert "AED 530,000" in out["fast_answer"]
+    assert "recent transaction details" not in out["fast_answer"]
+    assert "BINGHATTI" not in out["fast_answer"]
+
+
+def test_sales_stat_follows_llm_slots_not_phrase_regexes(monkeypatch):
+    """Paraphrase with none of cheapest/lowest/sale: only the LLM slots can route it."""
+    import asyncio
+    import json
+
+    import app.retrieval.propai_catalog as catalog
+    from app.memory.conversation_memory import ConversationMemory
+    from app.answers.turn_resolve import _SALES_STAT_SIGNAL, offline_resolve_turn
+    from run import _sale_stat_kind, _understood_turn
+
+    from app.answers.turn_resolve import resolve_turn
+
+    question = "What's the least I'd have to pay for a one-bed at Hanover Square this past year?"
+    # Offline regex must NOT understand this paraphrase...
+    assert _sale_stat_kind(question) is None
+    assert not _SALES_STAT_SIGNAL.search(question)
+    assert (offline_resolve_turn(question) or {}).get("action") != "sales_stat"
+
+    class _FakeLLM:
+        async def generate(self, prompt):
+            return json.dumps({
+                "action": "sales_stat",
+                "stat": "cheapest",
+                "project": "Hanover Square",
+                "place": None,
+                "beds": 1,
+                "months": 12,
+                "confidence": 0.95,
+            })
+
+    seen = {}
+
+    def fake_cheapest(**kwargs):
+        seen.update(kwargs)
+        return {
+            "project": "HANOVER SQUARE",
+            "date": "2025-12-22",
+            "price": 530000,
+            "bedrooms": 1,
+            "size_sqft": 660,
+            "property_type": "Unit",
+        }
+
+    monkeypatch.setattr(catalog, "project_named_in_question", lambda text: "HANOVER SQUARE")
+    monkeypatch.setattr(catalog, "cheapest_sale", fake_cheapest)
+    monkeypatch.setattr(
+        catalog,
+        "sale_window_stats",
+        lambda **kwargs: {"count": 42, "low": 530000, "high": 910000, "median": 700000},
+    )
+    memory = ConversationMemory(llm_client=_FakeLLM())
+    resolved = asyncio.run(
+        resolve_turn(question, memory, llm_generate=memory.llm_client.generate)
+    )
+    assert resolved["action"] == "sales_stat"
+    assert resolved["source"] == "llm"
+    assert resolved["stat"] == "cheapest"
+    assert resolved["project"] == "Hanover Square"
+
+    out = asyncio.run(_understood_turn(question, memory, {}))
+    assert out is not None
+    assert seen["project"] == "HANOVER SQUARE"
+    assert seen["bedrooms"] == 1
+    assert seen["months"] == 12
+    assert seen["highest"] is False
+    answer = out["fast_answer"]
+    assert answer.startswith("Understood:")
+    assert "AED 530,000" in answer
+    assert "recent transaction details" not in answer
+
+
+def test_conflict_studio_and_villa_forces_split_not_sticky_search(monkeypatch):
+    """LLM wrongly says search+JVC → still split with explain-first, no place invent."""
+    import asyncio
+    import json
+
+    import app.retrieval.propai_catalog as catalog
+    from app.answers.turn_resolve import resolve_turn
+    from app.memory.conversation_memory import ConversationMemory
+    from run import _understood_turn
+
+    question = (
+        "The budget is AED 900,000. I need a 3-bedroom villa and, "
+        "at the same time, only a studio apartment."
+    )
+
+    class _FakeLLM:
+        async def generate(self, prompt):
+            # Deliberately wrong: single search with sticky community.
+            return json.dumps({
+                "action": "search",
+                "place": "Jumeirah Village Circle",
+                "beds": 3,
+                "budget_aed": 900000,
+                "confidence": 0.95,
+            })
+
+    monkeypatch.setattr(
+        catalog,
+        "agent_projects",
+        lambda filters, limit=8, sort="cheapest", skip_names=None: (
+            [
+                {
+                    "id": "P1",
+                    "name": "Studio One",
+                    "price": 700000,
+                    "developer_name": "Dev",
+                    "community": "Marina",
+                    "bedroom_min": 0,
+                    "bedroom_max": 0,
+                }
+            ] * 2,
+            2,
+        ),
+    )
+
+    memory = ConversationMemory(llm_client=_FakeLLM())
+    memory.set_dialogue_state({
+        "action": "search",
+        "place": "Jumeirah Village Circle",
+        "beds": 2,
+    })
+    resolved = asyncio.run(
+        resolve_turn(question, memory, llm_generate=memory.llm_client.generate)
+    )
+    assert resolved["action"] == "recommend"
+    assert resolved["kind"] == "split"
+    assert resolved.get("place") in (None, "")
+    assert resolved.get("beds") is None
+
+    out = asyncio.run(_understood_turn(question, memory, {}))
+    assert out is not None
+    answer = out["fast_answer"]
+    assert answer.startswith("Understood:")
+    assert "Acot Recommend" in answer
+    assert "studio" in answer.lower()
+    assert "villa" in answer.lower() or "3-bedroom" in answer.lower()
+    assert "prop-ai" not in answer.lower() and "propai" not in answer.lower()
+    assert "cannot" not in answer.lower()
+    assert "Jumeirah Village Circle" not in answer.split("\n")[0]
+    assert "I found 136 projects" not in answer
+
+
+def test_highest_and_average_sale_asks_use_exact_aggregates(monkeypatch):
+    import app.retrieval.propai_catalog as catalog
+
+    seen = {}
+
+    def fake_extreme(**kwargs):
+        seen.update(kwargs)
+        return {
+            "project": "BURJ VISTA",
+            "date": "2026-10-01",
+            "price": 9_000_000,
+            "bedrooms": 2,
+            "size_sqft": 1800,
+            "property_type": "Unit",
+        }
+
+    monkeypatch.setattr(catalog, "project_named_in_question", lambda text: None)
+    monkeypatch.setattr(catalog, "place_named", lambda text: "Downtown Dubai")
+    monkeypatch.setattr(catalog, "resolve_dubai_place", lambda place: "Downtown Dubai")
+    monkeypatch.setattr(catalog, "cheapest_sale", fake_extreme)
+    monkeypatch.setattr(
+        catalog,
+        "sale_window_stats",
+        lambda **kwargs: {"count": 10, "low": 900_000, "high": 9_000_000, "median": 2_000_000},
+    )
+    high = _transaction_turn("What is the highest sale price in Downtown?", None)
+    assert high is not None
+    assert seen.get("highest") is True
+    assert "AED 9,000,000" in high["fast_answer"]
+    assert high["fast_answer"].startswith("Understood:")
+    assert "highest of 10 recorded" in high["fast_answer"]
+
+    avg = _cheapest_sale_turn("What is the average sale price of 2-bedroom in Downtown?")
+    assert avg is not None
+    assert "median price is **AED 2,000,000**" in avg["fast_answer"]
+    assert "AED 900,000 to AED 9,000,000" in avg["fast_answer"]
+    assert avg["fast_answer"].startswith("Understood:")
+
+
+def test_project_count_turn_answers_from_propai(monkeypatch):
+    import app.retrieval.propai_catalog as catalog
+    from app.memory.conversation_memory import ConversationMemory
+
+    monkeypatch.setattr(catalog, "count_projects", lambda: 4110)
+    memory = ConversationMemory(llm_client=None)
+    out = _project_count_turn(
+        "How many residential projects are there in Dubai?",
+        memory,
+    )
+    assert out is not None
+    assert "4,110" in out["fast_answer"]
+    assert "show me" in out["fast_answer"].lower()
+    state = memory.get_dialogue_state()
+    assert state["action"] == "project_count"
+    assert state["place"] == "Dubai"
+    assert state["last_result"]["count"] == 4110
+
+
+def test_developer_rank_turn_lists_top_developers(monkeypatch):
+    import app.retrieval.propai_catalog as catalog
+
+    monkeypatch.setattr(
+        catalog,
+        "top_developers_by_value",
+        lambda limit=5, months=12: [
+            {"developer": "EMAAR", "sales": 100, "value": 50_000_000_000},
+            {"developer": "DAMAC PROPERTIES", "sales": 80, "value": 20_000_000_000},
+        ],
+    )
+    out = _developer_rank_turn(
+        "Which 5 developers had the highest sales value in Dubai in the last 12 months?"
+    )
+    assert out is not None
+    assert "EMAAR" in out["fast_answer"]
+    assert "DAMAC PROPERTIES" in out["fast_answer"]
+
+
+def test_sql_browse_passes_min_price_and_ready(monkeypatch):
+    import app.retrieval.propai_catalog as catalog
+
+    seen = {}
+
+    def fake_agent_projects(filters, limit=10, sort="latest_handover", skip_names=None):
+        seen["filters"] = filters
+        seen["sort"] = sort
+        return (
+            [{
+                "name": "Lunaya",
+                "developer_name": "Zaya",
+                "community": "Dubai",
+                "price": 6440000,
+                "status": "Secondary Ready",
+                "project_status": "Secondary Ready",
+            }],
+            1,
+        )
+
+    monkeypatch.setattr(catalog, "agent_projects", fake_agent_projects)
+    monkeypatch.setattr(catalog, "resolve_dubai_place", lambda place: place)
+
+    above = _sql_project_browse_turn(
+        "Show me projects in Dubai starting above AED 5 million", None
+    )
+    assert above is not None
+    assert seen["filters"].get("min_price") == 5_000_000
+    assert seen["sort"] == "priciest"
+
+    seen.clear()
+
+    def fake_ready(filters, limit=10, sort="latest_handover", skip_names=None):
+        seen["filters"] = filters
+        seen["sort"] = sort
+        return (
+            [{
+                "name": "Chaimaa Premiere",
+                "developer_name": "X",
+                "community": "Jumeirah Village Circle",
+                "price": 600000,
+                "bedroom_min": 1,
+                "bedroom_max": 1,
+                "status": "Secondary Ready",
+                "project_status": "Secondary Ready",
+            }],
+            1,
+        )
+
+    monkeypatch.setattr(catalog, "agent_projects", fake_ready)
+    question = "Show only ready 1-bedroom apartments in JVC under AED 700,000"
+    ready = _sql_project_browse_turn(question, None)
+    assert ready is not None
+    assert seen["filters"].get("ready_only") is True
+    assert seen["filters"].get("max_price") == 700_000
+    assert seen["filters"].get("bedrooms") == 1
+    assert seen["filters"].get("communities") == ["Jumeirah Village Circle"]
+
+    # Answer text must explain the filters — not a bare "Bedrooms: 1" stub list.
+    answer = _build_fast_structured_answer(question, ready["structured_summary"])
+    assert answer.startswith("Understood:")
+    assert "Bedrooms:" not in answer or "Recent sale" in answer or "ready" in answer.lower()
+    assert "ready" in answer.lower()
+    assert "1-bedroom" in answer.lower() or "1 bedroom" in answer.lower()
+    assert "700,000" in answer or "700000" in answer.replace(",", "")
+    assert "Jumeirah Village Circle" in answer or "JVC" in answer
+    assert "Chaimaa Premiere" in answer
+    assert "Found 10 project(s) matching your request" not in answer

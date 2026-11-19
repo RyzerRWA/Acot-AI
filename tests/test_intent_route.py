@@ -1,7 +1,9 @@
 from app.answers.intent_route import (
     classify_intent,
+    goal_for_route,
     is_incomplete_home_browse,
     is_no_preference_reply,
+    is_recommend_intent,
     is_show_more,
     parse_bedrooms,
     parse_budget_aed,
@@ -94,6 +96,52 @@ def test_classify_show_properties_in_arabian_ranches_is_browse():
     route = classify_intent("Show me properties in Arabian Ranches")
     assert route["intent"] == "neither"
     assert route["subject"] == "Arabian Ranches"
+
+
+def test_why_these_on_screen_is_shortlist_not_filtered_rerun():
+    class _Memory:
+        active_candidates = [
+            {"name": "Damac Towers by Paramount", "entity_type": "project"},
+            {"name": "Damac Maison Aykon City", "entity_type": "project"},
+            {"name": "Executive Towers - East Heights", "entity_type": "project"},
+        ]
+        last_user_question = (
+            "ok i am looking for the best project in business bay for families"
+        )
+        last_standalone_question = last_user_question
+        turns = []
+
+    route = classify_intent(
+        "Why are these projects good for the family",
+        _Memory(),
+    )
+    assert route["intent"] == "recommend"
+    assert route["kind"] == "shortlist"
+    assert route["subject"] == "on_screen"
+
+
+def test_phase3_plain_apartment_browse_is_search_not_recommend():
+    browse = classify_intent("Show me 2 bedroom apartments in Dubai Marina")
+    assert browse["intent"] == "neither"
+    assert not is_recommend_intent("Show me 2 bedroom apartments in Dubai Marina")
+    assert classify_intent("Show me projects in Jumeirah Village Circle")["intent"] == "neither"
+
+
+def test_phase3_buy_best_family_afford_are_recommend():
+    cases = [
+        "I want a 3-bedroom in JVC for a family of 4 to buy around AED 1.8M.",
+        "Show me the best apartments for the family",
+        "Is AED 900,000 enough for a 1-bedroom in Dubai Marina?",
+        "Where should I buy in Dubai?",
+        "Which Dubai areas are best for families?",
+    ]
+    for question in cases:
+        route = classify_intent(question)
+        assert route["intent"] == "recommend", question
+        assert is_recommend_intent(question)
+        assert goal_for_route(route) in {
+            "family", "budget", "afford", "open_buy", "invest", "ready", "compare",
+        }
 
 
 def test_snapshot_answer_quotes_separate_bedroom_medians():
@@ -190,13 +238,107 @@ def test_family_questions_read_different_intents():
     assert general["focus"] != towers["focus"]
     assert towers["focus"]["kids"] is True
     assert towers["focus"]["avoid_towers"] is True
+    assert towers["focus"]["want_villas"] is True
     assert villas["focus"]["want_3bed"] is True
     assert villas["focus"]["want_villas"] is True
     general_text = format_family_areas(_family_sample(), general["focus"])
     towers_text = format_family_areas(_family_sample(), towers["focus"])
-    assert general_text.split("\n")[0] != towers_text.split("\n")[0]
+    # Both open with the same Understood line; the explanation that follows must differ.
+    assert general_text.startswith("Understood:")
+    assert general_text.split("\n\n")[1] != towers_text.split("\n\n")[1]
     assert "does not tag" not in general_text.lower()
-    assert "towers" in towers_text.lower()
+    assert "towers" in towers_text.lower() or "low-rise" in towers_text.lower()
+    assert "villa share" in towers_text.lower() or "high share of villas" in towers_text.lower() or "lead on villa" in towers_text.lower()
+
+
+def test_kids_followup_reranks_away_from_busy_tower_volume(monkeypatch):
+    """Q2 kids/not-towers must not replay the general volume list (Town Square)."""
+    rows = [
+        {
+            "area": "Mudon",
+            "official_area": "MUDON",
+            "sales_12m": 200,
+            "existing_sales": 143,
+            "villa_sales": 126,
+            "existing_villas": 126,
+            "family_sales": 119,
+            "existing_family_sales": 119,
+            "median_family_sale": 3_750_000,
+        },
+        {
+            "area": "The Springs",
+            "official_area": "THE SPRINGS",
+            "sales_12m": 107,
+            "existing_sales": 107,
+            "villa_sales": 107,
+            "existing_villas": 107,
+            "family_sales": 48,
+            "existing_family_sales": 48,
+            "median_family_sale": 5_780_000,
+        },
+        {
+            "area": "Town Square",
+            "official_area": "TOWN SQUARE",
+            "sales_12m": 800,
+            "existing_sales": 754,
+            "villa_sales": 98,
+            "existing_villas": 98,
+            "family_sales": 172,
+            "existing_family_sales": 172,
+            "median_family_sale": 2_750_000,
+        },
+        {
+            "area": "Arabian Ranches",
+            "official_area": "ARABIAN RANCHES",
+            "sales_12m": 91,
+            "existing_sales": 91,
+            "villa_sales": 91,
+            "existing_villas": 91,
+            "family_sales": 39,
+            "existing_family_sales": 39,
+            "median_family_sale": 5_850_000,
+        },
+        {
+            "area": "The Valley",
+            "official_area": "THE VALLEY",
+            "sales_12m": 87,
+            "existing_sales": 87,
+            "villa_sales": 87,
+            "existing_villas": 87,
+            "family_sales": 87,
+            "existing_family_sales": 87,
+            "median_family_sale": 2_855_000,
+        },
+    ]
+
+    monkeypatch.setattr(
+        intent_turns,
+        "fetch_family_areas",
+        lambda limit=5, focus=None: rank_family_areas(rows, focus=focus, limit=limit),
+    )
+    monkeypatch.setattr(
+        intent_turns, "_search", lambda filters, limit=6, skip_names=None: ([], [])
+    )
+
+    general = intent_turns.recommend_data_turn("Which Dubai areas are best for families?")
+    kids = intent_turns.recommend_data_turn(
+        "Best communities for a family with kids, not just the busiest towers.",
+        None,
+        {
+            "intent": "recommend",
+            "kind": "family_areas",
+            "source_question": "Which Dubai areas are best for families?",
+            "focus": {"kids": False, "avoid_towers": False},
+        },
+    )
+    assert general is not None and kids is not None
+    general_names = [row["name"] for row in general["structured_summary"]["community"]]
+    kids_names = [row["name"] for row in kids["structured_summary"]["community"]]
+    assert "Town Square" in general_names
+    assert "Town Square" not in kids_names
+    assert kids_names[0] in {"The Springs", "Arabian Ranches", "The Valley", "Mudon"}
+    assert "towers" in kids["fast_answer"].lower() or "villa share" in kids["fast_answer"].lower()
+    assert general["fast_answer"].split("\n\n")[1] != kids["fast_answer"].split("\n\n")[1]
 
 
 def _family_sample():
@@ -1339,6 +1481,7 @@ def test_villa_miss_in_business_bay_lists_villas_elsewhere(monkeypatch):
             "name": "DAMAC Islands 2 - Bahamas 1",
             "community": "DAMAC Islands",
             "price": 2_903_000,
+            "price_kind": "recent_sale",
             "sales_count": 300,
         }
     ]
@@ -1360,10 +1503,156 @@ def test_villa_miss_in_business_bay_lists_villas_elsewhere(monkeypatch):
     assert turn is not None
     text = turn["fast_answer"].lower()
     assert "business bay" in text
-    assert "apartments" in text
+    assert "recorded" in text or "transaction" in text or "acot recommend" in text
     assert "damac islands" in text
     assert turn["structured_summary"]["projects"][0]["name"] == "DAMAC Islands 2 - Bahamas 1"
     assert "1,799,825" not in text
+
+
+def test_search_keeps_only_transaction_backed_rows(monkeypatch):
+    """Catalog ingress must not return handover-only towers as recommend cards."""
+    from types import SimpleNamespace
+
+    catalog = [
+        {"name": "Forest City Tower 3", "handover_time": "2032-01-01", "status": "On Sale"},
+        {
+            "name": "Ajmal Sarah",
+            "price": 320_756,
+            "price_kind": "recent_sale",
+            "sales_count": 14,
+            "last_sold_on": "2026-06-01",
+            "community": "Dubai Land Residence Complex",
+        },
+    ]
+
+    def fake_agent(raw, limit=8, sort="cheapest"):
+        return catalog[:limit], {}
+
+    monkeypatch.setattr(
+        "app.retrieval.propai_catalog.agent_projects", fake_agent
+    )
+    matches, closest = intent_turns._search(
+        {"communities": ["Dubai"], "bedrooms": 0},
+        limit=6,
+        skip_names={"x"},
+    )
+    names = [row["name"] for row in matches]
+    assert names == ["Ajmal Sarah"]
+    assert closest == []
+
+    monkeypatch.setattr(
+        "app.listings.tools.search_projects",
+        lambda raw: SimpleNamespace(
+            cards=[{"row": row} for row in catalog],
+            output={"closest_matches": [
+                {
+                    "id": "H1",
+                    "name": "Sobha Central",
+                    "handover": "2031-12-01",
+                    "community": "DMCC",
+                }
+            ]},
+        ),
+    )
+    matches2, closest2 = intent_turns._search({"communities": ["Dubai"]}, limit=4)
+    assert [row["name"] for row in matches2] == ["Ajmal Sarah"]
+    assert closest2 == []
+
+
+def test_split_turn_rejects_handover_only_towers(monkeypatch):
+    """Split shortlists must come from sales evidence — never catalog handover towers."""
+    studios = [
+        {
+            "name": "Ajmal Sarah",
+            "community": "Dubai Land Residence Complex",
+            "price": 320_756,
+            "price_kind": "recent_sale",
+            "sales_count": 14,
+            "last_sold_on": "2026-06-01",
+        }
+    ]
+    villas = [
+        {
+            "name": "Forest City Tower 3",
+            "community": "Dubai South",
+            "handover_time": "2032-01-01",
+            "status": "On Sale",
+        },
+        {
+            "name": "Sobha Central",
+            "community": "DMCC-EZ2",
+            "handover_time": "2031-12-01",
+            "status": "On Sale",
+        },
+        {
+            "name": "Evidence Villa Park",
+            "community": "International City",
+            "price": 650_000,
+            "price_kind": "recent_sale",
+            "sales_count": 9,
+            "rent_count": 3,
+            "last_sold_on": "2026-04-01",
+        },
+    ]
+
+    monkeypatch.setattr(
+        intent_turns,
+        "fetch_studio_projects_under_budget",
+        lambda budget=None, limit=8: studios,
+    )
+    monkeypatch.setattr(
+        intent_turns,
+        "fetch_villa_projects_under_budget",
+        lambda budget=None, limit=8, property_type="villa", bedrooms=None: villas,
+    )
+    turn = intent_turns.recommend_data_turn(
+        "I need a 4-bedroom villa and a studio under AED 700,000",
+        None,
+        {
+            "intent": "recommend",
+            "kind": "split",
+            "budget_aed": 700_000,
+        },
+    )
+    assert turn is not None
+    names = [row["name"] for row in turn["structured_summary"]["projects"]]
+    assert "Ajmal Sarah" in names
+    assert "Evidence Villa Park" in names
+    assert "Forest City Tower 3" not in names
+    assert "Sobha Central" not in names
+    text = turn["fast_answer"].lower()
+    assert "forest city" not in text
+    assert "sobha central" not in text
+    assert "evidence villa" in text
+    assert "sales" in text
+
+
+def test_villa_deepen_miss_is_positive_and_empty(monkeypatch):
+    """When no sale-backed villas exist, do not dump apartments or handover towers."""
+    monkeypatch.setattr(
+        intent_turns, "_recommend_pool", lambda filters, skip_names=None, pool_size=None: ([], [])
+    )
+    monkeypatch.setattr(
+        intent_turns, "fetch_villa_projects_under_budget", lambda *a, **k: []
+    )
+    turn = intent_turns.recommend_data_turn(
+        "villas",
+        None,
+        {
+            "intent": "recommend",
+            "kind": "filtered",
+            "property_type": "villa",
+            "bedrooms": 4,
+            "budget_aed": 700_000,
+        },
+    )
+    assert turn is not None
+    assert turn["structured_summary"]["projects"] == []
+    text = turn["fast_answer"].lower()
+    assert "acot recommend" in text
+    assert "forest city" not in text
+    assert "sobha central" not in text
+    assert "mostly apartments" not in text
 
 
 def test_incomplete_home_browse_vs_complete_first_message():
