@@ -86,6 +86,21 @@ _BROWSE_NAME = re.compile(
 )
 
 
+# Some models fill every optional field with an "empty" value (-1, or 0 for a maximum, a year or a count). For the
+# project and sales tools that means "not given"; the rental tools keep their strict checks.
+_EMPTY_KEYS = ("min_price_aed", "max_price_aed", "handover_year", "min_size_sqft", "max_size_sqft", "bedrooms",
+               "last_days", "limit", "months")
+
+
+def _lenient(a: dict) -> dict:
+    out = dict(a)
+    for key in _EMPTY_KEYS:
+        v = out.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and (v < 0 or (v == 0 and key != "bedrooms")):
+            out.pop(key)
+    return out
+
+
 def _num(args: dict, key: str, lo: float, hi: float):
     value = args.get(key)
     if value is None or value == "":
@@ -526,6 +541,7 @@ MAX_PROFILE_NOTE = 200
 
 
 def _project_filters(a: dict) -> dict:
+    a = _lenient(a)
     f = {
         "communities": _strings(a, "communities"),
         "developers": _strings(a, "developers"),
@@ -687,7 +703,7 @@ def _closest_place(text: str) -> str | None:
 
 def search_projects(raw) -> ToolResult:
     """Project search that also reads a misspelt place the way the user meant it."""
-    a = _normalize_project_search(_obj(raw))
+    a = _normalize_project_search(_lenient(_obj(raw)))
     result = _search_projects(a)
     if result.output.get("matching_projects"):
         return result
@@ -935,12 +951,16 @@ def compare_projects(raw) -> ToolResult:
 
 
 def market_stats(raw) -> ToolResult:
-    a = _obj(raw)
+    a = _lenient(_obj(raw))
     f = _project_filters(a)
     group_key = str(a.get("group_by") or "none")
     if group_key != "none" and group_key not in PROJECT_GROUPS:
         raise ToolInputError(f"group_by must be one of: none, {', '.join(PROJECT_GROUPS)}.")
-    parts, params = ["coalesce(name, '') <> ''"], []
+    parts, params = ["coalesce(name, '') <> ''", "not is_plot", "coalesce(development_status, '') <> 'CANCELLED'"], []
+    use = str(a.get("use") or "").strip().lower()
+    if use in ("residential", "office", "commercial", "land"):
+        parts.append("lower(usage) = %s")
+        params.append(use)
     if f.get("communities"):
         names = [n for c in f["communities"] for n in (c, ALIASES.get(c.lower())) if n]
         clause, extra = contains_place_sql(["master_project", "area", "name"], names)
@@ -1112,6 +1132,194 @@ def area_sales(raw) -> ToolResult:
     })
 
 
+# ---------------------------------------------------------------- recorded sales (Dubai Land Department)
+
+SALE_SORTS = {
+    "newest": "instance_date desc, sale_price desc",
+    "oldest": "instance_date asc, sale_price asc",
+    "cheapest": "sale_price asc, instance_date desc",
+    "priciest": "sale_price desc, instance_date desc",
+}
+SALE_TYPES = {"apartment": "Apartment", "villa": "Villa", "hotel apartment": "Hotel Apartment", "office": "Office",
+              "shop": "Shop", "land": "Land", "warehouse": "Warehouse", "building": "Building"}
+
+
+def _date(args: dict, key: str):
+    value = str(args.get(key) or "").strip()
+    if not value:
+        return None
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise ToolInputError(f"{key} must be a date like 2026-11-30.")
+    return value
+
+
+def _sales_where(a: dict) -> tuple[str, list, dict]:
+    """Shared filters for recorded sales: place, project/building name, bedrooms, kind, ready or off-plan, dates, price."""
+    # Records priced under AED 150 per sq ft are partial transfers or typos (an AED 40,960 "1-bedroom"), not sales.
+    a = _lenient(a)
+    parts = ["deleted_at is null", "coalesce(outlier_flag, '') <> 'True'", "sale_price > 0", "instance_date <= current_date",
+             "(property_type = 'Land' or price_per_sqft is null or price_per_sqft >= 150)"]
+    params: list = []
+    used: dict = {}
+    place = str(a.get("place") or "").strip()[:80]
+    if place.lower() in ("dubai", "all dubai", "all of dubai", "uae", "city wide", "citywide"):
+        place = ""  # the whole city is the default, not a place filter
+    if place:
+        from app.answers.predict import _sales_place_filter
+        clause, extra = _sales_place_filter(place)
+        parts.append(clause)
+        params.extend(extra)
+        used["place"] = place
+    name = str(a.get("name") or "").strip()[:80]
+    for token in _name_tokens(name):
+        parts.append("(project_name_prop_ai ilike %s or building_name_prop_ai ilike %s)")
+        like = _like([token])[0]
+        params.extend([like, like])
+    if name:
+        used["name"] = name
+    beds = _beds(a, "bedrooms", 0, 12)
+    if beds is not None:
+        parts.append("bedrooms = %s")
+        params.append(beds)
+        used["bedrooms"] = "studio" if beds == 0 else int(beds)
+    kind = str(a.get("property_type") or "").strip().lower()
+    if kind:
+        if kind not in SALE_TYPES:
+            raise ToolInputError(f"property_type must be one of: {', '.join(SALE_TYPES.values())}.")
+        parts.append("property_type = %s")
+        params.append(SALE_TYPES[kind])
+        used["property_type"] = SALE_TYPES[kind]
+    status = str(a.get("status") or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if status in ("ready", "ready_only", "existing", "completed"):
+        parts.append("development_status = 'Existing'")
+        used["status"] = "ready"
+    elif status in ("off_plan", "offplan", "off_plan_only"):
+        parts.append("development_status = 'Off-Plan'")
+        used["status"] = "off-plan"
+    month = str(a.get("month") or "").strip()
+    last_days = _num(a, "last_days", 1, 3650)
+    date_from, date_to = _date(a, "date_from"), _date(a, "date_to")
+    if month:
+        if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", month):
+            raise ToolInputError("month must look like 2026-11.")
+        parts.append("instance_date >= %s::date and instance_date < (%s::date + interval '1 month')")
+        params.extend([month + "-01", month + "-01"])
+        used["month"] = month
+    elif last_days:
+        parts.append("instance_date >= current_date - %s::int")
+        params.append(int(last_days))
+        used["last_days"] = int(last_days)
+    else:
+        if date_from:
+            parts.append("instance_date >= %s::date")
+            params.append(date_from)
+            used["date_from"] = date_from
+        if date_to:
+            parts.append("instance_date <= %s::date")
+            params.append(date_to)
+            used["date_to"] = date_to
+    lo, hi = _num(a, "min_price_aed", 0, 10_000_000_000), _num(a, "max_price_aed", 0, 10_000_000_000)
+    if lo is not None and hi is not None and lo > hi:
+        raise ToolInputError("min_price_aed cannot exceed max_price_aed.")
+    if lo is not None:
+        parts.append("sale_price >= %s")
+        params.append(lo)
+        used["min_price_aed"] = lo
+    if hi is not None:
+        parts.append("sale_price <= %s")
+        params.append(hi)
+        used["max_price_aed"] = hi
+    return " and ".join(parts), params, used
+
+
+def sales_search(raw) -> ToolResult:
+    """Individual recorded sales (Dubai Land Department), with the count of all matches and their price range."""
+    a = _lenient(_obj(raw))
+    where, params, used = _sales_where(a)
+    sort = str(a.get("sort") or "newest").strip().lower()
+    if sort not in SALE_SORTS:
+        raise ToolInputError(f"sort must be one of: {', '.join(SALE_SORTS)}.")
+    limit = int(round(_num(a, "limit", 1, 10) or 5))
+    summary = fetch(
+        "select count(*)::int as n, min(sale_price) as lowest, max(sale_price) as highest, "
+        "(percentile_cont(0.5) within group (order by sale_price))::float8 as median, "
+        "min(instance_date)::text as first_sale, max(instance_date)::text as last_sale "
+        f"from propai_sales where {where}", tuple(params))[0]
+    rows = fetch(
+        "select instance_date::text as date, sale_price, bedrooms, property_type, property_sub_type_en as sub_type, "
+        "coalesce(nullif(project_name_prop_ai, ''), building_name_prop_ai) as project, building_name_prop_ai as building, "
+        "master_project_prop_ai as master_project, area_name_prop_ai as area, development_status as status, "
+        "procedure_area_sqft as size_sqft, price_per_sqft "
+        f"from propai_sales where {where} order by {SALE_SORTS[sort]} limit {limit}", tuple(params))
+    sales = []
+    for r in rows:
+        sales.append({
+            "date": r["date"], "price_aed": round(float(r["sale_price"])),
+            "bedrooms": ("studio" if r["bedrooms"] == 0 else int(r["bedrooms"])) if r.get("bedrooms") is not None and r["bedrooms"] < 20 else None,
+            "type": r["property_type"], "project": r["project"], "building": r["building"] or None,
+            "community": r["master_project"] or r["area"],
+            "ready_or_off_plan": "ready" if r["status"] == "Existing" else "off-plan" if r["status"] == "Off-Plan" else None,
+            "size_sqft": round(float(r["size_sqft"])) if r.get("size_sqft") else None,
+            "price_per_sqft_aed": round(float(r["price_per_sqft"])) if r.get("price_per_sqft") else None,
+        })
+    return ToolResult({
+        "matching_sales": summary["n"], "showing": len(sales), "sorted_by": sort, "filters_used": used,
+        "lowest_price_aed": summary["lowest"], "median_price_aed": summary["median"], "highest_price_aed": summary["highest"],
+        "first_sale_date": summary["first_sale"], "last_sale_date": summary["last_sale"],
+        "sales": sales,
+        "note": "Recorded Dubai Land Department sales. These are real transactions, not asking prices. "
+                "Partial transfers priced under AED 150 per sq ft are already left out. A studio is 0 bedrooms: never present a studio price as a 1-bedroom price. "
+                "If matching_sales is 0, say what was searched (filters_used) and nothing was found.",
+    })
+
+
+def top_developers(raw) -> ToolResult:
+    """Developers ranked by the value of their recorded sales."""
+    a = _lenient(_obj(raw))
+    where, params, used = _sales_where({**a, "last_days": None, "month": None, "date_from": None, "date_to": None,
+                                        **({"last_days": int(_num(a, "months", 1, 120) * 30.4)} if _num(a, "months", 1, 120) else {"last_days": 365})})
+    limit = int(round(_num(a, "limit", 1, 10) or 5))
+    rows = fetch(
+        "select developer_group as developer, count(*)::int as sales, sum(sale_price)::float8 as total_value, "
+        "(percentile_cont(0.5) within group (order by sale_price))::float8 as median_price "
+        f"from propai_sales where {where} and coalesce(btrim(developer_group), '') <> '' "
+        f"group by developer_group order by sum(sale_price) desc limit {limit}", tuple(params))
+    return ToolResult({
+        "ranked_by": "total value of recorded sales", "filters_used": used,
+        "developers": [{"rank": i + 1, "developer": r["developer"], "sales": r["sales"],
+                        "total_sales_value_aed": round(r["total_value"]), "median_price_aed": round(r["median_price"])}
+                       for i, r in enumerate(rows)],
+        "note": "Sums of Dubai Land Department sale prices (off-plan and ready) grouped by developer group. "
+                "Sales with no developer on record are left out, so totals can be lower than the whole market.",
+    })
+
+
+def data_context() -> str:
+    """Today's date and how far the recorded data reaches, so 'today', 'this month' and 'latest' mean something."""
+    import time
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    now = time.time()
+    cached = _CONTEXT.get("value")
+    if cached and now - _CONTEXT["at"] < 600:
+        return cached
+    today = datetime.now(ZoneInfo("Asia/Dubai")).date()
+    try:
+        row = fetch("select (select max(instance_date) from propai_sales where instance_date <= current_date)::text as sale, "
+                    "(select max(contract_start_date) from propai_rents where contract_start_date <= current_date)::text as rent")[0]
+    except Exception:
+        row = {}
+    text = (f"Today is {today:%A %d %B %Y} (Dubai time). "
+            f"Recorded Dubai Land Department sales reach {row.get('sale') or 'an unknown date'} and rent contracts "
+            f"{row.get('rent') or 'an unknown date'}; nothing newer is in the data. Use today's date for 'today', "
+            "'this month', 'last 30 days' and 'last 12 months'. When asked for the latest sale date, quote the sales date.")
+    _CONTEXT.update(value=text, at=now)
+    return text
+
+
+_CONTEXT: dict = {"at": 0.0}
+
+
 # ---------------------------------------------------------------- user profile
 
 PROFILE_GOALS = ("buy_to_live", "invest", "rent_out", "holiday_home", "other")
@@ -1222,6 +1430,8 @@ TOOL_FUNCTIONS = {
     "search_brochures": search_brochures,
     "search_brokers": search_brokers,
     "area_sales": area_sales,
+    "sales_search": sales_search,
+    "top_developers": top_developers,
     "update_profile": update_profile,
 }
 

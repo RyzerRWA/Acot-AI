@@ -8,7 +8,7 @@ import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from typing import Literal
@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from run import initialize_acot, ask_acot, stream_acot, _slim_stream_response
 from app.llm.client import LLMQueueTimeoutError
+from app import market_refresh
 from app.listings import session_store
 from app.listings.tools import ToolInputError, clean_profile
 from app.logging_utils import (
@@ -75,6 +76,7 @@ async def lifespan(_app: FastAPI):
         )
         install_stdout_logger(logging.getLogger("acot.pipeline"))
 
+        market_refresh.start_schedule()  # sales / rents / projects refresh every 2 days (MARKET_REFRESH_ENABLED=false to stop)
         get_api_components()
         print(
             f"[boot] ACOT pipeline warm in "
@@ -797,3 +799,31 @@ def clear_session(session_id: str):
 def session_stats():
 
     return session_cache_stats()
+
+
+# ============================================================
+# MARKET DATA REFRESH (admin panel -> backend -> here)
+# ============================================================
+
+def _internal_only(key: str | None):
+    """The backend sends INTERNAL_API_KEY; when the service has one set, nothing else may start or read a refresh."""
+    expected = os.getenv("INTERNAL_API_KEY", "").strip()
+    if expected and key != expected:
+        raise HTTPException(status_code=403, detail="Not allowed.")
+
+
+@app.get("/api/admin/market-refresh")
+def market_refresh_status(x_internal_key: str | None = Header(default=None)):
+    _internal_only(x_internal_key)
+    return market_refresh.status()
+
+
+@app.post("/api/admin/market-refresh", status_code=202)
+def market_refresh_start(x_internal_key: str | None = Header(default=None)):
+    _internal_only(x_internal_key)
+    result = market_refresh.start("manual")
+    if not result["started"] and result["reason"] == "already_running":
+        raise HTTPException(status_code=409, detail="A refresh is already running.")
+    if not result["started"]:
+        raise HTTPException(status_code=429, detail=f"A refresh was started in the last {result['wait_minutes']} minutes. Try again shortly.")
+    return result

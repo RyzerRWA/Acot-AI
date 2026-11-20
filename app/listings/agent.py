@@ -18,7 +18,7 @@ from openai import OpenAI
 from app.core.config import AICREDITS_API_KEY, AICREDITS_BASE_URL, llm_chat_extras
 from app.graph.graph import build_agent_graph
 from app.listings.prompt import SYSTEM_PROMPT, TOOLS, tools_for
-from app.listings.tools import ToolInputError, mentions_known_name, run_tool
+from app.listings.tools import ToolInputError, data_context, mentions_known_name, run_tool
 
 log = logging.getLogger("acot.listings")
 
@@ -125,6 +125,7 @@ class ListingAgent:
         started = time.perf_counter()
         profile = {} if profile is None else profile
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages.append({"role": "system", "content": data_context()})
         if audience in AUDIENCE_CONTEXT:
             messages.append({"role": "system", "content": AUDIENCE_CONTEXT[audience]})
         if profile:
@@ -203,6 +204,8 @@ class ListingAgent:
         cards = [card for key, card in seen.items() if key in cited_ids][:10]
         answer = _ID_TAG.sub(lambda m: m.group(0) if m.group(1) in seen or m.group(1) in earlier else "",
                              cleaned).strip()
+        # [[...]] is only for ids; a name the model put in double brackets is shown as plain text
+        answer = re.sub(r"\[\[([^\]]+)\]\]", lambda m: m.group(0) if _ID_TAG.fullmatch(m.group(0)) else m.group(1), answer)
         ms = int(round((time.perf_counter() - started) * 1000))
         log.info("listings: %s | %s tokens | %sms | %s",
                  ",".join(u["name"] + ("" if u["ok"] else "!") for u in used) or "no tools", tokens, ms, model)
