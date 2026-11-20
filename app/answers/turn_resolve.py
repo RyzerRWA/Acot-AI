@@ -90,6 +90,42 @@ def _on_screen_project_count(conversation_memory) -> int:
         and str(item.get("entity_type") or "project").lower() == "project"
         and item.get("name")
     )
+
+
+def _has_shown_or_sale_projects(conversation_memory) -> bool:
+    if _on_screen_project_count(conversation_memory) >= 1:
+        return True
+    if conversation_memory is None:
+        return False
+    stubs = getattr(conversation_memory, "last_sale_projects", None) or []
+    return any(isinstance(item, dict) and item.get("name") for item in stubs)
+
+
+def _is_shown_attribute_ask(question: str | None, conversation_memory=None) -> bool:
+    """Developer/price/handover about the current shortlist (with or without 'these')."""
+    from app.retrieval.hybrid.question_text import (
+        is_attribute_phrase,
+        is_group_attribute_question,
+    )
+
+    text = question or ""
+    if is_group_attribute_question(text):
+        return True
+    if not is_attribute_phrase(text):
+        return False
+    if not _has_shown_or_sale_projects(conversation_memory):
+        return False
+    # Real project browses / agents / sales stay on their own paths.
+    if re.search(
+        r"\b(?:show|find|list)\s+(?:me\s+)?(?:\d+\s+)?(?:projects?|apartments?|"
+        r"villas?|townhouses?|flats?)\b",
+        text,
+        re.I,
+    ):
+        return False
+    if _AGENTS_SIGNAL.search(text) or _SALES_SIGNAL.search(text):
+        return False
+    return True
 _PROJECT_COUNT_SIGNAL = re.compile(
     r"\bhow many\b.*\bprojects?\b|\bproject count\b|\bnumber of projects\b",
     re.I,
@@ -125,6 +161,51 @@ def _parse_month_year(text: str) -> tuple[int | None, int | None]:
     if year_match:
         year = int(year_match.group(1))
     return month, year
+
+
+# Strip sale/browse filler so leftover tokens like "AC3" can resolve as a place/project.
+_SALES_PLACE_FILLER = re.compile(
+    r"\b(?:show|me|tell|find|list|give|the|top|best|latest|recent|last|newest|"
+    r"recorded|please|can|you|could|what|are|is|any|all|how|many|"
+    r"transactions?|transcations?|sales?|sold|details?|info|information|about|"
+    r"for|in|at|of|dubai|apartments?|bedroom|bedrooms?|studio|studios?)\b",
+    re.I,
+)
+
+
+def sales_place_from_text(text: str | None) -> str | None:
+    """Area or project named in a sales/transaction ask (including short codes)."""
+    asked = text or ""
+    try:
+        from app.retrieval.propai_catalog import (
+            place_named,
+            project_named_in_question,
+            resolve_dubai_place,
+        )
+
+        # Prefer a full project title ("The Woods at Sobha Sanctuary") over a
+        # shorter master/community leftover ("Sobha Sanctuary").
+        project = project_named_in_question(asked)
+        if project:
+            return project
+        named = extract_place(asked) or place_named(asked)
+        if named and str(named).strip().lower() != "dubai":
+            return named
+        leftover = " ".join(_SALES_PLACE_FILLER.sub(" ", asked).split()).strip(" .?")
+        if len(leftover) < 3:
+            return None
+        return resolve_dubai_place(leftover)
+    except Exception:
+        named = extract_place(asked)
+        if named and str(named).strip().lower() != "dubai":
+            return named
+        return None
+
+
+def has_explicit_sales_place_token(text: str | None) -> bool:
+    """True when the ask leaves a place/project token after sale-filler stripping."""
+    leftover = " ".join(_SALES_PLACE_FILLER.sub(" ", text or "").split()).strip(" .?")
+    return len(leftover) >= 3
 
 
 def _coerce_place_scoped_recommend(
@@ -376,6 +457,19 @@ def offline_resolve_turn(
             text,
         )
 
+    # "Who is the developer of each of these projects?" / "developer details in JVC"
+    # with cards on screen — never clarify or re-browse the community.
+    if _is_shown_attribute_ask(text, conversation_memory):
+        return _clean_resolution(
+            {
+                "action": "attribute",
+                "place": place,
+                "confidence": 0.92,
+                "source": "offline",
+            },
+            text,
+        )
+
     if _PROJECT_COUNT_SIGNAL.search(text) and not _SALE_COUNT_SIGNAL.search(text):
         return _clean_resolution(
             {
@@ -390,7 +484,7 @@ def offline_resolve_turn(
         return _clean_resolution(
             {
                 "action": "sales_count",
-                "place": place,
+                "place": place or sales_place_from_text(text),
                 "beds": beds,
                 "month": month,
                 "year": year,
@@ -402,11 +496,12 @@ def offline_resolve_turn(
     if _SALES_SIGNAL.search(text) and (
         re.search(r"\b(?:recent|latest|last|show|list|transactions?)\b", text, re.I)
         or place
+        or sales_place_from_text(text)
     ):
         return _clean_resolution(
             {
                 "action": "sales_list",
-                "place": place,
+                "place": place or sales_place_from_text(text),
                 "beds": beds,
                 "month": month,
                 "year": year,
@@ -469,6 +564,16 @@ async def resolve_turn(
             state = getattr(conversation_memory, "dialogue_state", None) or {}
     state = normalize_dialogue_state(state)
 
+    # Named project compares ("Compare Serenz and Aura Heights") belong to the
+    # hybrid comparison path — never invent a recommend clarify for area/beds.
+    try:
+        from app.retrieval.hybrid.question_text import comparison_pair
+
+        if comparison_pair(text):
+            return None
+    except Exception:
+        pass
+
     # Latency: skip LLM when offline already has a high-confidence executable
     # action. Never short-circuit a sticky sales_list over a price-extreme ask —
     # that was the "regex dump again" failure mode; prefer sales_stat / LLM.
@@ -478,6 +583,15 @@ async def resolve_turn(
         offline_fast["source"] = "offline"
         offline_fast["confidence"] = score_confidence(offline_fast, text)
         action = str(offline_fast.get("action") or "")
+        kind = str(offline_fast.get("kind") or "").lower()
+        # On-screen shortlist/compare is handled by specialized turns — never
+        # treat it as an executable sticky afford/filtered recommend.
+        if (
+            action == "recommend"
+            and kind == "shortlist"
+            and _on_screen_project_count(conversation_memory) >= 2
+        ):
+            return None
         sticky_sales_trap = (
             action in {"sales_list", "sales_count"}
             and _stat_kind_from_text(text) is not None
@@ -502,6 +616,26 @@ async def resolve_turn(
             and float(offline_fast.get("confidence") or 0) >= 0.8
         ):
             return offline_fast
+
+    # Compare / best-of-shown with live cards: do not let the LLM invent a
+    # sticky afford/search re-run — specialized compare/shortlist turns handle it.
+    if _on_screen_project_count(conversation_memory) >= 2:
+        route = classify_intent(text, conversation_memory)
+        if (
+            route.get("intent") == "recommend"
+            and route.get("kind") == "shortlist"
+            and str(route.get("subject") or "").lower() == "on_screen"
+        ):
+            return None
+        if re.search(r"\bcompar(?:e|ison|ing)\b", text, re.I):
+            return None
+        if re.search(
+            r"\btell(?:\s+me)?(?:\s+the)?\s+best\b|"
+            r"\bwhich (?:one |of these )?(?:is|are) (?:the )?best\b",
+            text,
+            re.I,
+        ):
+            return None
 
     if llm_generate is not None:
         prompt = f"""You are ACOT's turn understanding layer for Dubai real estate.
@@ -547,6 +681,13 @@ Rules (meaning + state — never require exact wording):
 - buy/best/family/afford/invest/recommend → recommend + goal
 - best projects in a named area → recommend, kind filtered, place set — NOT open_best
 - open_best only with no community and no budget (citywide where-to-buy)
+- Compare all / compare these / tell me the best / which is best about options already
+  shown → recommend, kind=shortlist, place=null (on-screen). Do NOT re-run a prior
+  afford/filtered recommend with sticky place+budget.
+- Named project compares ("Compare Serenz by Danube and Aura Heights", "A vs B")
+  are NOT recommend/clarify. Leave them for the comparison retriever (action general
+  is wrong too — prefer not inventing slots; if unsure use action general with
+  confidence < 0.5 so the hybrid compare path can run).
 - agents/brokers → agents
 - greetings only → small_talk
 - incomplete home browse (beds/type, no area, no budget) → clarify

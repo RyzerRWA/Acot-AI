@@ -45,6 +45,9 @@ def test_named_compare_picks_clearer_value_and_activity():
     assert "yield" not in footer.lower()
     assert "roi" not in footer.lower()
     assert "AED 1,400,000" in footer or "sales" in footer.lower() or "rental" in footer.lower()
+    # Why should cite a head-to-head fact vs the other named option.
+    assert "Alpha Tower" in footer
+    assert "Limited data: ranked on" not in footer
 
 
 def test_thin_data_stays_positive():
@@ -127,7 +130,9 @@ def test_budget_fit_beats_a_much_cheaper_project():
     assert result["winner"]["name"] == "Near Budget"
     text = format_footer(result)
     assert "1,720,000" in text
-    assert "430,000" not in text
+    # The cheap project may appear only as the contrast, never as the pick.
+    assert "Recommend:** Near Budget" in text
+    assert "Closer budget fit at AED 1,720,000 vs Cheap Tower" in text
 
 
 def test_ready_stock_quotes_latest_sale_not_old_handover():
@@ -285,7 +290,10 @@ def test_single_factor_says_limited_data_and_omits_score():
     assert result["can_rank"] is False
     assert result["used_factors"] == ["lower price"]
     footer = format_footer(result)
-    assert "limited data" in footer.lower()
+    # Concrete vs-alternative fact replaces a bare "Limited data: ranked on …" line.
+    assert "1,000,000" in footer
+    assert "B" in footer
+    assert "Limited data: ranked on" not in footer
     assert "score" not in footer.lower()
     table = format_compare_table(projects, result)
     assert "| Score |" in table
@@ -819,4 +827,8 @@ def test_phase4_filtered_turn_passes_family_goal(monkeypatch):
     )
     assert turn is not None
     assert "**Acot Recommend:** Family Court" in turn["fast_answer"]
-    assert "Investor Tower" in turn["fast_answer"] or "Also strong" in turn["fast_answer"]
+    assert (
+        "Investor Tower" in turn["fast_answer"]
+        or "Also strong" in turn["fast_answer"]
+        or "Also worth reviewing" in turn["fast_answer"]
+    )

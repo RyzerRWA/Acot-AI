@@ -271,10 +271,34 @@ class QueryPlanner:
                 "The question appears to depend on a previous conversation turn."
             )
 
+        # Bare "Serenz by Danube and Aura Heights" is a named compare even
+        # without the word "compare" (demo retry after a clarify).
+        bare_pair = None
+        if not self._contains_any(q_lower, self.COMPARISON_TERMS):
+            try:
+                from app.retrieval.hybrid.question_text import comparison_pair
+
+                bare_pair = comparison_pair(q)
+            except Exception:
+                bare_pair = None
+            if bare_pair:
+                for name in bare_pair:
+                    if name and name not in plan.entity_candidates:
+                        plan.entity_candidates.append(name)
+
         # ------------------------------------------------------------
         # Primary intent
         # ------------------------------------------------------------
-        if self._contains_any(q_lower, self.PREDICTION_TERMS):
+        if bare_pair:
+            plan.intent = "comparison"
+            plan.operations.append("compare")
+            plan.needs_comparison = True
+            plan.needs_structured_data = True
+            plan.reasoning.append(
+                "Two named projects were detected; treating this as a comparison."
+            )
+
+        elif self._contains_any(q_lower, self.PREDICTION_TERMS):
             plan.intent = "prediction"
             plan.operations.append("predict")
             plan.needs_prediction = True

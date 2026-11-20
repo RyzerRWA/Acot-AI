@@ -1554,6 +1554,8 @@ def test_search_keeps_only_transaction_backed_rows(monkeypatch):
             ]},
         ),
     )
+    # Hermetic: don't let the live DB attach sales to the handover-only row.
+    monkeypatch.setattr(intent_turns, "attach_market_activity", lambda rows: rows)
     matches2, closest2 = intent_turns._search({"communities": ["Dubai"]}, limit=4)
     assert [row["name"] for row in matches2] == ["Ajmal Sarah"]
     assert closest2 == []

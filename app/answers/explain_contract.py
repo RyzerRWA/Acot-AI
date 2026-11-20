@@ -173,9 +173,15 @@ def build_understood(
             " I will show licensed agents with card rank and licence facts for that area."
         )
     elif intent == "recommend" and goal_key == "family":
-        lead += (
-            " I will rank communities on ready villa and 3+ bedroom sales activity."
-        )
+        if place and str(place).strip().lower() not in {"", "dubai"}:
+            lead += (
+                " I will rank projects in that community on recorded 3+ bedroom "
+                "sales activity and recent sale prices."
+            )
+        else:
+            lead += (
+                " I will rank communities on ready villa and 3+ bedroom sales activity."
+            )
     elif intent == "recommend" and goal_key in {"budget", "afford", "invest"}:
         lead += (
             " I will ground the picks in recorded sale prices and transaction activity."

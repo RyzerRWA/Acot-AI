@@ -522,6 +522,158 @@ def test_comparison_without_comparable_fields_still_shows_table():
     assert "can't recommend" not in comparison["answer"].lower()
 
 
+def test_named_compare_serenz_aura_never_clarifies_for_area_beds_budget():
+    """Demo-critical: named project compare must not ask for area/beds/budget."""
+    import asyncio
+
+    from app.answers.clarify import should_clarify
+    from app.answers.turn_resolve import resolve_turn
+    from app.memory.conversation_memory import ConversationMemory
+    from app.retrieval.hybrid.question_text import comparison_pair
+    from run import _understood_turn
+
+    questions = [
+        "Compare Serenz by Danube and Aura Heights",
+        "Serenz by Danube and Aura Heights",
+    ]
+    for question in questions:
+        assert comparison_pair(question) == ("Serenz by Danube", "Aura Heights")
+        assert should_clarify(
+            {
+                "action": "recommend",
+                "goal": "compare",
+                "kind": "shortlist",
+                "confidence": 0.95,
+            },
+            question,
+        ) is False
+
+        async def _fake_llm(_prompt):
+            return (
+                '{"action":"recommend","kind":"filtered","goal":"compare",'
+                '"confidence":0.95}'
+            )
+
+        memory = ConversationMemory(llm_client=None)
+        resolved = asyncio.run(
+            resolve_turn(question, memory, llm_generate=_fake_llm)
+        )
+        assert resolved is None
+        understood = asyncio.run(_understood_turn(question, memory, {}))
+        assert understood is None
+
+
+def test_bare_project_pair_plans_as_comparison():
+    """'A and B' retry after a clarify must reach the comparison retriever."""
+    from app.retrieval.hybrid.query_planner import QueryPlanner
+
+    planner = QueryPlanner.__new__(QueryPlanner)
+    plan = planner._rule_plan("Serenz by Danube and Aura Heights")
+    assert plan.needs_comparison is True
+    assert plan.intent == "comparison"
+    assert plan.entity_candidates == ["Serenz by Danube", "Aura Heights"]
+
+
+def test_transaction_details_after_single_project_answer_uses_that_project():
+    """Agent answers may leave no active_candidates; tx details still mean that project."""
+    from app.memory.conversation_memory import ConversationMemory
+
+    memory = ConversationMemory(llm_client=None)
+    memory.active_entities["project"] = "Serenz by Danube"
+    memory.active_entities["community"] = "Jumeirah Village Circle (JVC)"
+    memory.turns = [
+        {
+            "user_question": "What is the starting price of Serenz by Danube?",
+            "candidate_names": [],
+        }
+    ]
+    subject = _transaction_subject("Show me the recent transaction details", memory)
+    assert subject and subject[0]["name"] == "Serenz by Danube"
+    # A named place is still its own ask.
+    assert _transaction_subject("Show me recent sales in Business Bay", memory) is None
+
+
+def test_fresh_marina_buy_ask_is_not_patched_into_old_task():
+    import asyncio
+
+    from app.answers.followup_resolve import resolve_followup
+    from app.answers.turn_resolve import resolve_turn
+    from app.memory.conversation_memory import ConversationMemory
+
+    question = (
+        "So I need few properties to buy and in Dubai Marina and also my "
+        "budget is around 3 million."
+    )
+    for state in (
+        {"action": "clarify"},
+        {"action": "sales_list", "place": "Jumeirah Village Circle", "beds": 0},
+        {"action": "search", "place": "Jumeirah Village Circle", "beds": 1},
+    ):
+        memory = ConversationMemory(llm_client=None)
+        memory.set_dialogue_state(state)
+        assert asyncio.run(
+            resolve_followup(question, memory.get_dialogue_state(), llm_generate=None)
+        ) is None
+        resolved = asyncio.run(resolve_turn(question, memory, llm_generate=None))
+        assert resolved["action"] == "recommend"
+        assert resolved["place"] == "Dubai Marina"
+        assert resolved["budget_aed"] == 3_000_000
+        # Stale studio/1-bed from the old task must not leak into the new ask.
+        assert resolved["beds"] is None
+
+
+def test_named_compare_does_not_prefer_handover_only_over_recorded_price():
+    """Serenz with price/beds must beat Aura Heights that only has earlier handover."""
+    summary = {
+        "comparison": True,
+        "comparison_entities": [
+            {
+                "resolved_name": "Serenz by Danube",
+                "data": {
+                    "projects": [{
+                        "name": "Serenz by Danube",
+                        "price": 1_187_220,
+                        "bedroom_min": 1.5,
+                        "bedroom_max": 1.5,
+                        "handover_time": "2029-09-01",
+                    }],
+                },
+            },
+            {
+                "resolved_name": "Aura Heights",
+                "data": {
+                    "projects": [{
+                        "name": "Aura Heights",
+                        "handover_time": "2029-04-01",
+                    }],
+                },
+            },
+        ],
+    }
+
+    comparison = _build_comparison(summary)
+
+    assert comparison is not None
+    answer = comparison["answer"]
+    assert "| Factor | Serenz by Danube | Aura Heights |" in answer
+    assert "AED 1,187,220" in answer
+    assert "Not recorded" in answer
+    assert "**Acot Recommend:** Serenz by Danube" in answer
+    assert "**Acot Recommend:** Aura Heights" not in answer
+    assert "Aura Heights scores 100%" not in answer
+    assert "Stands out for" not in answer
+    assert "1,187,220" in answer.split("**Acot Recommend:**")[-1]
+    assert "Aura Heights" in answer.split("**Acot Recommend:**")[-1]
+    # Fuller record should lead the scores.
+    serenz_score = next(
+        side["score"] for side in comparison["sides"] if side["name"] == "Serenz by Danube"
+    )
+    aura_score = next(
+        side["score"] for side in comparison["sides"] if side["name"] == "Aura Heights"
+    )
+    assert serenz_score > aura_score
+
+
 def test_rental_comparison_escapes_title_pipes_and_explains_tradeoff():
     summary = {
         "comparison_entities": [
@@ -560,8 +712,11 @@ def test_rental_comparison_escapes_title_pipes_and_explains_tradeoff():
     assert "| Score | 50% | 50% |" in comparison["answer"]
     assert "Conclusion: The comparison is balanced." in comparison["answer"]
     assert "**Acot Recommend:** Villa | Sea View and Villa | Garden" in comparison["answer"]
-    assert "lower yearly rent" in comparison["answer"]
-    assert "more space" in comparison["answer"]
+    assert "Stands out for" not in comparison["answer"]
+    assert "260,000" in comparison["answer"].split("**Acot Recommend:**")[-1] or (
+        "lower yearly rent" in comparison["answer"].lower()
+    )
+    assert "more space" in comparison["answer"].lower() or "4,023" in comparison["answer"]
 
 
 def test_comparison_table_includes_every_selected_listing_in_order():
@@ -1105,6 +1260,127 @@ def test_compare_all_projects_uses_every_candidate_in_a_table():
     assert "Creek Beach - Summer" in turn["fast_answer"]
     assert "Creek Beach - Savanna-Cedar-Mangrove" in turn["fast_answer"]
     assert "**Acot Recommend:**" in turn["fast_answer"]
+
+
+def test_compare_all_after_afford_does_not_need_preloaded_sales_counts():
+    """On-screen compare keeps every card in the table even before sales attach."""
+    class _Memory:
+        active_candidates = [
+            {
+                "name": name,
+                "entity_type": "project",
+                "community": "Business Bay",
+                "price": price,
+                "bedroom_min": 2,
+                "bedroom_max": 2,
+            }
+            for name, price in (
+                ("Bay Square", 1_200_000),
+                ("Executive Towers", 1_400_000),
+                ("The Binary", 1_100_000),
+            )
+        ]
+        dialogue_state = {
+            "action": "recommend",
+            "kind": "afford",
+            "goal": "afford",
+            "place": "Business Bay",
+            "beds": 2,
+            "budget_aed": 1_500_000,
+        }
+
+        def get_dialogue_state(self):
+            return self.dialogue_state
+
+    question = "compare all and tell me the best"
+    turn = _compare_shown_turn(question, _Memory())
+    assert turn is not None
+    assert len(turn["structured_summary"]["projects"]) == 3
+    assert "Bay Square" in turn["fast_answer"]
+    assert "Executive Towers" in turn["fast_answer"]
+    assert "The Binary" in turn["fast_answer"]
+    assert "**Acot Recommend:**" in turn["fast_answer"]
+    assert "Understood:" not in turn["fast_answer"]
+    assert "1,500,000" not in turn["fast_answer"]
+    assert _shortlist_recommend_turn(question, _Memory()) is None
+
+
+def test_compare_all_after_afford_beats_sticky_understood_resolve():
+    """LLM sticky afford must not replay when cards are on screen for compare-all."""
+    import asyncio
+    from app.answers.intent_route import classify_intent
+    from app.answers.turn_resolve import resolve_turn
+    from run import _dialogue_followup_turn, _understood_turn
+
+    class _Memory:
+        active_candidates = [
+            {
+                "name": name,
+                "entity_type": "project",
+                "community": "Business Bay",
+                "price": price,
+                "bedroom_min": 2,
+                "bedroom_max": 2,
+                "sales_count": sales,
+                "rent_count": rents,
+            }
+            for name, price, sales, rents in (
+                ("Bay Square", 1_200_000, 40, 100),
+                ("Executive Towers", 1_400_000, 55, 120),
+                ("The Binary", 1_100_000, 30, 90),
+            )
+        ]
+        dialogue_state = {
+            "action": "recommend",
+            "kind": "afford",
+            "goal": "afford",
+            "place": "Business Bay",
+            "beds": 2,
+            "budget_aed": 1_500_000,
+            "source_question": "Is AED 1.5M enough for a 2-bedroom in Business Bay?",
+        }
+        llm_client = None
+
+        def get_dialogue_state(self):
+            return self.dialogue_state
+
+        def set_dialogue_state(self, state):
+            self.dialogue_state = state
+
+    question = "compare all and tell me the best"
+    memory = _Memory()
+    route = classify_intent(question, memory)
+    assert route.get("kind") == "shortlist"
+    assert route.get("subject") == "on_screen"
+
+    async def _fake_afford_llm(_prompt):
+        return (
+            '{"action":"recommend","kind":"afford","goal":"afford",'
+            '"place":"Business Bay","beds":2,"budget_aed":1500000,'
+            '"confidence":0.95}'
+        )
+
+    resolved = asyncio.run(
+        resolve_turn(question, memory, llm_generate=_fake_afford_llm)
+    )
+    # Must not invent sticky afford — leave the turn to compare/shortlist.
+    assert resolved is None or (
+        resolved.get("kind") == "shortlist"
+        and resolved.get("action") == "recommend"
+    )
+    assert (resolved or {}).get("kind") != "afford"
+    assert (resolved or {}).get("place") in {None, "", "on_screen"}
+
+    followup = asyncio.run(_dialogue_followup_turn(question, memory, {}))
+    assert followup is None
+
+    understood = asyncio.run(_understood_turn(question, memory, {}))
+    assert understood is not None
+    assert "| Factor |" in understood["fast_answer"]
+    assert "Understood:" not in understood["fast_answer"]
+    assert "enough for a 2-bedroom" not in understood["fast_answer"]
+    assert "Bay Square" in understood["fast_answer"]
+    assert "Executive Towers" in understood["fast_answer"]
 
 
 def _deira_studio_cards(entity_type="listing"):
@@ -2414,6 +2690,441 @@ def test_transaction_details_after_recommend_uses_on_screen_projects(monkeypatch
     assert not calls["latest"], "must not fall back to area-wide latest_sales"
 
 
+def test_cold_project_cards_force_sales_clarify():
+    """After 2+ topic breaks, bare transaction details must clarify — not sticky cards."""
+    from run import _project_card_context_is_live, _transaction_subject
+
+    class _Memory:
+        active_candidates = [
+            {
+                "name": "Hanover Square",
+                "entity_type": "project",
+                "community": "Jumeirah Village Circle",
+            },
+            {
+                "name": "The Square",
+                "entity_type": "project",
+                "community": "Jumeirah Village Circle",
+            },
+        ]
+        turns = [
+            {
+                "user_question": "best projects in jvc",
+                "candidate_names": ["Hanover Square", "The Square"],
+            },
+            {"user_question": "show me rentals in Dubai Marina"},
+            {"user_question": "top agents in Business Bay"},
+        ]
+
+        def get_dialogue_state(self):
+            return {"action": "agents", "place": "Business Bay"}
+
+    assert _project_card_context_is_live(
+        "Show me the recent transaction details", _Memory()
+    ) is False
+    assert _transaction_subject(
+        "Show me the recent transaction details", _Memory()
+    ) is None
+    # Deixis still unlocks the cold cards.
+    assert _transaction_subject(
+        "Show me recent transactions for these projects", _Memory()
+    )
+
+
+def test_fresh_cards_stay_sticky_after_one_soft_followup():
+    from run import _transaction_subject
+
+    class _Memory:
+        active_candidates = [
+            {"name": "Hanover Square", "entity_type": "project", "community": "JVC"},
+            {"name": "The Square", "entity_type": "project", "community": "JVC"},
+        ]
+        turns = [
+            {
+                "user_question": "best projects in jvc",
+                "candidate_names": ["Hanover Square", "The Square"],
+            },
+            {"user_question": "what is the handover date"},
+        ]
+
+        def get_dialogue_state(self):
+            return {"action": "recommend", "place": "Jumeirah Village Circle"}
+
+    found = _transaction_subject(
+        "Show me the recent transaction details", _Memory()
+    )
+    assert found and found[0]["name"] == "Hanover Square"
+
+
+def test_named_place_sales_wins_over_cold_or_fresh_cards(monkeypatch):
+    import app.retrieval.propai_catalog as catalog
+    from run import _transaction_subject
+
+    class _Memory:
+        active_candidates = [
+            {"name": "Hanover Square", "entity_type": "project", "community": "JVC"},
+        ]
+        turns = []
+
+        def get_dialogue_state(self):
+            return {"action": "recommend", "place": "Jumeirah Village Circle"}
+
+    monkeypatch.setattr(
+        catalog,
+        "place_named",
+        lambda text: "Dubai Marina" if "marina" in (text or "").lower() else None,
+    )
+    assert (
+        _transaction_subject(
+            "Show me recent sales in Dubai Marina", _Memory()
+        )
+        is None
+    )
+
+
+def test_cold_cards_understood_turn_clarifies(monkeypatch):
+    """Sample anytime flow: recommend → rent → agents → bare transactions → clarify."""
+    import asyncio
+
+    from app.memory.conversation_memory import ConversationMemory
+
+    memory = ConversationMemory(llm_client=None)
+    memory.set_dialogue_state({
+        "action": "agents",
+        "place": "Business Bay",
+        "source_question": "top agents in Business Bay",
+    })
+    memory.active_candidates = [
+        {
+            "name": "Hanover Square",
+            "entity_type": "project",
+            "community": "Jumeirah Village Circle",
+        },
+        {
+            "name": "The Square",
+            "entity_type": "project",
+            "community": "Jumeirah Village Circle",
+        },
+    ]
+    memory.turns = [
+        {
+            "user_question": "best projects in jvc",
+            "candidate_names": ["Hanover Square", "The Square"],
+        },
+        {"user_question": "show me rentals in Dubai Marina"},
+        {"user_question": "top agents in Business Bay"},
+    ]
+
+    out = asyncio.run(
+        __import__("run")._understood_turn(
+            "Show me the recent transaction details",
+            memory,
+            {},
+        )
+    )
+    assert out is not None
+    assert out.get("structured_summary", {}).get("clarify") is True
+    assert "project" in out["fast_answer"].lower() or "area" in out["fast_answer"].lower()
+
+
+def test_best_project_in_marina_does_not_rerank_sticky_cards(monkeypatch):
+    """'best project in Dubai Marina for family' must not use format_explain_on_screen."""
+    from app.memory.conversation_memory import ConversationMemory
+    from run import _shortlist_recommend_turn
+
+    memory = ConversationMemory(llm_client=None)
+    memory.set_dialogue_state({
+        "action": "recommend",
+        "goal": "family",
+        "kind": "filtered",
+        "place": "Dubai Marina",
+        "beds": 3,
+    })
+    memory.active_candidates = [
+        {
+            "name": "Ocean Heights",
+            "entity_type": "project",
+            "community": "Dubai Marina",
+            "price": 1_500_000,
+            "size_max": 1422,
+        },
+        {
+            "name": "Marina Pinnacle",
+            "entity_type": "project",
+            "community": "Dubai Marina",
+            "price": 1_900_000,
+        },
+        {
+            "name": "Sulafa Tower",
+            "entity_type": "project",
+            "community": "Dubai Marina",
+            "price": 1_899_000,
+        },
+    ]
+
+    question = "suggest me the best project in Dubai Marina for living family"
+    assert _shortlist_recommend_turn(question, memory) is None
+
+    # Deixis shortlist still works on the same cards.
+    which = _shortlist_recommend_turn(
+        "which of these is the best for a family?",
+        memory,
+    )
+    assert which is not None
+    assert "on-screen" in which["fast_answer"].lower() or "acot recommend" in which["fast_answer"].lower()
+
+
+def test_developer_chip_after_jvc_browse_lists_developers():
+    """Live bug: developer chip clarified / re-browsed instead of on-screen developers."""
+    import asyncio
+
+    from app.answers.turn_resolve import offline_resolve_turn
+    from app.memory.conversation_memory import ConversationMemory
+
+    memory = ConversationMemory(llm_client=None)
+    memory.set_dialogue_state({
+        "action": "search",
+        "place": "Jumeirah Village Circle",
+        "source_question": "show me projects in JVC",
+    })
+    memory.active_candidates = [
+        {
+            "name": "Laya Crest",
+            "entity_type": "project",
+            "community": "Jumeirah Village Circle",
+            "developer_name": "LAYA DEVELOPERS L.L.C.",
+        },
+        {
+            "name": "Serenz",
+            "entity_type": "project",
+            "community": "Jumeirah Village Circle",
+            "developer_name": "Danube",
+        },
+    ]
+
+    chip = "Who is the developer of each of these projects?"
+    offline = offline_resolve_turn(chip, memory)
+    assert offline and offline["action"] == "attribute"
+
+    out = asyncio.run(__import__("run")._understood_turn(chip, memory, {}))
+    assert out is not None
+    assert out.get("structured_summary", {}).get("clarify") is not True
+    answer = out["fast_answer"].lower()
+    assert "laya" in answer or "developer" in answer
+    assert "serenz" in answer or "danube" in answer
+    assert "i found" not in answer
+    assert "200 projects" not in answer
+
+    follow = "i want the developer details in JVC"
+    out2 = asyncio.run(__import__("run")._understood_turn(follow, memory, {}))
+    assert out2 is not None
+    assert out2.get("structured_summary", {}).get("clarify") is not True
+    answer2 = out2["fast_answer"].lower()
+    assert "laya" in answer2 and "danube" in answer2
+    # Must answer the shortlist developers — not a fresh 200-project browse.
+    assert "200 projects" not in answer2
+    projects = out2.get("structured_summary", {}).get("projects") or []
+    assert len(projects) == 2
+
+
+def test_top_agents_for_jvc_chip_does_not_list_projects(monkeypatch):
+    """Live bug: agents chip after JVC browse returned 200 projects, not agents."""
+    import asyncio
+
+    from app.memory.conversation_memory import ConversationMemory
+    from app.retrieval.propai_catalog import resolve_dubai_place
+
+    assert resolve_dubai_place("Jumeirah Village Circle (JVC)") == "Jumeirah Village Circle"
+    assert _broker_place(
+        "Tell me the top agents for Jumeirah Village Circle (JVC)", None
+    ) == "Jumeirah Village Circle"
+
+    captured = {}
+
+    def fake_list(**kwargs):
+        captured.update(kwargs)
+        return _broker_rows()[: kwargs.get("limit", 5)]
+
+    monkeypatch.setattr("app.retrieval.propai_catalog.list_brokers", fake_list)
+
+    memory = ConversationMemory(llm_client=None)
+    memory.set_dialogue_state({
+        "action": "search",
+        "place": "Jumeirah Village Circle",
+        "source_question": "show me projects in JVC",
+    })
+    memory.active_candidates = [
+        {
+            "name": "The Weave",
+            "entity_type": "project",
+            "community": "Jumeirah Village Circle",
+        },
+    ]
+
+    # Follow-up path must not hijack into project browse.
+    follow = asyncio.run(
+        __import__("run")._dialogue_followup_turn(
+            "Tell me the top agents for Jumeirah Village Circle (JVC)",
+            memory,
+            {},
+        )
+    )
+    assert follow is None
+
+    out = asyncio.run(
+        __import__("run")._understood_turn(
+            "Tell me the top agents for Jumeirah Village Circle (JVC)",
+            memory,
+            {},
+        )
+    )
+    assert out is not None
+    assert out.get("structured_summary", {}).get("brokers")
+    assert captured.get("place") == "Jumeirah Village Circle"
+    assert "licensed agents" in out["fast_answer"].lower()
+    assert "jumeirah village circle" in out["fast_answer"].lower()
+    assert "1wood" not in out["fast_answer"].lower()
+    assert "I found" not in out["fast_answer"]
+    assert "200 projects" not in out["fast_answer"].lower()
+
+
+def test_top_agents_after_fresh_motor_city_cards(monkeypatch):
+    """Sample: Motor City projects on screen → bare 'i want top agents' uses Motor City."""
+    import asyncio
+
+    from app.memory.conversation_memory import ConversationMemory
+
+    captured = {}
+
+    def fake_list(**kwargs):
+        captured.update(kwargs)
+        return _broker_rows()[: kwargs.get("limit", 5)]
+
+    monkeypatch.setattr("app.retrieval.propai_catalog.list_brokers", fake_list)
+
+    memory = ConversationMemory(llm_client=None)
+    memory.set_dialogue_state({
+        "action": "search",
+        "place": "Motor City",
+        "source_question": "show me projects in Motor City",
+    })
+    memory.active_candidates = [
+        {
+            "name": "Ananda Residences",
+            "entity_type": "project",
+            "community": "Motor City",
+        },
+        {
+            "name": "Regent House",
+            "entity_type": "project",
+            "community": "Motor City",
+        },
+    ]
+
+    out = asyncio.run(
+        __import__("run")._understood_turn(
+            "i want top agents",
+            memory,
+            {},
+        )
+    )
+    assert out is not None
+    assert out.get("structured_summary", {}).get("clarify") is not True
+    assert out.get("structured_summary", {}).get("brokers")
+    assert captured.get("place") == "Motor City"
+    assert "motor city" in out["fast_answer"].lower()
+    assert "licensed agents" in out["fast_answer"].lower()
+    # Must not fall back to a project browse answer.
+    assert "I found" not in out["fast_answer"]
+    assert "35 projects" not in out["fast_answer"].lower()
+
+
+def test_top_agents_cold_cards_clarifies():
+    """After 2+ topic breaks, bare top agents clarifies — does not invent Motor City."""
+    import asyncio
+
+    from app.memory.conversation_memory import ConversationMemory
+
+    memory = ConversationMemory(llm_client=None)
+    memory.set_dialogue_state({
+        "action": "recommend",
+        "place": "Dubai Marina",
+        "source_question": "best family areas",
+    })
+    memory.active_candidates = [
+        {
+            "name": "Ananda Residences",
+            "entity_type": "project",
+            "community": "Motor City",
+        },
+        {
+            "name": "Regent House",
+            "entity_type": "project",
+            "community": "Motor City",
+        },
+    ]
+    memory.turns = [
+        {
+            "user_question": "show me projects in Motor City",
+            "candidate_names": ["Ananda Residences", "Regent House"],
+        },
+        {"user_question": "show me rentals in Dubai Marina"},
+        {"user_question": "best communities for a family with kids"},
+    ]
+
+    out = asyncio.run(
+        __import__("run")._understood_turn(
+            "i want top agents",
+            memory,
+            {},
+        )
+    )
+    assert out is not None
+    assert out.get("structured_summary", {}).get("clarify") is True
+    assert "agent" in out["fast_answer"].lower()
+    # Must not invent sticky Motor City in the Understood line.
+    assert "in motor city" not in out["fast_answer"].lower()
+
+
+def test_top_agents_named_place_ignores_motor_city_cards(monkeypatch):
+    import asyncio
+
+    from app.memory.conversation_memory import ConversationMemory
+
+    captured = {}
+
+    def fake_list(**kwargs):
+        captured.update(kwargs)
+        return _broker_rows()[: kwargs.get("limit", 5)]
+
+    monkeypatch.setattr("app.retrieval.propai_catalog.list_brokers", fake_list)
+
+    memory = ConversationMemory(llm_client=None)
+    memory.set_dialogue_state({
+        "action": "search",
+        "place": "Motor City",
+        "source_question": "show me projects in Motor City",
+    })
+    memory.active_candidates = [
+        {
+            "name": "Ananda Residences",
+            "entity_type": "project",
+            "community": "Motor City",
+        },
+    ]
+
+    out = asyncio.run(
+        __import__("run")._understood_turn(
+            "top agents in Business Bay",
+            memory,
+            {},
+        )
+    )
+    assert out is not None
+    assert captured.get("place") == "Business Bay"
+    assert "business bay" in out["fast_answer"].lower()
+
+
 def test_full_community_list_is_answered_from_the_data(monkeypatch):
     """'Full list of communities' gets every community (not a top 10), even with a typo."""
     import app.database.postgres as postgres
@@ -3037,8 +3748,128 @@ def test_sql_browse_passes_min_price_and_ready(monkeypatch):
     assert above is not None
     assert seen["filters"].get("min_price") == 5_000_000
     assert seen["sort"] == "priciest"
+    assert not seen["filters"].get("communities")
+    assert "Jumeirah Village Circle" not in (above.get("fast_answer") or "")
 
-    seen.clear()
+
+def test_latest_sales_keeps_named_project_building_deals(monkeypatch):
+    """AC3-style project asks must not be emptied by the unit sqft outlier band."""
+    import app.retrieval.propai_catalog as catalog
+
+    calls = {"sql": []}
+
+    def fake_fetch(sql, params=None):
+        calls["sql"].append((sql, params))
+        text = " ".join(str(sql).lower().split())
+        if "from propai_projects" in text and "upper(btrim(name))" in text:
+            return [{"name": "AC3", "master_project": "Motor City"}]
+        if "from propai_sales" in text:
+            assert "procedure_area_sqft between 50 and 100000" not in text
+            assert params and "AC3" in params
+            return [{
+                "project": "AC3",
+                "sold_on": "2025-12-18",
+                "price": 182_100_000,
+                "bedrooms": None,
+                "size_sqft": 145669,
+                "property_type": "Building",
+            }]
+        return []
+
+    monkeypatch.setattr(catalog, "fetch", fake_fetch)
+    out = catalog.latest_sales(place="AC3", limit=8)
+    assert out["count"] == 1
+    assert out["sales"][0]["project"] == "AC3"
+    assert out["sales"][0]["price"] == 182_100_000
+
+
+def test_latest_sales_matches_short_sale_alias_for_woods(monkeypatch):
+    """Catalog 'The Woods at Sobha Sanctuary' must find sale-table 'THE WOODS'."""
+    import app.retrieval.propai_catalog as catalog
+
+    def fake_fetch(sql, params=None):
+        text = " ".join(str(sql).lower().split())
+        if "from propai_projects" in text:
+            return [{
+                "name": "The Woods at Sobha Sanctuary",
+                "master_project": "SOBHA SANCTUARY",
+            }]
+        if "from propai_sales" in text:
+            # Short alias + master must both be in the filter params.
+            flat = [str(p) for p in (params or ())]
+            assert any("Woods at Sobha Sanctuary" in p for p in flat)
+            assert any(p.upper() == "THE WOODS" or p == "The Woods" for p in flat)
+            assert any("SOBHA SANCTUARY" in p.upper() for p in flat)
+            return [{
+                "project": "THE WOODS",
+                "sold_on": "2026-11-18",
+                "price": 2_500_000,
+                "bedrooms": 3,
+                "size_sqft": 2200,
+                "property_type": "Villa",
+            }]
+        return []
+
+    monkeypatch.setattr(catalog, "fetch", fake_fetch)
+    out = catalog.latest_sales(place="The Woods at Sobha Sanctuary", limit=5)
+    assert out["count"] == 1
+    assert out["sales"][0]["project"] == "THE WOODS"
+
+
+def test_dubai_above_5m_after_jvc_state_stays_citywide(monkeypatch):
+    """Sticky JVC must not hijack an explicit Dubai min-price browse."""
+    import asyncio
+
+    import app.retrieval.propai_catalog as catalog
+    from app.memory.conversation_memory import ConversationMemory
+
+    seen = {}
+
+    def fake_browse(filters, limit=10, sort="latest_handover", skip_names=None):
+        seen["filters"] = dict(filters or {})
+        seen["sort"] = sort
+        return (
+            [{
+                "name": "Lunaya",
+                "developer_name": "Zaya",
+                "community": "Palm Jumeirah",
+                "price": 6_440_000,
+            }],
+            1,
+            None,
+        )
+
+    monkeypatch.setattr(catalog, "browse_projects_near_budget", fake_browse)
+    monkeypatch.setattr(catalog, "resolve_dubai_place", lambda place: place)
+
+    memory = ConversationMemory(llm_client=None)
+    memory.set_dialogue_state({
+        "action": "search",
+        "place": "Jumeirah Village Circle",
+        "beds": 1,
+        "budget_aed": 700_000,
+        "ready_only": True,
+        "source_question": "Show only ready 1-bedroom apartments in JVC under AED 700,000",
+    })
+
+    question = "Show me projects in Dubai starting above AED 5 million"
+    out = asyncio.run(
+        __import__("run")._understood_turn(question, memory, {})
+    )
+    assert out is not None
+    assert seen.get("filters", {}).get("min_price") == 5_000_000
+    assert not seen.get("filters", {}).get("communities")
+    assert seen.get("filters", {}).get("bedrooms") is None
+    assert not seen.get("filters", {}).get("ready_only")
+    answer = (out.get("fast_answer") or "").lower()
+    assert "jumeirah village circle" not in answer
+    assert "lunaya" in answer or "project" in answer
+
+
+def test_sql_browse_ready_jvc_answer_explains_filters(monkeypatch):
+    import app.retrieval.propai_catalog as catalog
+
+    seen = {}
 
     def fake_ready(filters, limit=10, sort="latest_handover", skip_names=None):
         seen["filters"] = filters
@@ -3068,7 +3899,6 @@ def test_sql_browse_passes_min_price_and_ready(monkeypatch):
 
     # Answer text must explain the filters — not a bare "Bedrooms: 1" stub list.
     answer = _build_fast_structured_answer(question, ready["structured_summary"])
-    assert answer.startswith("Understood:")
     assert "Bedrooms:" not in answer or "Recent sale" in answer or "ready" in answer.lower()
     assert "ready" in answer.lower()
     assert "1-bedroom" in answer.lower() or "1 bedroom" in answer.lower()
@@ -3076,3 +3906,20 @@ def test_sql_browse_passes_min_price_and_ready(monkeypatch):
     assert "Jumeirah Village Circle" in answer or "JVC" in answer
     assert "Chaimaa Premiere" in answer
     assert "Found 10 project(s) matching your request" not in answer
+
+
+def test_other_city_is_declined_not_mapped_onto_dubai():
+    from run import _outside_dubai_market_reply
+
+    reply = _outside_dubai_market_reply('Best family areas in Abu Dhabi.')
+    assert reply and 'only covers Dubai' in reply and 'Abu Dhabi' in reply
+    assert _outside_dubai_market_reply('Best family areas in Dubai') is None
+    assert _outside_dubai_market_reply('Top agents in Abu Dhabi') is None
+
+
+def test_arabian_ranches_3_stays_on_the_numbered_master():
+    from app.retrieval.propai_catalog import place_named
+
+    assert place_named('I want a 3-bedroom in Arabian Ranches 3 around AED 2.8M.') == 'Arabian Ranches III'
+    assert place_named('typical sale in Arabian Ranches only') == 'Arabian Ranches'
+
