@@ -75,12 +75,16 @@ _SHORTLIST = re.compile(
     r"which (?:one |of these |of those )?(?:is|are) (?:the )?(?:best|better)|"
     r"which (?:project|property) is (?:the )?(?:best|better)|"
     r"tell(?: me)? which (?:project|property|one) is (?:the )?(?:best|better)|"
+    r"tell(?: me)? (?:the )?best|"
+    r"compar(?:e|ison|ing).{0,60}(?:best|better|all|these|those|them)|"
+    r"compare (?:all|these|those|them)\b|"
     r"which of these|"
     r"which one|"
     r"what do you think|"
-    r"why (?:these|those|this|them)|"
+    # Deixis about the on-screen set (allow a few words between, e.g. why are these … good)
+    r"why .{0,40}(?:these|those|this|them)|"
     r"is (?:that|this|it) good|"
-    r"are (?:these|those|they) good|"
+    r"are (?:these|those|they) .{0,40}good|"
     r"explain(?:\s+more)?|"
     r"recommend (?:one|one of these|the best|among these)|"
     r"which (?:of these )?(?:should|would) i|"
@@ -101,11 +105,17 @@ _WANT_FILTER = re.compile(
     r"\b(?:i want|i need|looking for|i'?m looking)\b",
     re.I,
 )
+# Recommend-shaped home asks only — plain "show me apartments in X" stays search.
 _SHOW_HOME = re.compile(
-    r"\b(?:show|find|list|get)\s+(?:me\s+)?(?:the\s+)?(?:best\s+)?"
-    r"(?:apartments?|flats?|villas?|townhouses?)\b|"
+    r"\b(?:show|find|list|get)\s+(?:me\s+)?(?:the\s+)?best\s+"
+    r"(?:apartments?|flats?|villas?|townhouses?|homes?|propert(?:y|ies))\b|"
     r"\b(?:best\s+)?(?:apartments?|flats?|villas?|townhouses?)\s+for\s+(?:the\s+)?family\b|"
     r"\bmy budget\b.{0,60}\b(?:apartments?|flats?|villas?|homes?|family)\b",
+    re.I,
+)
+_BUY_OR_PICK = re.compile(
+    r"\b(?:buy|buying|to buy|purchase|for sale|invest|recommend|suggest|best|afford|"
+    r"enough for|should i|worth buying|family|compar(?:e|ison))\b",
     re.I,
 )
 _CASUAL_CHALLENGE = re.compile(
@@ -280,7 +290,12 @@ _PREMIUM_FOLLOW = re.compile(
 
 
 def family_area_focus(question: str | None) -> dict[str, bool]:
-    """What the family-area question actually asked for."""
+    """What the family-area question actually asked for.
+
+    Kids / avoid-towers signals prefer low-rise villa communities (industry pattern:
+    family guides rank villa stock + schools/parks — we use villa share from sales
+    as the measurable proxy in Prop-AI).
+    """
     text = question or ""
     avoid_towers = bool(_FAMILY_AVOID_TOWERS.search(text))
     want_villas = bool(_FAMILY_VILLAS.search(text))
@@ -288,10 +303,40 @@ def family_area_focus(question: str | None) -> dict[str, bool]:
     return {
         "kids": kids,
         "avoid_towers": avoid_towers,
-        "want_villas": want_villas or avoid_towers,
+        # Kids ⇒ low-rise preference even without the word "villa".
+        "want_villas": want_villas or avoid_towers or kids,
         "not_studios": bool(_FAMILY_NOT_STUDIOS.search(text)),
         "want_3bed": bool(_FAMILY_3BED.search(text)),
     }
+
+
+def merge_family_area_focus(
+    question: str | None,
+    route: dict | None = None,
+) -> dict[str, bool]:
+    """Union focus from the current ask, route, and prior source question.
+
+    Current-message flags always win when set — so a kids/towers follow-up
+    after a general family ask re-ranks instead of repeating the same list.
+    """
+    route = route or {}
+    parsed = family_area_focus(question)
+    prior = family_area_focus(route.get("source_question"))
+    carried = route.get("focus") if isinstance(route.get("focus"), dict) else {}
+    keys = ("kids", "avoid_towers", "want_villas", "not_studios", "want_3bed")
+    focus = {
+        key: bool(parsed.get(key) or carried.get(key) or prior.get(key))
+        for key in keys
+    }
+    # Current ask can upgrade to avoid_towers without waiting for prior.
+    if parsed.get("avoid_towers") or parsed.get("kids"):
+        focus["want_villas"] = True
+    if parsed.get("avoid_towers"):
+        focus["avoid_towers"] = True
+    focus["no_yield"] = bool(
+        carried.get("no_yield") or prior.get("no_yield") or _YIELD.search(question or "")
+    )
+    return focus
 
 
 def parse_budget_aed(question: str | None) -> int | None:
@@ -515,11 +560,33 @@ def extract_place(question: str | None) -> str | None:
     return known_dubai_label(text)
 
 
+_SAME_TIME = re.compile(
+    r"\b(?:at the same time|and,? only|both a .+ and|simultaneously)\b",
+    re.I,
+)
+_LARGE_BED = re.compile(r"\b([3-6]|three|four|five|six)\s*-?\s*(?:bed(?:room)?s?|br)\b", re.I)
+
+
 def is_split_constraints(question: str | None) -> bool:
+    """True when the user asks for incompatible products in one turn.
+
+    Example: studio apartment AND a 3/4-bed villa on one budget.
+    """
     text = question or ""
     studio = bool(_STUDIO.search(text))
-    other = bool(_VILLA.search(text) or _FOUR_BED.search(text))
-    return studio and other
+    other = bool(
+        _VILLA.search(text)
+        or _FOUR_BED.search(text)
+        or _LARGE_BED.search(text)
+    )
+    if studio and other:
+        return True
+    # Explicit conflict wording with two bedroom sizes.
+    if studio and _SAME_TIME.search(text) and parse_bedrooms(text):
+        beds = parse_bedrooms(text)
+        if any(b >= 3 for b in beds):
+            return True
+    return False
 
 
 def _on_screen(conversation_memory) -> bool:
@@ -865,8 +932,48 @@ def is_incomplete_home_browse(question: str | None) -> bool:
     return True
 
 
+def goal_for_route(route: dict[str, Any] | None) -> str | None:
+    """Map a recommend route kind onto dialogue_state.goal (Phase 3/4)."""
+    if not isinstance(route, dict) or route.get("intent") != "recommend":
+        return None
+    kind = route.get("kind")
+    if kind == "family_areas":
+        return "family"
+    if kind == "afford":
+        return "afford"
+    if kind == "open_best":
+        return "open_buy"
+    if kind == "ready_offplan":
+        return "ready"
+    if kind in {"cheapest", "filtered", "split"}:
+        if route.get("household") or (route.get("focus") or {}).get("want_villas"):
+            return "family"
+        if route.get("budget_aed"):
+            return "budget"
+        # Place-scoped "best in Marina" is local ranking, not citywide open_buy.
+        subject = str(route.get("subject") or "").strip().lower()
+        if subject and subject not in {"", "dubai", "on_screen"}:
+            return "invest"
+        return "open_buy"
+    if kind == "yield_areas":
+        return "invest"
+    if kind == "shortlist":
+        return "compare"
+    return None
+
+
+def is_recommend_intent(question: str | None, conversation_memory=None) -> bool:
+    """True when this turn should rank a pick (not plain search/browse)."""
+    return classify_intent(question, conversation_memory).get("intent") == "recommend"
+
+
 def classify_intent(question: str | None, conversation_memory=None) -> dict[str, Any]:
-    """Return intent, optional kind, and subject. No database calls."""
+    """Return intent, optional kind, and subject. No database calls.
+
+    Phase 3 split:
+    - search / browse / count / sales → intent neither (facts list, no Acot Recommend)
+    - buy / best / family / afford / compare → intent recommend (rank + Why)
+    """
     text = question or ""
     continued = _continue_last_recommend(text, conversation_memory)
     if continued is not None:
@@ -922,6 +1029,14 @@ def classify_intent(question: str | None, conversation_memory=None) -> dict[str,
             "bedrooms": named_beds[0] if named_beds else 1,
         }
     whole_market = (place or "").lower() in {"", "dubai"}
+    # On-screen referential follow-ups ("why are these good…") beat place-inheritance
+    # re-search. Gated by cards on screen + existing shortlist deixis, not new sentences.
+    if _on_screen(conversation_memory) and _SHORTLIST.search(text):
+        return {
+            "intent": "recommend",
+            "kind": "shortlist",
+            "subject": "on_screen",
+        }
     if whole_market and _FAMILY.search(text) and _FAMILY_AREAS.search(text):
         focus = family_area_focus(text)
         focus["no_yield"] = bool(_YIELD.search(text))
@@ -935,6 +1050,7 @@ def classify_intent(question: str | None, conversation_memory=None) -> dict[str,
         _FAMILY.search(text)
         and not _FAMILY_AREAS.search(text)
         and re.search(r"\b(?:project|propert(?:y|ies)|suitable|which)\b", text, re.I)
+        and not _SHORTLIST.search(text)
     ):
         prior = prior_anchor_question(conversation_memory, text)
         locked = None if whole_market else place
@@ -1017,11 +1133,18 @@ def classify_intent(question: str | None, conversation_memory=None) -> dict[str,
         }
     rental_only = bool(_RENT.search(text)) and not _BUY.search(text)
     typed_home = _ONLY_TYPE.search(text)
+    # "Only villas under 4M" / typed refine with buy-or-pick signal → recommend.
+    # Plain "show me villas in Bay" stays search (facts list).
     if (
         not rental_only
         and typed_home
         and place
         and not whole_market
+        and (
+            _BUY_OR_PICK.search(text)
+            or parse_budget_aed(text)
+            or bool(_ONLY_TYPE.search(text))
+        )
     ):
         ptype = _property_type_from_text(text)
         people = household_size(text)
@@ -1097,7 +1220,15 @@ def classify_intent(question: str | None, conversation_memory=None) -> dict[str,
     if followed:
         return followed
     ptype = _property_type_from_text(text)
-    if not rental_only and ptype in {"villa", "townhouse"}:
+    # Citywide villa/townhouse without a pick signal is still a recommend shortlist;
+    # place-scoped "show me villas in X" without buy/best/budget stays search.
+    if not rental_only and ptype in {"villa", "townhouse"} and (
+        whole_market
+        or _BUY_OR_PICK.search(text)
+        or parse_budget_aed(text)
+        or household_size(text)
+        or bool(_ONLY_TYPE.search(text))
+    ):
         people = household_size(text)
         route = {
             "intent": "recommend",

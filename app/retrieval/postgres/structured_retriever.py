@@ -15,9 +15,8 @@ class StructuredRetriever:
     Structured retrieval directly from PostgreSQL.
 
     Tables used:
-        - communities
-        - propai_projects
-        - sub_communities
+        - propai_projects / propai_places (Prop-AI only)
+        - old communities / sub_communities / listings are not queried
     """
 
     def __init__(self):
@@ -269,25 +268,35 @@ class StructuredRetriever:
         self,
         community_name: str
     ):
-        """
-        Retrieve exact community information.
-        """
+        """Prop-AI place lookup — never the retired `communities` table."""
 
         if not community_name:
             return []
 
         query = community_name.strip()
-
-        return fetch(
-            """
-            select id, slug, name, city, latitude, longitude, photos,
-                   sell_properties_count, rent_properties_count, projects_count,
-                   pool_projects_count, total_count, assigned_agents, knowledge_text,
-                   source, fetched_at, updated_at
-            from communities where name ilike %s limit 5
-            """,
-            (query,),
-        )
+        try:
+            rows = fetch(
+                """
+                select label as name, level, sales_count, key
+                from propai_places
+                where label ilike %s
+                order by sales_count desc nulls last
+                limit 5
+                """,
+                (query,),
+            )
+        except Exception:
+            return []
+        return [
+            {
+                "name": row.get("name"),
+                "level": row.get("level"),
+                "sales_count": row.get("sales_count"),
+                "key": row.get("key"),
+                "source": "propai",
+            }
+            for row in (rows or [])
+        ]
 
     # =========================================================
     # SUB-COMMUNITIES
@@ -298,23 +307,10 @@ class StructuredRetriever:
         community_name: str,
         limit: int = 20
     ):
-        """
-        Retrieve sub-communities belonging to a community.
-        """
+        """Retired old `sub_communities` table — return empty (Prop-AI has no equivalent)."""
 
-        if not community_name:
-            return []
-
-        query = community_name.strip()
-
-        return fetch(
-            """
-            select id, slug, name, city, community, community_slug, latitude, longitude,
-                   photos, knowledge_text, source, fetched_at, updated_at
-            from sub_communities where community ilike %s limit %s
-            """,
-            (query, limit),
-        )
+        _ = community_name, limit
+        return []
 
     # =========================================================
     # GENERAL STRUCTURED RETRIEVAL

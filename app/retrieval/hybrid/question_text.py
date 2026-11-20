@@ -106,6 +106,13 @@ _DOMAIN_WORDS = (
     "villa", "villas", "handover", "listing", "listings",
     "agent", "agents", "broker", "brokers",
     "transaction", "transactions",
+    # Freshness / list wording — never rewrite "latest" → "lowest" (edit distance 2).
+    "latest", "recent", "newest", "details",
+    # Lifestyle wording — never rewrite "living" → "listing" (edit distance 2).
+    "living", "live", "lifestyle",
+    # Superlatives — "chepest" / "lowset" must become cheapest / lowest.
+    "cheapest", "lowest", "highest", "average", "median",
+    "expensive", "priciest", "minimum", "maximum",
 )
 
 _GENERIC_WORDS = {
@@ -196,6 +203,9 @@ def _correct_domain_word(token: str) -> str:
     if lowered in _DOMAIN_WORDS or len(lowered) < 5:
         return token
     if any(ch.isdigit() for ch in lowered):
+        return token
+    # Proper nouns (Hanover Square) must not become domain words (handover).
+    if len(core) >= 2 and core[0].isupper() and core[1:].islower():
         return token
     if lowered in _locked_place_words():
         return token
@@ -340,6 +350,26 @@ def bedroom_rental_pair(question: str):
     return left, right, place
 
 
+def _looks_like_project_compare_name(value: str) -> bool:
+    """True for a project-like label, not beds/budget/browse fragments."""
+    text = (value or "").strip()
+    if len(text) < 3 or len(text) > 80:
+        return False
+    if re.search(
+        r"\b(?:bed(?:room)?s?|studio|apartment|villa|townhouse|budget|aed|"
+        r"million|rentals?|listings?|projects?|agents?|brokers?|sales?|"
+        r"transactions?|family|invest|dubai)\b",
+        text,
+        re.I,
+    ):
+        return False
+    if re.fullmatch(r"\d+(?:\.\d+)?", text):
+        return False
+    # Prefer multi-token or Camel/Title-ish names (Serenz, Aura Heights, AC3).
+    tokens = re.findall(r"[A-Za-z0-9]+", text)
+    return bool(tokens) and (len(tokens) >= 2 or (tokens[0][:1].isupper() if tokens[0] else False))
+
+
 def comparison_pair(question: str):
     """Return the two names in a comparison, without the trailing request."""
 
@@ -355,6 +385,15 @@ def comparison_pair(question: str):
         match = re.search(pattern, text, flags=re.IGNORECASE)
         if match:
             break
+    # Bare "Serenz by Danube and Aura Heights" after a compare clarify retry.
+    if not match and not re.search(
+        r"\b(?:show|find|list|how many|agents?|brokers?|sales?|transactions?)\b",
+        text,
+        re.I,
+    ):
+        bare = re.match(r"^(.+?)\s+and\s+(.+)$", text, flags=re.IGNORECASE)
+        if bare:
+            match = bare
     if not match:
         return None
 
@@ -362,6 +401,13 @@ def comparison_pair(question: str):
     right = _clean_compare_name(match.group(2))
     if not left or not right or left.lower() == right.lower():
         return None
+    # Bare "A and B" must look like two project names, not "2 and 3 bedrooms".
+    if not re.search(r"\b(?:compare|vs\.?|versus)\b", text, re.I):
+        if not (
+            _looks_like_project_compare_name(left)
+            and _looks_like_project_compare_name(right)
+        ):
+            return None
     return left, right
 
 
