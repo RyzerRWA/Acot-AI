@@ -1,3 +1,5 @@
+note: dont create new errors and issues while solving the problem error and issue
+
 12. New Prop-AI data
 
 # Areas with the most recorded sales

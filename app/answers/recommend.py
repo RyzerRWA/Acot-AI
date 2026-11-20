@@ -1009,7 +1009,7 @@ def rank_projects(
         alts = [item for item in items if item is not best][:3]
     if alts:
         notes.append(
-            "Also strong: "
+            "Also worth reviewing: "
             + ", ".join(item["name"] for item in alts)
             + "."
         )
@@ -1040,17 +1040,51 @@ def rank_projects(
     }
 
 
-def _detail_why(item: dict | None, factors: list[str]) -> list[str]:
-    """Concrete, positive why lines using the winning project's numbers."""
+def _detail_why(
+    item: dict | None,
+    factors: list[str],
+    *,
+    alternatives: list[dict] | None = None,
+) -> list[str]:
+    """Concrete, comparative why lines using the winner vs the next option."""
     item = item or {}
+    alt = None
+    for candidate in alternatives or []:
+        if isinstance(candidate, dict) and candidate.get("name"):
+            # Prefer a full ranked row with numbers when available.
+            if any(
+                candidate.get(key) is not None
+                for key in ("price", "size", "beds", "sales_count", "rent_count", "handover")
+            ):
+                alt = candidate
+                break
+            alt = alt or candidate
     lines = []
     for factor in factors[:5]:
         if factor == "budget fit" and item.get("price"):
-            lines.append(f"Close to your budget at AED {int(item['price']):,}")
+            if alt and alt.get("price") is not None:
+                lines.append(
+                    f"Closer budget fit at AED {int(item['price']):,} vs "
+                    f"{alt['name']} at AED {int(alt['price']):,}"
+                )
+            else:
+                lines.append(f"Close to your budget at AED {int(item['price']):,}")
         elif factor == "lower price" and item.get("price"):
-            lines.append(f"Attractive recent price at AED {int(item['price']):,}")
+            if alt and alt.get("price") is not None:
+                lines.append(
+                    f"Lower recorded price at AED {int(item['price']):,} than "
+                    f"{alt['name']} at AED {int(alt['price']):,}"
+                )
+            else:
+                lines.append(f"Attractive recent price at AED {int(item['price']):,}")
         elif factor == "more space" and item.get("size"):
-            lines.append(f"Larger recorded size around {int(item['size']):,} sqft")
+            if alt and alt.get("size"):
+                lines.append(
+                    f"Larger recorded size around {int(item['size']):,} sqft vs "
+                    f"{int(alt['size']):,} sqft for {alt['name']}"
+                )
+            else:
+                lines.append(f"Larger recorded size around {int(item['size']):,} sqft")
         elif factor in {"more bedrooms", "bedroom fit"}:
             wanted = item.get("wanted_beds")
             if wanted == 0:
@@ -1060,25 +1094,56 @@ def _detail_why(item: dict | None, factors: list[str]) -> list[str]:
             elif wanted:
                 lines.append(f"Fits the {int(wanted)}-bedroom request")
             elif item.get("beds") is not None:
-                lines.append(f"Bedroom range includes {item['beds']:g} bedrooms")
+                if alt and alt.get("beds") is not None:
+                    lines.append(
+                        f"Bedroom range includes {item['beds']:g} bedrooms vs "
+                        f"{alt['beds']:g} for {alt['name']}"
+                    )
+                else:
+                    lines.append(f"Bedroom range includes {item['beds']:g} bedrooms")
             else:
                 lines.append(_why_line(factor))
         elif factor == "earlier handover" and item.get("handover") and _is_future_stamp(item.get("handover")):
             stamp = _month_year(item["handover"]) or "an earlier date"
-            lines.append(f"Earlier handover timing ({stamp})")
+            if alt and alt.get("handover") and _is_future_stamp(alt.get("handover")):
+                other = _month_year(alt["handover"]) or "a later date"
+                lines.append(
+                    f"Earlier handover ({stamp}) than {alt['name']} ({other})"
+                )
+            else:
+                lines.append(f"Earlier handover timing ({stamp})")
         elif factor == "latest recorded sale" and item.get("last_sale"):
             stamp = _month_year(item["last_sale"]) or "this year"
-            lines.append(f"Latest recorded sale {stamp}")
+            if alt and alt.get("last_sale"):
+                other = _month_year(alt["last_sale"]) or "an earlier sale"
+                lines.append(
+                    f"Latest recorded sale {stamp} vs {other} for {alt['name']}"
+                )
+            else:
+                lines.append(f"Latest recorded sale {stamp}")
         elif factor == "more recent sales activity" and item.get("sales_count"):
-            lines.append(
-                f"Strong sales and transaction activity ({int(item['sales_count'])} recent sales)"
-            )
+            if alt and alt.get("sales_count") is not None:
+                lines.append(
+                    f"Stronger recent sales activity ({int(item['sales_count'])} sales) "
+                    f"than {alt['name']} ({int(alt['sales_count'])} sales)"
+                )
+            else:
+                lines.append(
+                    f"Strong sales and transaction activity "
+                    f"({int(item['sales_count'])} recent sales)"
+                )
         elif factor == "active rental market" and item.get("rent_count"):
-            lines.append(
-                f"Active rental market ({int(item['rent_count'])} rental contracts)"
-            )
+            if alt and alt.get("rent_count") is not None:
+                lines.append(
+                    f"More active rental market ({int(item['rent_count'])} contracts) "
+                    f"than {alt['name']} ({int(alt['rent_count'])} contracts)"
+                )
+            else:
+                lines.append(
+                    f"Active rental market ({int(item['rent_count'])} rental contracts)"
+                )
         elif factor == "readiness":
-            lines.append("Strong readiness / availability status")
+            lines.append("Strong readiness / availability status on recorded project data")
         else:
             lines.append(_why_line(factor))
     return lines
@@ -1092,6 +1157,7 @@ def format_footer(result: dict, *, intro: str | None = None) -> str:
         lines.append("")
     rec = result.get("recommendation") or {}
     winner = result.get("winner")
+    ranked = result.get("ranked") or []
     if rec.get("tied"):
         names = " and ".join(rec["tied"][:2])
         lines.append(f"**Acot Recommend:** {names}")
@@ -1121,13 +1187,27 @@ def format_footer(result: dict, *, intro: str | None = None) -> str:
         lines.append("- Each option brings useful price, size or market activity signals.")
         return "\n".join(lines)
 
+    # Prefer full ranked rows for vs-alternative facts (stubs only have name/id).
+    alt_rows = [
+        row for row in ranked
+        if isinstance(row, dict)
+        and row.get("name")
+        and str(row.get("name")) != str(name)
+    ]
+    if not alt_rows:
+        alt_rows = list(rec.get("alternatives") or [])
+
     lines.append(f"**Acot Recommend:** {name}")
     lines.append("**Why this is the strongest match:**" if result.get("can_rank") else "**Why:**")
     why = rec.get("why") or result.get("why") or []
-    for item in _detail_why(winner, why):
+    detail = _detail_why(winner, why, alternatives=alt_rows)
+    for item in detail:
         lines.append(f"- {item}")
+    # Skip weak "Limited data: ranked on …" when concrete fact lines already explain.
     for note in rec.get("notes") or result.get("notes") or []:
         lower = str(note).lower()
+        if lower.startswith("limited") and detail:
+            continue
         if lower.startswith("limited"):
             lines.append(f"- {note}")
     alts = rec.get("alternatives") or []
@@ -1136,7 +1216,7 @@ def format_footer(result: dict, *, intro: str | None = None) -> str:
             str(alt.get("name") or "") for alt in alts[:3] if alt.get("name")
         )
         if alt_names:
-            lines.append(f"- Also strong: {alt_names}.")
+            lines.append(f"- Also worth reviewing: {alt_names}.")
     return "\n".join(lines)
 
 

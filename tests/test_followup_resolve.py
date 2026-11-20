@@ -75,6 +75,83 @@ def test_full_new_browse_is_not_a_followup():
     assert resolution is None or resolution.get("kind") == "new"
 
 
+def test_top_agents_after_project_browse_is_not_a_followup():
+    """Regression: agents chip must not re-list '200 projects in JVC'."""
+    state = {
+        "action": "search",
+        "place": "Jumeirah Village Circle",
+        "source_question": "show me projects in JVC",
+    }
+
+    async def _run():
+        return await resolve_followup(
+            "Tell me the top agents for Jumeirah Village Circle (JVC)",
+            state,
+            llm_generate=None,
+        )
+
+    resolution = asyncio.run(_run())
+    assert resolution is None or resolution.get("kind") == "new"
+
+
+def test_transaction_chip_after_search_is_not_a_followup():
+    state = {
+        "action": "search",
+        "place": "Motor City",
+        "source_question": "show me projects in Motor City",
+    }
+
+    async def _run():
+        return await resolve_followup(
+            "Show me the recent transaction details",
+            state,
+            llm_generate=None,
+        )
+
+    resolution = asyncio.run(_run())
+    assert resolution is None or resolution.get("kind") == "new"
+
+
+def test_short_place_tweak_still_continues_search():
+    """'what about Marina?' after a browse may patch place — not a full new task."""
+    state = {
+        "action": "search",
+        "place": "Jumeirah Village Circle",
+        "source_question": "show me projects in JVC",
+    }
+
+    async def _run():
+        return await resolve_followup(
+            "what about Dubai Marina",
+            state,
+            llm_generate=None,
+        )
+
+    resolution = asyncio.run(_run())
+    assert resolution is not None
+    assert resolution.get("kind") == "continue"
+    assert resolution.get("patch", {}).get("place")
+
+
+def test_ack_only_does_not_continue_recommend():
+    state = {
+        "action": "recommend",
+        "place": "Dubai Marina",
+        "goal": "family",
+        "kind": "filtered",
+    }
+
+    async def _run():
+        return await resolve_followup(
+            "Ok that's cool",
+            state,
+            llm_generate=None,
+        )
+
+    resolution = asyncio.run(_run())
+    assert resolution is None or resolution.get("kind") == "new"
+
+
 def test_family_kids_refinement_is_not_a_continue():
     state = {
         "action": "recommend",

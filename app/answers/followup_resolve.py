@@ -40,12 +40,38 @@ _EXPLAIN_HINT = re.compile(
 _NEW_TASK = re.compile(
     r"\b(?:show|find|list)\s+(?:me\s+)?(?:projects?|propert(?:y|ies)|apartments?|"
     r"villas?|townhouses?|agents?|brokers?)\b|"
+    # Chips / natural agents asks must not patch a prior search into projects.
+    r"\b(?:top|best|tell\s+me(?:\s+the)?)\s+(?:agents?|brokers?)\b|"
+    r"\b(?:agents?|brokers?)\s+for\b|"
     r"\bhow many\b|\bwho are\b|\bcompare\b|"
     r"\brecent\s+(?:sales?|transactions?)\b|"
     # Price extremes are a new ask; sales-thread context decides sales_stat.
     r"\b(?:cheapest|lowest|highest|most\s+expensive|average|median|"
     r"least\s+expensive|priciest)\b|"
-    r"\bwhich\s+one\b",
+    r"\bwhich\s+one\b|"
+    # On-screen pick/best after cards — never sticky-rerun the prior afford/search.
+    r"\btell(?:\s+me)?(?:\s+the)?\s+best\b|"
+    r"\b(?:which|what).{0,40}\b(?:best|better|pick|choose)\b",
+    re.I,
+)
+_AGENTS_ASK = re.compile(r"\b(?:agents?|brokers?)\b", re.I)
+# Stand-alone buy/need/want sentences carry their own intent and slots.
+_FRESH_INTENT = re.compile(
+    r"\b(?:i\s+(?:need|want|would\s+like)|i['’]?m\s+looking|i\s+am\s+looking|"
+    r"looking\s+for|(?:to|want\s+to|need\s+to)\s+buy|"
+    r"(?:few|some|a\s+few)\s+propert(?:y|ies))\b",
+    re.I,
+)
+_SALES_OR_TX_ASK = re.compile(
+    r"\b(?:transactions?|transcations?|sale history|sales history|"
+    r"(?:recent|latest|last|newest)\s+sales?|"
+    r"sales?\s+(?:in|of|for|details?|history)|"
+    r"\bsold\b)\b",
+    re.I,
+)
+_RECOMMEND_ASK = re.compile(
+    r"\b(?:where should i buy|best (?:areas?|communities)|"
+    r"for (?:a )?famil(?:y|ies)|recommend|invest(?:ment)?)\b",
     re.I,
 )
 # Catalog freshness / max sale date — never sticky-explain a prior recommend.
@@ -68,12 +94,47 @@ _DATA_FRESHNESS_ASK = re.compile(
 )
 
 
-def _is_attribute_about_shown(question: str | None) -> bool:
-    """Developer/price/handover of 'these' is a new ask, not a sales_list continue."""
+def _is_attribute_about_shown(question: str | None, state: dict[str, Any] | None = None) -> bool:
+    """Developer/price/handover of the shortlist is a new ask, not a search continue."""
     try:
+        from app.answers.intent_route import parse_bedrooms, parse_budget_aed
+        from app.answers.turn_resolve import _is_shown_attribute_ask
         from app.retrieval.hybrid.question_text import is_group_attribute_question
 
-        return bool(is_group_attribute_question(question or ""))
+        text = question or ""
+        if is_group_attribute_question(text):
+            return True
+        # Without memory here, still treat clear attribute phrasing as new when a
+        # browse/recommend/search task is active (chips after project cards).
+        if str((state or {}).get("action") or "") in {
+            "search", "recommend", "sales_list", "sales_count",
+        }:
+            from app.retrieval.hybrid.question_text import is_attribute_phrase
+
+            if is_attribute_phrase(text) and not re.search(
+                r"\b(?:show|find|list)\s+(?:me\s+)?(?:projects?|apartments?)\b",
+                text,
+                re.I,
+            ):
+                # "same … 2 bedrooms" / budget tweaks are slot continues, not
+                # developer/price/handover attribute chips about the cards.
+                beds_only = bool(parse_bedrooms(text)) and not re.search(
+                    r"\b(?:developer|handover|price|prices|amenities|size|status)\b",
+                    text,
+                    re.I,
+                )
+                budget_only = (
+                    parse_budget_aed(text) is not None
+                    and not re.search(
+                        r"\b(?:developer|handover|amenities|size|status)\b",
+                        text,
+                        re.I,
+                    )
+                )
+                if beds_only or budget_only:
+                    return False
+                return True
+        return bool(_is_shown_attribute_ask(text, None))
     except Exception:
         return False
 
@@ -187,6 +248,54 @@ def _offline_resolve(question: str, state: dict[str, Any]) -> dict[str, Any]:
     split_path = _split_path_followup(text, state)
     if split_path is not None:
         return split_path
+    prior_action = str(state.get("action") or "")
+    # Casual speech is never a sticky continue (ack / thanks / cool).
+    try:
+        from app.answers.turn_act import is_casual_speech
+
+        if is_casual_speech(text):
+            return {
+                "kind": "new",
+                "more": False,
+                "mode": "rerun",
+                "action": state.get("action"),
+                "patch": {},
+            }
+    except Exception:
+        pass
+    # Intent shifts must not silently continue the previous task. Follow-up chips
+    # often name a place ("top agents for JVC") which used to create a place
+    # patch and re-run search/recommend instead of the new intent.
+    if _AGENTS_ASK.search(text) and prior_action not in {"agents", ""}:
+        return {
+            "kind": "new",
+            "more": False,
+            "mode": "rerun",
+            "action": state.get("action"),
+            "patch": {},
+        }
+    if (
+        _SALES_OR_TX_ASK.search(text)
+        and prior_action not in {"sales_list", "sales_count", "sales_stat", ""}
+    ):
+        return {
+            "kind": "new",
+            "more": False,
+            "mode": "rerun",
+            "action": state.get("action"),
+            "patch": {},
+        }
+    if (
+        _RECOMMEND_ASK.search(text)
+        and prior_action not in {"recommend", ""}
+    ):
+        return {
+            "kind": "new",
+            "more": False,
+            "mode": "rerun",
+            "action": state.get("action"),
+            "patch": {},
+        }
     # "Most recent Dubai sales data?" is a catalog-freshness ask, not explain/rerun.
     if _DATA_FRESHNESS_ASK.search(text):
         return {
@@ -204,7 +313,7 @@ def _offline_resolve(question: str, state: dict[str, Any]) -> dict[str, Any]:
             "action": state.get("action"),
             "patch": {},
         }
-    if _is_attribute_about_shown(text):
+    if _is_attribute_about_shown(text, state):
         return {
             "kind": "new",
             "more": False,
@@ -259,6 +368,16 @@ def _offline_resolve(question: str, state: dict[str, Any]) -> dict[str, Any]:
         }
     patch: dict[str, Any] = {}
     place = extract_place(text)
+    # Sales asks often name short project codes ("in AC3") that extract_place misses.
+    if not place and str(state.get("action") or "") in {
+        "sales_list", "sales_count", "search",
+    }:
+        try:
+            from app.answers.turn_resolve import sales_place_from_text
+
+            place = sales_place_from_text(text)
+        except Exception:
+            place = None
     if place:
         patch["place"] = place
     beds = parse_bedrooms(text)
@@ -314,13 +433,52 @@ def _offline_resolve(question: str, state: dict[str, Any]) -> dict[str, Any]:
     if action == "project_count" and show_list:
         action = "search"
         continue_same = True
+    # Naming place/beds/budget inside a full stand-alone sentence is NOT enough
+    # to keep the prior action. Only short / deixis / "same" tweaks may patch.
+    token_count = len(re.findall(r"[a-z0-9]+", text.lower()))
+    # A full sentence with its own intent ("I need a few properties to buy in
+    # Dubai Marina, budget around 3 million") is a fresh ask — never patch the
+    # previous sales/search/clarify task just because it says "also".
+    fresh_full_ask = bool(
+        patch
+        and not more
+        and token_count >= 7
+        and _FRESH_INTENT.search(text)
+        and not re.search(r"\b(?:them|those|these|same|again|instead)\b", text, re.I)
+        and (patch.get("place") or patch.get("budget_aed") is not None or patch.get("beds"))
+    )
+    if fresh_full_ask:
+        return {
+            "kind": "new",
+            "more": False,
+            "mode": "rerun",
+            "action": state.get("action"),
+            "patch": {},
+        }
+    slot_tweak_only = bool(
+        patch
+        and (
+            continue_same
+            or sales_slot_tweak
+            or token_count <= 5
+            or bool(_REF_HINT.search(text))
+        )
+    )
+    if patch and not slot_tweak_only:
+        return {
+            "kind": "new",
+            "more": False,
+            "mode": "rerun",
+            "action": state.get("action"),
+            "patch": {},
+        }
     mode = "explain" if explain else ("page" if more else ("patch" if patch else "rerun"))
     return {
-        "kind": "continue" if continue_same or patch else "new",
+        "kind": "continue" if continue_same or slot_tweak_only else "new",
         "more": more,
         "mode": mode,
         "action": action,
-        "patch": patch,
+        "patch": patch if (continue_same or slot_tweak_only) else {},
     }
 
 
@@ -400,6 +558,12 @@ Rules:
   (do not re-run the conflict split)
 - After family_areas: a NEW ranking ask (kids, not towers, villas/3-bed stock) → kind=new
   Example: "Best communities for a family with kids, not just the busiest towers."
+- Agents/brokers asks ("top agents for JVC", "tell me the top agents for …") are kind=new
+  unless the active action is already agents. Never continue a search/recommend as project browse.
+- Transaction/sales asks after search/recommend are kind=new (not a place-patch re-browse).
+- Recommend/family/invest asks after search/agents/sales are kind=new.
+- A place/beds/budget mention alone does NOT continue the prior task when the message is a
+  full stand-alone sentence. Only short slot tweaks / deixis / "same" / "more" continue.
   Do NOT continue/rerun the previous general family list.
 - After sales_list/sales_count: any compare or price extreme about those results
   ("which one is cheapest", "lowest among these", "least I'd pay…") → kind=new

@@ -591,10 +591,105 @@ def _side_snapshot(name, records):
     }
 
 
+def _clean_check_bullet(text: str) -> str:
+    """Turn a scored-factor sentence into a Why bullet without markdown labels."""
+    clean = re.sub(r"\*\*", "", str(text or "")).strip()
+    clean = re.sub(
+        r"^(?:Price|Yearly rent|Size|Bedrooms|Handover|Readiness|"
+        r"More space|More bedrooms|More recent sales activity|"
+        r"Recorded price|Recorded size|Recorded bedrooms|"
+        r"Recorded sales activity|Lower price|Lower yearly rent)\s*:\s*",
+        "",
+        clean,
+        flags=re.I,
+    ).strip()
+    return clean.rstrip(".")
+
+
+def _pairwise_why_bullets(winner, loser, checks) -> list[str]:
+    """Fact-rich head-to-head Why lines for the pairwise recommend block."""
+    bullets = []
+    seen = set()
+    for name, _factor, text in checks:
+        if name != winner["name"]:
+            continue
+        line = _clean_check_bullet(text)
+        if not line:
+            continue
+        key = line.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        bullets.append(f"- {line}.")
+
+    joined = " ".join(bullets).lower()
+    # Extra contrast only when checks did not already cover that field.
+    if (
+        winner.get("price") is not None
+        and loser.get("price") is None
+        and "price" not in joined
+    ):
+        bullets.append(
+            f"- {winner['name']} shows a recorded price of {_format_aed(winner['price'])}, "
+            f"while {loser['name']} has no price on these records."
+        )
+    elif (
+        winner.get("price") is not None
+        and loser.get("price") is not None
+        and winner["price"] != loser["price"]
+        and "price" not in joined
+    ):
+        bullets.append(
+            f"- Recorded price {_format_aed(winner['price'])} for "
+            f"{winner['name']} vs {_format_aed(loser['price'])} for {loser['name']}."
+        )
+
+    joined = " ".join(bullets).lower()
+    if (
+        winner.get("sales_count")
+        and not loser.get("sales_count")
+        and "sales" not in joined
+    ):
+        bullets.append(
+            f"- Stronger recent sales evidence on {winner['name']} "
+            f"({int(winner['sales_count'])} recorded sales) than {loser['name']}."
+        )
+    elif (
+        winner.get("sales_count")
+        and loser.get("sales_count")
+        and winner["sales_count"] != loser["sales_count"]
+        and "sales" not in joined
+    ):
+        bullets.append(
+            f"- More recent sales on {winner['name']} "
+            f"({int(winner['sales_count'])} vs {int(loser['sales_count'])} for "
+            f"{loser['name']})."
+        )
+
+    loser_edges = [
+        _clean_check_bullet(text)
+        for name, _factor, text in checks
+        if name == loser["name"]
+    ]
+    if loser_edges:
+        edge = loser_edges[0]
+        bullets.append(
+            f"- Also worth reviewing {loser['name']}: {edge}."
+        )
+    else:
+        bullets.append(f"- Also worth reviewing: {loser['name']}.")
+    return bullets[:6]
+
+
 def _score_snapshots(left, right):
-    """Score two sides from shared fields. Higher means stronger on those fields."""
+    """Score two sides from shared fields. Higher means stronger on those fields.
+
+    A side with recorded price/beds/size/sales must not lose solely because the
+    other side only has an earlier handover (thin catalog row).
+    """
 
     checks = []
+    _MARKET_KEYS = ("price", "beds", "size", "sales_count")
 
     def _table_cell(value):
         return (
@@ -603,6 +698,9 @@ def _score_snapshots(left, right):
             .replace("|", "\\|")
             .replace("\n", " ")
         )
+
+    def _coverage(side):
+        return sum(1 for key in _MARKET_KEYS if side.get(key) is not None)
 
     rent_frequency = left.get("frequency")
     if rent_frequency == right.get("frequency") and rent_frequency:
@@ -649,8 +747,38 @@ def _score_snapshots(left, right):
             ),
         ))
 
+    def prefer_present(key, factor, formatter, noun):
+        """Credit the side that has a recorded value when the other does not."""
+        left_value = left.get(key)
+        right_value = right.get(key)
+        if (left_value is None) == (right_value is None):
+            return
+        present = left if left_value is not None else right
+        missing = right if present is left else left
+        value = present.get(key)
+        checks.append((
+            present["name"],
+            factor,
+            (
+                f"{present['name']} has a recorded {noun} ({formatter(value)}), "
+                f"while {missing['name']} does not on these records."
+            ),
+        ))
+
     prefer_low("price", price_factor, lambda value: _format_aed(value) or str(value))
+    prefer_present(
+        "price",
+        "recorded price",
+        lambda value: _format_aed(value) or str(value),
+        "price",
+    )
     prefer_high("size", "more space", lambda value: f"{int(value):,} sqft")
+    prefer_present(
+        "size",
+        "recorded size",
+        lambda value: f"{int(value):,} sqft",
+        "size",
+    )
 
     def _bedroom_text(value):
         if value == 0:
@@ -660,10 +788,17 @@ def _score_snapshots(left, right):
         return f"{value:g} bedrooms"
 
     prefer_high("beds", "more bedrooms", _bedroom_text)
+    prefer_present("beds", "recorded bedrooms", _bedroom_text, "bedroom count")
     prefer_high(
         "sales_count",
         "more recent sales activity",
         lambda value: f"{int(value):,} sales",
+    )
+    prefer_present(
+        "sales_count",
+        "recorded sales activity",
+        lambda value: f"{int(value):,} sales",
+        "sales activity",
     )
     left_handover = left.get("handover")
     right_handover = right.get("handover")
@@ -699,6 +834,28 @@ def _score_snapshots(left, right):
     right["score"] = right_score
     winner = left if left_score >= right_score else right
     loser = right if winner is left else left
+    # Handover-only wins must not crown a thin catalog row over a fuller record.
+    winner_factors = [factor for name, factor, _text in checks if name == winner["name"]]
+    if (
+        winner_factors
+        and set(winner_factors) <= {"earlier handover"}
+        and _coverage(loser) > _coverage(winner)
+    ):
+        checks[:] = [
+            item for item in checks
+            if item[1] != "earlier handover"
+        ]
+        left_wins = sum(1 for name, _factor, _text in checks if name == left["name"])
+        right_wins = len(checks) - left_wins
+        if not checks or left_wins == right_wins:
+            left_score = right_score = 50
+        else:
+            left_score = round(40 + 60 * left_wins / len(checks))
+            right_score = round(40 + 60 * right_wins / len(checks))
+        left["score"] = left_score
+        right["score"] = right_score
+        winner = left if left_score >= right_score else right
+        loser = right if winner is left else left
     table_rows = [
         f"| Factor | {_table_cell(left['name'])} | {_table_cell(right['name'])} |",
         "| --- | --- | --- |",
@@ -750,37 +907,53 @@ def _score_snapshots(left, right):
         recommendation = (
             f"**Acot Recommend:** {left['name']} and {right['name']}\n"
             "**Why:**\n"
-            "- Each brings helpful recorded details to compare next.\n"
-            "- A good next step is to match them to your preferred layout and community feel."
+            "- Recorded price, size, bedroom and handover details are still light "
+            "for a firm pick.\n"
+            "- Match them next to the layout, community and budget you care about most."
         )
     elif left_score == right_score:
-        left_advantages = ", ".join(factor_wins[left["name"]])
-        right_advantages = ", ".join(factor_wins[right["name"]])
+        left_bullets = _pairwise_why_bullets(left, right, checks)
+        right_bullets = _pairwise_why_bullets(right, left, checks)
+        # Drop the mutual "also worth reviewing" tails for a balanced block.
+        left_core = [line for line in left_bullets if "also worth reviewing" not in line.lower()]
+        right_core = [line for line in right_bullets if "also worth reviewing" not in line.lower()]
+        left_advantages = ", ".join(factor_wins[left["name"]]) or "balanced factors"
+        right_advantages = ", ".join(factor_wins[right["name"]]) or "balanced factors"
         conclusion = (
             f"Conclusion: The comparison is balanced. {left['name']} leads on "
             f"{left_advantages}, while {right['name']} leads on {right_advantages}."
         )
+        why_parts = left_core[:2] + right_core[:2]
+        if not why_parts:
+            why_parts = [
+                f"- {left['name']} and {right['name']} split the recorded factors evenly."
+            ]
+        why_parts.append(
+            "- Pick the one that matches the lifestyle factor you value most."
+        )
         recommendation = (
             f"**Acot Recommend:** {left['name']} and {right['name']}\n"
             f"**Why:**\n"
-            f"- {left['name']} stands out for {left_advantages}.\n"
-            f"- {right['name']} stands out for {right_advantages}.\n"
-            f"- Pick the one that matches the lifestyle factor you value most."
+            + "\n".join(why_parts)
         )
     else:
-        winning_factors = ", ".join(factor_wins[winner["name"]])
+        winning_factors = ", ".join(factor_wins[winner["name"]]) or "recorded factors"
         conclusion = (
             f"Conclusion: {winner['name']} leads on the recorded factors "
             f"({winning_factors})."
         )
-        why_lines = "\n".join(
-            f"- Stands out for {factor}" for factor in factor_wins[winner["name"]]
-        )
+        why_lines = _pairwise_why_bullets(winner, loser, checks)
         recommendation = (
             f"**Acot Recommend:** {winner['name']}\n"
             f"**Why this is the strongest match:**\n"
-            f"{why_lines or '- Strong balance across the recorded comparison factors.'}\n"
-            f"- Also worth reviewing: {loser['name']}."
+            + "\n".join(
+                why_lines
+                or [
+                    f"- Stronger balance of recorded price, size, bedrooms and market "
+                    f"activity than {loser['name']}.",
+                    f"- Also worth reviewing: {loser['name']}.",
+                ]
+            )
         )
 
     return f"{intro}\n\n{table}\n\n{conclusion}\n{recommendation}"

@@ -458,6 +458,16 @@ def place_named(text: str) -> str | None:
     lowered = (text or "").lower()
     for label in _PLACE_LABELS:
         if re.search(rf"(?<![a-z0-9]){re.escape(label)}(?![a-z0-9])", lowered):
+            # "Arabian Ranches 3" is the numbered master (stored as ... III), not the original.
+            numbered = re.search(
+                rf"(?<![a-z0-9]){re.escape(label)}[\s-]*([23])\b"
+                r"(?!\s*-?\s*(?:bed|br|bhk|million|m\b|k\b|,\d))",
+                lowered,
+            )
+            if numbered:
+                sibling = f"{label} {'ii' if numbered.group(1) == '2' else 'iii'}"
+                if sibling in _PLACE_LABELS:
+                    return sibling.title().replace(" Iii", " III").replace(" Ii", " II")
             return ALIASES.get(label) or label.title()
     return None
 
@@ -864,9 +874,20 @@ def recent_sales(name, limit: int = 8, per_project: int = 5, offset: int = 0) ->
     projects = []
     for item in raw:
         text = " ".join(str(item or "").split())
-        if len(text) >= 3 and text.upper() not in projects:
-            projects.append(text.upper())
-        if len(projects) >= limit:
+        if len(text) < 3:
+            continue
+        for key in (text,):
+            upper = key.upper()
+            if upper not in projects:
+                projects.append(upper)
+        # Catalog titles like "The Woods at Sobha Sanctuary" are stored as
+        # short sale names ("THE WOODS") under the same master.
+        row = _exact_project_row(text)
+        if row:
+            short = _short_project_sale_alias(row.get("name"))
+            if short and short.upper() not in projects:
+                projects.append(short.upper())
+        if len(projects) >= max(limit * 2, 8):
             break
     if not projects:
         return {"count": 0, "sales": []}
@@ -912,6 +933,72 @@ def recent_sales(name, limit: int = 8, per_project: int = 5, offset: int = 0) ->
     return {"count": len(sales), "sales": sales}
 
 
+def _exact_project_row(place: str | None) -> dict | None:
+    """Catalog project row when `place` matches one Prop-AI project name."""
+    text = str(place or "").strip()
+    if len(text) < 2:
+        return None
+    try:
+        rows = fetch(
+            """
+            select name, master_project
+            from propai_projects
+            where coalesce(name, '') <> ''
+              and upper(btrim(name)) = upper(btrim(%s))
+            limit 1
+            """,
+            (text,),
+        )
+    except Exception:
+        return None
+    if rows and rows[0].get("name"):
+        return {
+            "name": str(rows[0]["name"]).strip(),
+            "master_project": (
+                str(rows[0].get("master_project") or "").strip() or None
+            ),
+        }
+    return None
+
+
+def _exact_project_label(place: str | None) -> str | None:
+    """Canonical project name when `place` is exactly one Prop-AI project (e.g. AC3)."""
+    row = _exact_project_row(place)
+    return row["name"] if row else None
+
+
+def _short_project_sale_alias(name: str | None) -> str | None:
+    """'The Woods at Sobha Sanctuary' → 'The Woods' (sale-table short title)."""
+    text = str(name or "").strip()
+    lowered = text.lower()
+    for sep in (" at ", " by ", " - ", " – "):
+        idx = lowered.find(sep)
+        if idx >= 3:
+            short = text[:idx].strip()
+            if len(short) >= 3:
+                return short
+    return None
+
+
+def _named_project_sales_clause(project_row: dict) -> tuple[str, list]:
+    """Match catalog project sales, including short sale-table aliases + master."""
+    name = str(project_row.get("name") or "").strip()
+    master = str(project_row.get("master_project") or "").strip()
+    short = _short_project_sale_alias(name)
+    if short and master and short.lower() != name.lower():
+        return (
+            "("
+            "upper(btrim(project_name_prop_ai)) = upper(btrim(%s))"
+            " or ("
+            "upper(btrim(project_name_prop_ai)) = upper(btrim(%s))"
+            " and upper(btrim(coalesce(master_project_prop_ai, ''))) = upper(btrim(%s))"
+            ")"
+            ")",
+            [name, short, master],
+        )
+    return ("upper(btrim(project_name_prop_ai)) = upper(btrim(%s))", [name])
+
+
 def latest_sales(
     place=None,
     limit: int = 8,
@@ -928,17 +1015,27 @@ def latest_sales(
         "sale_price between 10000 and 2000000000",
         "instance_date is not null",
         "coalesce(project_name_prop_ai, '') <> ''",
-        "(procedure_area_sqft is null or procedure_area_sqft between 50 and 100000)",
     ]
     params: list = []
     text = str(place or "").strip()
-    if text:
-        clause, extra = contains_place_sql(
-            ["area_name_prop_ai", "master_project_prop_ai", "project_name_prop_ai"],
-            _expanded([text]),
-        )
+    project_row = _exact_project_row(text) if text else None
+    if project_row:
+        # Named project (AC3 / The Woods at Sobha Sanctuary): keep building/plot
+        # sales and resolve short sale-table titles under the same master.
+        clause, extra = _named_project_sales_clause(project_row)
         parts.append(clause)
         params.extend(extra)
+    else:
+        parts.append(
+            "(procedure_area_sqft is null or procedure_area_sqft between 50 and 100000)"
+        )
+        if text:
+            clause, extra = contains_place_sql(
+                ["area_name_prop_ai", "master_project_prop_ai", "project_name_prop_ai"],
+                _expanded([text]),
+            )
+            parts.append(clause)
+            params.extend(extra)
     if bedrooms is not None and bedrooms != "":
         try:
             parts.append("bedrooms = %s")
@@ -1237,17 +1334,25 @@ def cheapest_sale(
     params: list = []
     project_name = str(project or "").strip()
     if project_name:
-        parts.append("upper(project_name_prop_ai) = upper(%s)")
-        params.append(project_name)
+        project_row = _exact_project_row(project_name) or {"name": project_name}
+        clause, extra = _named_project_sales_clause(project_row)
+        parts.append(clause)
+        params.extend(extra)
     else:
         text = str(place or "").strip()
         if text:
-            clause, extra = contains_place_sql(
-                ["area_name_prop_ai", "master_project_prop_ai", "project_name_prop_ai"],
-                _expanded([text]),
-            )
-            parts.append(clause)
-            params.extend(extra)
+            project_row = _exact_project_row(text)
+            if project_row:
+                clause, extra = _named_project_sales_clause(project_row)
+                parts.append(clause)
+                params.extend(extra)
+            else:
+                clause, extra = contains_place_sql(
+                    ["area_name_prop_ai", "master_project_prop_ai", "project_name_prop_ai"],
+                    _expanded([text]),
+                )
+                parts.append(clause)
+                params.extend(extra)
     if bedrooms is not None and bedrooms != "":
         parts.append("bedrooms = %s")
         params.append(int(float(bedrooms)))
@@ -1714,6 +1819,9 @@ _OUTSIDE_DUBAI = {
 def _normalize_place(place) -> str:
     text = re.sub(r"\s+", " ", str(place or "").strip(" .?!,;:'\""))
     text = re.sub(r"^(?:the|in|at|for)\s+", "", text, flags=re.I)
+    # Chip / spoken aliases: "Jumeirah Village Circle (JVC)" → community name.
+    # Leaving "(JVC)" made resolve_dubai_place fuzzy-match unrelated projects.
+    text = re.sub(r"\s*\([^)]{1,40}\)", "", text)
     # Drop budget tails so "Dubai starting above AED 5 million" → "Dubai".
     text = re.sub(
         r"\b(?:starting(?:\s+(?:above|from|at))?|above|over|under|below|up\s+to|"
@@ -1754,6 +1862,13 @@ def _static_dubai_names() -> dict[str, str]:
     )
     for proper in extras:
         names.setdefault(proper.lower(), proper)
+    # The data stores numbered master plans in Roman numerals (ARABIAN RANCHES III);
+    # "Arabian Ranches 3" must stay on that master, not the original.
+    for number, roman in (("2", "II"), ("3", "III")):
+        proper = f"Arabian Ranches {roman}"
+        names[proper.lower()] = proper
+        names[f"arabian ranches {number}"] = proper
+        names[f"arabian ranches-{number}"] = proper
     return names
 
 

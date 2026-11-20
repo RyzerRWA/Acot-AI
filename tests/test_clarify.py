@@ -93,6 +93,7 @@ def test_state_place_upgrades_clarify_to_search():
         "place": None,
         "confidence": 0.4,
         "source": "offline",
+        "source_question": "looking for 2 bedroom apartments",
     }
     enriched = enrich_resolution_from_state(
         resolution,
@@ -101,6 +102,211 @@ def test_state_place_upgrades_clarify_to_search():
     assert enriched["action"] == "search"
     assert enriched["place"] == "Jumeirah Village Circle"
     assert not should_clarify(enriched, "looking for 2 bedroom apartments")
+
+
+def test_dubai_citywide_ask_does_not_inherit_sticky_jvc():
+    """'Projects in Dubai above 5M' must not become empty JVC 1-bed search."""
+    from app.answers.turn_resolve import offline_resolve_turn
+
+    question = "Show me projects in Dubai starting above AED 5 million"
+    offline = offline_resolve_turn(question, None)
+    enriched = enrich_resolution_from_state(
+        offline,
+        {
+            "action": "search",
+            "place": "Jumeirah Village Circle",
+            "beds": 1,
+            "budget_aed": 700_000,
+            "ready_only": True,
+            "source_question": "ready 1-bedroom in JVC under 700k",
+        },
+    )
+    assert enriched["place"] is None
+    assert enriched["beds"] is None
+    assert enriched["budget_aed"] == 5_000_000
+    assert enriched["action"] == "search"
+
+
+def test_latest_sales_details_is_sales_list_not_cheapest():
+    """Typo repair must not turn 'latest' into 'lowest' (edit distance 2)."""
+    from app.retrieval.hybrid.question_text import repair_typed_question
+    from app.answers.turn_resolve import offline_resolve_turn
+
+    question = "latest sales details on The Woods at Sobha Sanctuary"
+    assert "latest" in repair_typed_question(question).lower()
+    assert "lowest" not in repair_typed_question(question).lower()
+    offline = offline_resolve_turn(question, None)
+    assert offline["action"] == "sales_list"
+    assert offline.get("stat") is None
+    assert "woods" in str(offline.get("place") or "").lower()
+
+
+def test_sales_clarify_does_not_echo_sticky_budget():
+    from app.answers.turn_resolve import offline_resolve_turn
+
+    question = "Show me the recent transaction details"
+    offline = offline_resolve_turn(question, None)
+    enriched = enrich_resolution_from_state(
+        offline,
+        {
+            "action": "search",
+            "place": None,
+            "budget_aed": 5_000_000,
+            "source_question": "Show me projects in Dubai starting above AED 5 million",
+        },
+    )
+    assert enriched["action"] == "sales_list"
+    assert enriched.get("budget_aed") is None
+    text = clarify_question_text(enriched, question)
+    assert "5,000,000" not in text
+    assert "under AED" not in text.lower()
+
+
+def test_bare_sales_does_not_inherit_browse_place():
+    """Bare 'transaction details' after recommend/search must not paste sticky JVC."""
+    from app.answers.turn_resolve import offline_resolve_turn
+
+    question = "Show me the recent transaction details"
+    offline = offline_resolve_turn(question, None)
+    enriched = enrich_resolution_from_state(
+        offline,
+        {
+            "action": "recommend",
+            "place": "Jumeirah Village Circle",
+            "source_question": "best projects in jvc",
+        },
+    )
+    assert enriched["action"] == "sales_list"
+    assert enriched.get("place") is None
+    assert should_clarify(enriched, question)
+
+
+def test_sales_thread_still_inherits_place():
+    """Same sales thread continues with sticky place when no new place is named."""
+    resolution = {
+        "action": "sales_list",
+        "place": None,
+        "confidence": 0.85,
+        "source": "offline",
+        "source_question": "Show me the recent transaction details",
+    }
+    enriched = enrich_resolution_from_state(
+        resolution,
+        {"action": "sales_list", "place": "Business Bay"},
+    )
+    assert enriched["place"] == "Business Bay"
+
+
+def test_marina_family_recommend_does_not_inherit_sticky_50k():
+    """'Best project in Dubai Marina for living family' must not invent AED 50k."""
+    from app.answers.explain_contract import build_understood
+    from app.answers.turn_resolve import offline_resolve_turn
+    from app.retrieval.hybrid.question_text import repair_typed_question
+
+    question = "suggest me the best project in Dubai Marina for living family"
+    assert "living" in repair_typed_question(question).lower()
+    assert "listing" not in repair_typed_question(question).lower()
+
+    offline = offline_resolve_turn(question, None)
+    assert offline["action"] == "recommend"
+    assert offline["place"] == "Dubai Marina"
+    assert offline.get("budget_aed") is None
+
+    enriched = enrich_resolution_from_state(
+        offline,
+        {
+            "action": "search",
+            "place": "Jumeirah Village Circle",
+            "budget_aed": 50_000,
+            "beds": 1,
+            "source_question": "studio under 50k",
+        },
+    )
+    assert enriched.get("budget_aed") is None
+    assert enriched["place"] == "Dubai Marina"
+
+    understood = build_understood(
+        place="Dubai Marina",
+        beds=3,
+        budget_aed=None,
+        goal="family",
+        intent="recommend",
+    )
+    assert "50,000" not in understood
+    assert "dubai marina" in understood.lower()
+    assert "projects in that community" in understood.lower()
+    assert "rank communities on ready villa" not in understood.lower()
+
+
+def test_bare_agents_does_not_inherit_browse_place():
+    """Bare 'top agents' after Motor City browse must not paste sticky place."""
+    from app.answers.turn_resolve import offline_resolve_turn
+
+    question = "i want top agents"
+    offline = offline_resolve_turn(question, None)
+    assert offline["action"] == "agents"
+    enriched = enrich_resolution_from_state(
+        offline,
+        {
+            "action": "search",
+            "place": "Motor City",
+            "source_question": "show me projects in Motor City",
+        },
+    )
+    assert enriched["action"] == "agents"
+    assert enriched.get("place") is None
+    assert should_clarify(enriched, question)
+    text = clarify_question_text(enriched, question)
+    assert "agent" in text.lower()
+    # Sticky browse place must not appear in the Understood line.
+    assert "understood:" in text.lower()
+    assert "in motor city" not in text.lower()
+
+
+def test_agents_thread_still_inherits_place():
+    resolution = {
+        "action": "agents",
+        "place": None,
+        "confidence": 0.9,
+        "source": "offline",
+        "source_question": "show me the top ones",
+    }
+    enriched = enrich_resolution_from_state(
+        resolution,
+        {"action": "agents", "place": "Motor City"},
+    )
+    assert enriched["place"] == "Motor City"
+    assert not should_clarify(enriched, "show me the top ones")
+
+
+def test_sales_in_ac3_does_not_inherit_sticky_jvc(monkeypatch):
+    from app.answers.turn_resolve import offline_resolve_turn
+    import app.retrieval.propai_catalog as catalog
+
+    monkeypatch.setattr(catalog, "place_named", lambda text: None)
+    monkeypatch.setattr(
+        catalog,
+        "resolve_dubai_place",
+        lambda place: "AC3" if str(place or "").strip().upper() == "AC3" else None,
+    )
+
+    question = "Show me sales details in AC3"
+    offline = offline_resolve_turn(question, None)
+    assert offline["place"] == "AC3"
+    enriched = enrich_resolution_from_state(
+        offline,
+        {
+            "action": "sales_list",
+            "place": "Jumeirah Village Circle",
+            "beds": 1,
+            "budget_aed": 5_000_000,
+            "source_question": "ok jvc",
+        },
+    )
+    assert enriched["place"] == "AC3"
+    assert enriched.get("beds") is None
+    assert enriched.get("budget_aed") is None
+    assert not should_clarify(enriched, question)
 
 
 def test_clarify_turn_payload_has_no_fake_projects():

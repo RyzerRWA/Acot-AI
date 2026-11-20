@@ -806,6 +806,149 @@ def _transaction_place(question):
     return leftover or None
 
 
+_TX_DEIXIS = re.compile(
+    r"\b(?:these|those|them|this list|the projects|the ones|on screen)\b",
+    re.I,
+)
+# Soft follow-ups that keep project cards "live" for a later sales ask.
+_TX_SOFT_FOLLOWUP = re.compile(
+    r"\b(?:more|handover|developer|bedroom|bedrooms|price|prices|"
+    r"amenities|size|compare|which of|transaction|transactions|"
+    r"sales?|sold|details?)\b",
+    re.I,
+)
+# Hard topic changes — after two of these, bare "transaction details" must clarify.
+_TX_TOPIC_BREAK = re.compile(
+    r"\b(?:rent|rental|listings?|agents?|brokers?|famil(?:y|ies)|"
+    r"best (?:areas?|communities)|yield|roi|invest(?:ment|ing)?|"
+    r"where should i buy|show me (?:projects?|apartments?|villas?)\b)",
+    re.I,
+)
+
+
+def _dialogue_action_name(conversation_memory) -> str:
+    if conversation_memory is None:
+        return ""
+    if hasattr(conversation_memory, "get_dialogue_state"):
+        state = conversation_memory.get_dialogue_state() or {}
+    else:
+        state = getattr(conversation_memory, "dialogue_state", None) or {}
+    return str((state or {}).get("action") or "").strip().lower()
+
+
+def _project_card_context_is_live(question, conversation_memory) -> bool:
+    """True when on-screen project cards are still a safe subject for sales.
+
+    Users can ask anything anytime. Cards stay live for deixis, an active sales
+    thread, or at most one hard topic-break since the cards were shown. After
+    two+ unrelated asks (rent / agents / new browse / …), bare transaction
+    asks must clarify which community or project — not invent sticky cards.
+    """
+    if _TX_DEIXIS.search(question or ""):
+        return True
+    action = _dialogue_action_name(conversation_memory)
+    if action in {"sales_list", "sales_count"}:
+        return True
+    items = getattr(conversation_memory, "active_candidates", None) or []
+    projects = [
+        item for item in items
+        if isinstance(item, dict)
+        and str(item.get("entity_type") or "project").lower() == "project"
+        and item.get("name")
+    ]
+    if not projects:
+        return False
+    names = {
+        str(item.get("name") or "").strip().lower()
+        for item in projects
+        if item.get("name")
+    }
+    turns = getattr(conversation_memory, "turns", None) or []
+    last_card_idx = -1
+    for index, turn in enumerate(turns):
+        if not isinstance(turn, dict):
+            continue
+        cands = turn.get("candidate_names") or []
+        hits = sum(1 for name in cands if str(name or "").strip().lower() in names)
+        if hits >= min(2, len(names)) or (
+            len(names) == 1 and hits == 1
+        ):
+            last_card_idx = index
+    if last_card_idx < 0:
+        # Cards exist but not yet mirrored into turns — still search/recommend.
+        return action in {"search", "recommend", ""}
+    breaks = 0
+    for turn in turns[last_card_idx + 1 :]:
+        if not isinstance(turn, dict):
+            continue
+        user_q = str(turn.get("user_question") or "")
+        if not user_q.strip():
+            continue
+        lower = user_q.lower()
+        if any(name and name in lower for name in names):
+            continue
+        if _TRANSACTION.search(user_q) or _TX_SOFT_FOLLOWUP.search(user_q):
+            # Attribute / sales follow-ups about the same shortlist stay soft
+            # unless they clearly open a new topic (rent/agents/new browse).
+            if not _TX_TOPIC_BREAK.search(user_q):
+                continue
+        if _TX_TOPIC_BREAK.search(user_q):
+            breaks += 1
+        elif len(user_q.split()) >= 4:
+            breaks += 1
+        if breaks >= 2:
+            return False
+    return True
+
+
+def _last_turn_project_stub(question, conversation_memory):
+    """The single project the last answer was about, when cards were not mirrored.
+
+    Agent answers (e.g. "What is the starting price of X?") can show one project
+    card without leaving it in active_candidates; "show me the recent transaction
+    details" must still mean that project, not a place-less clarify.
+    """
+    if conversation_memory is None:
+        return None
+    # A named place is its own ask ("sales in Business Bay").
+    try:
+        from app.retrieval.propai_catalog import place_named
+        from app.answers.turn_resolve import sales_place_from_text
+
+        if place_named(question) or sales_place_from_text(question):
+            return None
+    except Exception:
+        pass
+    entities = getattr(conversation_memory, "active_entities", None) or {}
+    name = str(entities.get("project") or "").strip()
+    turns = getattr(conversation_memory, "turns", None) or []
+    last = turns[-1] if turns and isinstance(turns[-1], dict) else {}
+    if not name:
+        names = [str(n).strip() for n in (last.get("candidate_names") or []) if str(n or "").strip()]
+        if len(names) == 1:
+            name = names[0]
+    if not name:
+        # The last ask itself named one project ("starting price of Serenz by Danube").
+        last_q = str(last.get("user_question") or "").strip()
+        if last_q:
+            try:
+                from app.retrieval.propai_catalog import project_named_in_question
+
+                hit = str(project_named_in_question(last_q) or "").strip()
+                if hit and hit.lower() in last_q.lower():
+                    name = hit
+            except Exception:
+                name = ""
+    if not name:
+        return None
+    return [{
+        "name": name,
+        "entity_type": "project",
+        "community": entities.get("community"),
+        "developer_name": entities.get("developer"),
+    }]
+
+
 def _transaction_subject(question, conversation_memory):
     """Projects a transaction follow-up refers to, or None so the agent does not run."""
     if not _TRANSACTION.search(question or ""):
@@ -817,6 +960,11 @@ def _transaction_subject(question, conversation_memory):
         and str(item.get("entity_type") or "project").lower() == "project"
         and item.get("name")
     ]
+    if not projects:
+        # Bare "recent transaction details" right after a single-project answer.
+        stub = _last_turn_project_stub(question, conversation_memory)
+        if stub:
+            return stub
     asked = (question or "").lower()
     named = [project for project in projects if str(project["name"]).lower() in asked]
     if named:
@@ -825,16 +973,20 @@ def _transaction_subject(question, conversation_memory):
     # not eight random projects from that area. Only on-screen projects apply
     # when the ask does not name a different place.
     from app.retrieval.propai_catalog import place_named
-    place = place_named(question)
+    from app.answers.turn_resolve import sales_place_from_text
+
+    place = place_named(question) or sales_place_from_text(question)
     if place:
         on_screen_same_place = any(
             place.lower() in " ".join(
-                str(project.get(k) or "") for k in ("community", "sub_community", "area")
+                str(project.get(k) or "") for k in ("community", "sub_community", "area", "name")
             ).lower()
             for project in projects
         )
         if not on_screen_same_place:
             return None
+    if not _project_card_context_is_live(question, conversation_memory):
+        return None
     return projects[:8] or None
 
 
@@ -1667,12 +1819,37 @@ async def _dialogue_followup_turn(question, conversation_memory, components=None
 
     if conversation_memory is None:
         return None
+    # Casual speech never continues a sticky recommend/search task.
+    try:
+        from app.answers.turn_act import is_casual_speech
+
+        if is_casual_speech(question):
+            return None
+    except Exception:
+        pass
+    # Compare / best-of-shown about live cards is a new turn — never sticky afford.
+    if _on_screen_compare_or_pick(question, conversation_memory):
+        return None
     state = (
         conversation_memory.get_dialogue_state()
         if hasattr(conversation_memory, "get_dialogue_state")
         else getattr(conversation_memory, "dialogue_state", None)
     )
     if not looks_like_state_followup(question, state):
+        return None
+    # Intent-shifting chips/asks after another task are new turns — never a
+    # sticky search/recommend patch (e.g. agents chip → "200 projects in JVC").
+    prior_action = str((state or {}).get("action") or "")
+    asked = question or ""
+    if re.search(r"\b(?:agents?|brokers?)\b", asked, re.I) and prior_action not in {
+        "agents", "",
+    }:
+        return None
+    if re.search(
+        r"\b(?:transactions?|transcations?|(?:recent|latest)\s+sales?|sale history)\b",
+        asked,
+        re.I,
+    ) and prior_action not in {"sales_list", "sales_count", "sales_stat", ""}:
         return None
 
     resolve_started = time.perf_counter()
@@ -1756,6 +1933,28 @@ async def _understood_turn(question, conversation_memory, components=None):
     from app.answers.clarify import clarify_turn_payload, should_clarify
     from app.answers.turn_resolve import resolve_turn, state_updates_from_resolution
 
+    # Live cards + compare/best beat sticky afford re-runs from LLM resolve.
+    compare_early = await asyncio.to_thread(
+        _compare_shown_turn, question, conversation_memory
+    )
+    if compare_early is not None:
+        return compare_early
+    shortlist_early = await asyncio.to_thread(
+        _shortlist_recommend_turn, question, conversation_memory
+    )
+    if shortlist_early is not None:
+        return shortlist_early
+
+    # Named project compares must fall through to hybrid retrieval — never
+    # clarify for area/beds/budget ("Compare Serenz and Aura Heights").
+    try:
+        from app.retrieval.hybrid.question_text import comparison_pair
+
+        if comparison_pair(question):
+            return None
+    except Exception:
+        pass
+
     resolve_started = time.perf_counter()
     llm_generate = _llm_generate_from(conversation_memory, components)
     resolution = await resolve_turn(
@@ -1788,6 +1987,38 @@ async def _understood_turn(question, conversation_memory, components=None):
         )
         if stat_turn is not None:
             return _stamp_resolve(stat_turn)
+
+    # On-screen project cards beat a place-less sales clarify ("transaction details").
+    # The LLM may label a bare "transaction details" as clarify/general; the
+    # on-screen project still answers it.
+    if resolution.get("action") in {"sales_list", "clarify", "general", "search", None} and (
+        _TRANSACTION.search(question or "")
+    ):
+        on_screen = _transaction_subject(question, conversation_memory)
+        if on_screen:
+            return _stamp_resolve(
+                await asyncio.to_thread(
+                    _transaction_turn, question, conversation_memory
+                )
+            )
+
+    # Live project cards / deixis give agents a place before the clarify gate.
+    if resolution.get("action") == "agents" and not resolution.get("place"):
+        live_place = _broker_place(question, conversation_memory)
+        if live_place:
+            from app.answers.clarify import score_confidence
+
+            resolution = {**resolution, "place": live_place}
+            resolution["confidence"] = score_confidence(resolution, question)
+
+    # Attribute chips about on-screen projects beat a wrong clarify/search.
+    # ("Who is the developer of each of these projects?")
+    if resolution.get("action") in {"attribute", "clarify", "search", "general"}:
+        shown_early = _shown_attribute_response(
+            question, conversation_memory, {}, time.perf_counter(), None
+        )
+        if shown_early is not None:
+            return _stamp_resolve(shown_early)
 
     # Phase 7: ask before guessing when slots/confidence are weak.
     if should_clarify(resolution, question):
@@ -2728,6 +2959,29 @@ def _on_screen_broker_place(conversation_memory):
     return None
 
 
+def _agents_on_screen_place_allowed(question, conversation_memory) -> bool:
+    """Same freshness gate as sales: named/deixis/live cards stick; cold clarifies."""
+    if _TX_DEIXIS.search(question or "") or _BROKER_POINTER.search(question or ""):
+        return True
+    if _dialogue_action_name(conversation_memory) == "agents":
+        return True
+    return _project_card_context_is_live(question, conversation_memory)
+
+
+def _canonical_broker_place(place: str | None) -> str | None:
+    """Strip chip aliases like '(JVC)' and map to a known Dubai community/project."""
+    if not place or not str(place).strip():
+        return None
+    raw = str(place).strip()
+    try:
+        from app.retrieval.propai_catalog import known_dubai_label, resolve_dubai_place
+
+        return known_dubai_label(raw) or resolve_dubai_place(raw) or raw
+    except Exception:
+        cleaned = re.sub(r"\s*\([^)]{1,40}\)", "", raw).strip()
+        return cleaned or raw
+
+
 def _broker_place(question, conversation_memory):
     """Community or project a broker follow-up refers to."""
     asked = (question or "").strip()
@@ -2748,7 +3002,7 @@ def _broker_place(question, conversation_memory):
         pointed = " ".join(_BROKER_POINTER.sub(" ", place).split()).strip(" .?")
         if pointed:
             from app.listings.tools import ALIASES
-            return ALIASES.get(pointed.lower(), pointed)
+            return _canonical_broker_place(ALIASES.get(pointed.lower(), pointed))
     leftover = " ".join(_BROKER_FILLER.sub(" ", asked).split())
     leftover = " ".join(_BROKER_FILTER_WORDS.sub(" ", leftover).split()).strip(" .?")
     leftover = " ".join(_BROKER_POINTER.sub(" ", leftover).split()).strip(" .?")
@@ -2757,7 +3011,9 @@ def _broker_place(question, conversation_memory):
     if leftover:
         from app.retrieval.propai_catalog import is_outside_dubai, known_dubai_label
         if is_outside_dubai(leftover) or known_dubai_label(leftover):
-            return leftover
+            return _canonical_broker_place(leftover)
+    if not _agents_on_screen_place_allowed(question, conversation_memory):
+        return None
     return _on_screen_broker_place(conversation_memory)
 
 
@@ -2903,6 +3159,33 @@ def _format_brokers(rows, label=None) -> str:
         "Want agents for a nearby community, or should I match projects in the same area next?"
     )
     return scrub_user_facing("\n".join(lines).rstrip())
+
+
+_OUTSIDE_SKIP = re.compile(
+    r"\b(?:agents?|brokers?|transactions?|transcations?|sales?\s+in|rent(?:al|als)?)\b",
+    re.I,
+)
+
+
+def _outside_dubai_market_reply(question):
+    """Buy / area / project asks about another city: Dubai-only, said plainly."""
+    text = question or ""
+    if not text.strip() or _OUTSIDE_SKIP.search(text):
+        return None
+    try:
+        from app.retrieval.propai_catalog import outside_dubai_city
+
+        city = outside_dubai_city(text)
+    except Exception:
+        return None
+    if not city:
+        return None
+    return (
+        f"ACOT only covers Dubai, so I don't have {city} data. "
+        "I can rank Dubai areas for families, check what a budget buys, or compare "
+        "projects — for example Dubai Hills Estate, Arabian Ranches, Dubai Marina, "
+        "Business Bay or JVC. Which would you like?"
+    )
 
 
 def _outside_coverage_reply(question, asked=None):
@@ -3746,6 +4029,20 @@ def _shown_compare_limit(question: str) -> int | None:
     return _COMPARE_N.get(token, 2)
 
 
+def _on_screen_compare_or_pick(question, conversation_memory) -> bool:
+    """True when the ask ranks/compares live cards (not explain/why follow-ups)."""
+    _kind, available = _shown_compare_rows(question, conversation_memory)
+    if len(available) < 2:
+        return False
+    # Compare-all / first-N table asks.
+    if _shown_compare_limit(question):
+        return True
+    # "tell me the best" / which-is-best picks — not "why are these good".
+    if _SHORTLIST_RECOMMEND.search(question or ""):
+        return True
+    return False
+
+
 def _compare_shown_turn(question, conversation_memory):
     """Compare N (or all) on-screen projects or rentals in a table + Acot Recommend."""
     limit = _shown_compare_limit(question)
@@ -3759,11 +4056,13 @@ def _compare_shown_turn(question, conversation_memory):
         return None
     from app.answers.recommend import format_compare_table, rank_projects, wanted_bedrooms
 
+    # Keep every on-screen option in the table; evidence still informs the score.
     ranked = rank_projects(
         rows,
         wanted_beds=wanted_bedrooms(question),
         attach_sales=(kind == "project"),
         goal="compare",
+        require_evidence=False,
     )
     answer = format_compare_table(rows, ranked)
     summary = _empty_structured_summary()
@@ -3803,9 +4102,30 @@ def _shortlist_recommend_turn(question, conversation_memory):
         return None
     if _TRANSACTION.search(question or ""):
         return None
+    try:
+        from app.answers.turn_act import is_casual_speech
+
+        if is_casual_speech(question):
+            return None
+    except Exception:
+        pass
     from app.answers.intent_route import classify_intent
 
     route = classify_intent(question, conversation_memory)
+    # "best project in Dubai Marina for family" is a fresh place-scoped recommend.
+    # Do not re-rank whatever cards happen to be on screen just because the
+    # sentence contains "best project".
+    kind = str(route.get("kind") or "")
+    subject = str(route.get("subject") or "").strip().lower()
+    if (
+        kind in {
+            "filtered", "afford", "cheapest", "family_areas", "open_best",
+            "yield_areas", "ready_offplan", "split",
+        }
+        and subject
+        and subject != "on_screen"
+    ):
+        return None
     pick = bool(_SHORTLIST_RECOMMEND.search(question or ""))
     explain = bool(
         re.search(r"\b(?:why|explain|good for|suit|fit)\b", question or "", re.I)
@@ -3922,7 +4242,14 @@ def _shown_project_followup(question, conversation_memory):
     Returns (projects, no_match) or None when this is not that kind of question.
     After a sales_list answer there are no project cards — use last_sale_projects.
     """
-    if not is_group_attribute_question(question):
+    try:
+        from app.answers.turn_resolve import _is_shown_attribute_ask
+    except Exception:
+        _is_shown_attribute_ask = None
+    if _is_shown_attribute_ask is not None:
+        if not _is_shown_attribute_ask(question, conversation_memory):
+            return None
+    elif not is_group_attribute_question(question):
         return None
     items = getattr(conversation_memory, "active_candidates", None) or []
     projects = [
@@ -3941,6 +4268,24 @@ def _shown_project_followup(question, conversation_memory):
         from_sales = bool(projects)
     if not projects:
         return None
+    # Named community that does not match the shortlist → leave to area browse.
+    try:
+        from app.answers.intent_route import extract_place
+
+        named = extract_place(question)
+    except Exception:
+        named = None
+    if named and str(named).strip().lower() not in {"", "dubai"}:
+        needle = str(named).strip().lower()
+        same_place = any(
+            needle in " ".join(
+                str(project.get(key) or "")
+                for key in ("community", "sub_community", "area", "name")
+            ).lower()
+            for project in projects
+        )
+        if not same_place:
+            return None
     # Sales stubs usually lack developer_name — hydrate from Prop-AI.
     if from_sales or any(
         not str(p.get("developer_name") or p.get("developer") or "").strip()
@@ -4017,8 +4362,34 @@ def _classify_small_talk(question):
 
     words = re.findall(r"[a-z']+", text)
     if not words or len(words) > 8:
+        # Still allow longer polite thanks via casual gate.
+        try:
+            from app.answers.turn_act import casual_kind, is_casual_speech
+
+            if is_casual_speech(question):
+                return casual_kind(question)
+        except Exception:
+            pass
         return None
     joined = " ".join(words)
+    # Greetings / thanks leads first (preserve "Hello. So, uh," → greeting).
+    for pattern, lead_kind in _SMALL_TALK_LEADS:
+        if pattern.match(words[0]):
+            rest = words[1:]
+            if all(word in _SMALL_TALK_FILLER for word in rest):
+                return lead_kind
+            # "Hello. So, uh," / "hi there please" with no real ask → greeting.
+            if len(words) <= 8 and not _SMALL_TALK_REAL_ASK.search(joined):
+                return lead_kind
+            return None
+    # Casual speech gate (ack / cool / got it) — before any follow-up or data path.
+    try:
+        from app.answers.turn_act import casual_kind, is_casual_speech
+
+        if is_casual_speech(question):
+            return casual_kind(question)
+    except Exception:
+        pass
     # Casual thanks / soft acknowledgements that should not hit retrieval.
     if re.fullmatch(
         r"(?:ok(?:ay)?|alright|sure|yes|yep|yeah)?\s*"
@@ -4030,18 +4401,10 @@ def _classify_small_talk(question):
         "ok", "okay", "alright", "sure", "yes", "yep", "yeah", "no", "nope",
         "nah", "hmm", "hmmm", "interesting", "really", "got", "it", "cool",
         "nice", "maybe", "later", "not", "now",
+        "great", "perfect", "awesome", "amazing", "fine", "good",
     }
     if words and len(words) <= 3 and all(word in ack_words for word in words):
         return "ack"
-    for pattern, lead_kind in _SMALL_TALK_LEADS:
-        if pattern.match(words[0]):
-            rest = words[1:]
-            if all(word in _SMALL_TALK_FILLER for word in rest):
-                return lead_kind
-            # "Hello. So, uh," / "hi there please" with no real ask → greeting.
-            if len(words) <= 8 and not _SMALL_TALK_REAL_ASK.search(joined):
-                return lead_kind
-            return None
     return None
 
 
@@ -4113,8 +4476,8 @@ def _small_talk_answer(kind, name=None, audience="buyer"):
 
     if kind == "ack":
         return (
-            f"Okay{who}. If you want, I can show more options, compare the ones on screen, "
-            "or switch area or budget."
+            f"Glad that helped{who}. "
+            "Ask anytime if you want another area, agents, recent sales, or a tighter shortlist."
         )
 
     if kind == "bye":
@@ -4588,6 +4951,36 @@ async def _prepare_acot_turn_inner(
             "audience": components.get("audience") or "buyer",
         }
 
+    # Another city / emirate is out of coverage: say so, never map it onto Dubai data.
+    outside_reply = _outside_dubai_market_reply(question)
+    if outside_reply:
+        timing_ms["rewrite"] = 0
+        return {
+            "question": question,
+            "standalone_question": question,
+            "question_type": "general",
+            "structured_summary": _empty_structured_summary(),
+            "documents": [],
+            "investment_analysis": None,
+            "retrieval_result": {
+                "question_type": "general",
+                "structured_data": {
+                    "community": [],
+                    "projects": [],
+                    "sub_communities": [],
+                },
+                "documents": [],
+            },
+            "rag_chain": rag_chain,
+            "conversation_memory": conversation_memory,
+            "use_fast": True,
+            "fast_answer": outside_reply,
+            "context": None,
+            "timing_ms": timing_ms,
+            "ask_started": ask_started,
+            "audience": components.get("audience") or "buyer",
+        }
+
     # Nest agent Ask ACOT: CRM / claim / intro data in profile.companion (this question only).
     profile = components.get("profile") or {}
     companion = profile.get("companion") if isinstance(profile, dict) else None
@@ -4643,6 +5036,27 @@ async def _prepare_acot_turn_inner(
         freshness["rag_chain"] = rag_chain
         freshness["conversation_memory"] = conversation_memory
         return freshness
+
+    # On-screen compare / best-of-shown before sticky followup/understood —
+    # otherwise LLM resolve re-runs the prior afford with Business Bay + budget.
+    compare_shown_early = await asyncio.to_thread(
+        _compare_shown_turn, question, conversation_memory
+    )
+    if compare_shown_early is not None:
+        compare_shown_early["timing_ms"] = timing_ms
+        compare_shown_early["ask_started"] = ask_started
+        compare_shown_early["rag_chain"] = rag_chain
+        compare_shown_early["conversation_memory"] = conversation_memory
+        return compare_shown_early
+    shortlist_early = await asyncio.to_thread(
+        _shortlist_recommend_turn, question, conversation_memory
+    )
+    if shortlist_early is not None:
+        shortlist_early["timing_ms"] = timing_ms
+        shortlist_early["ask_started"] = ask_started
+        shortlist_early["rag_chain"] = rag_chain
+        shortlist_early["conversation_memory"] = conversation_memory
+        return shortlist_early
 
     # Production RAG pattern (NVIDIA AI-Q / OpenAI tool routing / Microsoft agent
     # routers): LLM understands the turn FIRST. Phrase regexes are only a cold
