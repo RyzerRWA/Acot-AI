@@ -207,6 +207,9 @@ def test_typo_repair_keeps_real_words():
     assert repair("parents with kids") == "parents with kids"
     assert repair("compare sobha central and trump tower") == "compare sobha central and trump tower"
     assert repair("handovr dates") == "handover dates"
+    # "nearest hotel" became "newest hotel" and answered with a handover list.
+    for word in ("nearest", "closest", "biggest", "largest", "nicest", "newer", "cheaper", "visas"):
+        assert repair(f"show me {word} in dubai") == f"show me {word} in dubai"
     # Genuine typos are still fixed.
     assert repair("agnets in marina") == "agents in marina"
     assert repair("chepest 1 bed") == "cheapest 1 bed"
