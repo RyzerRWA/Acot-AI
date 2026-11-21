@@ -1,3 +1,38 @@
+
+Today's date: What is today's date, and what is the latest sale date in your data?
+
+2. Recent sales with dates: Show the last 5 sales of 1-bedroom apartments in JVC, with sale date and price
+
+
+3. This month's sales: How many 1-bedroom apartments in JVC were sold in November 2026?
+
+
+
+4. Studio vs 1-bed price: What is the cheapest 1-bedroom sale in Hanover Square JVC in the last 12 months?
+
+5. Expensive projects: Show me projects in Dubai starting above AED 5 million
+
+
+6. Project count: How many residential projects are there in Dubai?
+Correct: about 6,009 (Prop-AI). ACOT shows 3,857.
+
+
+7. Developer ranking: Which 5 developers had the highest sales value in Dubai in the last 12 months?
+
+
+
+8. Business Bay. Ask the first question, then the second right after it. Who are the top agents in Business Bay?
+
+
+
+9. Ready only: Show only ready 1-bedroom apartments in JVC under AED 700,000
+
+
+
+
+
+
+
 Filtered (place + beds + budget) — the new ranking
 
 I want a 3-bedroom in JVC for a family of 4 to buy around AED 1.8M.
