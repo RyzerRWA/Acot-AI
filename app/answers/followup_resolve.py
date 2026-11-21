@@ -513,14 +513,11 @@ async def resolve_followup(
     offline = _offline_resolve(text, current)
     if offline.get("kind") == "new":
         return None
+    # A short message is not proof of a continue: "can u predict?" re-ran the last recommend word for word.
     if offline.get("kind") == "continue" and (
         offline.get("more")
         or offline.get("patch")
         or offline.get("mode") in {"page", "patch", "explain"}
-        or (
-            offline.get("mode") == "rerun"
-            and len(text.split()) <= 6
-        )
     ):
         return offline
 
@@ -572,6 +569,8 @@ Rules:
   Examples: "Who is the developer of each of these projects?", "their handover dates",
   "budget for each project", "what are their prices?"
 - A full new ask like "Show me villas in Palm" with no link to the active task → new
+- A different kind of answer about the same place (predict / forecast, ROI, yield, price trend, compare,
+  "is it a good investment", data questions) → new, even when it is short ("can u predict?")
 - Do not invent places. Only patch what the user said. Carry over unmentioned slots.
 """
         try:

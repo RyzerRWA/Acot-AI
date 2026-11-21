@@ -10,6 +10,8 @@ import re
 from datetime import datetime
 from typing import Any
 
+from app.database.postgres import CLEAN_SALE
+
 _READY = re.compile(r"\b(?:ready|completed|on[\s-]?sale|available)\b", re.I)
 _INACTIVE = re.compile(r"\b(?:cancelled|canceled|hold|inactive|sold[\s-]?out)\b", re.I)
 _BEDS = re.compile(r"\b(\d+)\s*[- ]?\s*(?:bed(?:room)?s?|br)\b", re.I)
@@ -299,7 +301,7 @@ def attach_market_activity(projects: list[dict]) -> None:
                            order by procedure_area_sqft
                        ) filter (where procedure_area_sqft > 0) as median_size
                 from propai_sales
-                where deleted_at is null and sale_price > 0
+                where {CLEAN_SALE}
                   and instance_date >= current_date - interval '{_RECENT_SALES_INTERVAL}'
                   and upper(project_name_prop_ai) = any(%s)
                 group by 1
@@ -517,9 +519,7 @@ def fetch_recommend_projects(
     if lock == "false":
         return [], []
     where = [
-        "deleted_at is null",
-        "coalesce(outlier_flag, '') <> 'True'",
-        "sale_price > 0",
+        CLEAN_SALE,
         f"instance_date >= current_date - interval '{_RECENT_SALES_INTERVAL}'",
         "coalesce(project_name_prop_ai, '') <> ''",
         lock,
@@ -629,9 +629,7 @@ def fetch_villa_projects_under_budget(
                    percentile_cont(0.5) within group (order by sale_price)::float8 as price,
                    max(instance_date) as last_sale
             from public.propai_sales
-            where deleted_at is null
-              and coalesce(outlier_flag, '') <> 'True'
-              and sale_price > 0
+            where {CLEAN_SALE}
               and instance_date >= current_date - interval '{_RECENT_SALES_INTERVAL}'
               and coalesce(project_name_prop_ai, '') <> ''
               and {type_sql}
@@ -681,9 +679,7 @@ def fetch_studio_projects_under_budget(
                    percentile_cont(0.5) within group (order by sale_price)::float8 as price,
                    max(instance_date) as last_sale
             from public.propai_sales
-            where deleted_at is null
-              and coalesce(outlier_flag, '') <> 'True'
-              and sale_price > 0
+            where {CLEAN_SALE}
               and instance_date >= current_date - interval '{_RECENT_SALES_INTERVAL}'
               and coalesce(project_name_prop_ai, '') <> ''
               and bedrooms = 0
@@ -1792,7 +1788,7 @@ def fetch_family_areas(limit: int = 5, focus: dict | None = None) -> list[dict]:
 
     try:
         rows = fetch(
-            """
+            f"""
             with s as (
               select coalesce(nullif(btrim(master_project_prop_ai), ''), area_name_prop_ai) as area,
                      bedrooms,
@@ -1800,9 +1796,7 @@ def fetch_family_areas(limit: int = 5, focus: dict | None = None) -> list[dict]:
                      development_status,
                      sale_price
               from public.propai_sales
-              where deleted_at is null
-                and coalesce(outlier_flag, '') <> 'True'
-                and sale_price > 0
+              where {CLEAN_SALE}
                 and instance_date >= current_date - interval '12 months'
                 and (
                   property_type_en = 'Villa'
@@ -2169,9 +2163,7 @@ def fetch_ready_offplan_stats(place: str | None = None) -> dict[str, dict]:
     from app.database.postgres import fetch
 
     clauses = [
-        "deleted_at is null",
-        "coalesce(outlier_flag, '') <> 'True'",
-        "sale_price > 0",
+        CLEAN_SALE,
         "instance_date >= current_date - interval '12 months'",
         "coalesce(property_type_en, '') not in ('Land', 'Plot')",
     ]

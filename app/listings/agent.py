@@ -107,7 +107,7 @@ class ListingAgent:
             try:
                 response = self.client.chat.completions.create(
                     model=model, messages=messages, tools=tools or TOOLS, tool_choice="auto",
-                    temperature=0.2, max_tokens=600, **llm_chat_extras(model))
+                    temperature=0, max_completion_tokens=600, **llm_chat_extras(model))
                 return model, response
             except Exception as exc:  # network, rate limit, provider error
                 last = f"{model}: {exc}"

@@ -2548,9 +2548,9 @@ def test_data_freshness_answers_today_and_max_sale_date(monkeypatch):
     assert out is not None
     assert out["use_fast"] is True
     assert out.get("documents") == []
-    assert "Today is" in out["fast_answer"]
-    assert "3 Nov 2026" in out["fast_answer"] or "2026-11-03" in out["fast_answer"]
-    assert "invent" in out["fast_answer"].lower()
+    assert "today is" in out["fast_answer"].lower()
+    assert "3 Nov 2026" in out["fast_answer"]
+    assert "nothing after these dates" in out["fast_answer"]
 
 
 def test_data_freshness_paraphrases_about_recent_sales_data(monkeypatch):
@@ -3923,3 +3923,13 @@ def test_arabian_ranches_3_stays_on_the_numbered_master():
     assert place_named('I want a 3-bedroom in Arabian Ranches 3 around AED 2.8M.') == 'Arabian Ranches III'
     assert place_named('typical sale in Arabian Ranches only') == 'Arabian Ranches'
 
+
+
+def test_todays_date_gets_only_the_date():
+    from datetime import date
+    # No understood flag: these are caught before follow-up handling, so an on-screen list never re-runs.
+    for question in ("what is todays date", "What's the date today?", "what day is it", "today date?"):
+        out = _data_freshness_turn(question)
+        assert out["fast_answer"] == f"Today is **{date.today().strftime('%A, %d %B %Y')}**.", question
+    # Asking about the data as well still gets the data dates.
+    assert "Sales" not in _data_freshness_turn("what is todays date", True)["fast_answer"]

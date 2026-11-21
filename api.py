@@ -478,7 +478,7 @@ def health_check():
     return {
         "status": "ok",
         "service": "ACOT",
-        "message": "ACOT FastAPI backend is running. cheppra "
+        "message": "ACOT FastAPI backend is running. in open ai creditinale"
     }
 
 
@@ -586,13 +586,18 @@ async def ask_endpoint(request: AskRequest):
     except Exception as exc:
 
         release_request_collector()
+        # Provider errors carry account ids and limits: log them, never send them to users.
+        logger.exception("ask failed")
         raise HTTPException(
             status_code=500,
-            detail=f"ACOT processing error: {str(exc)}"
-        )
+            detail=_USER_ERROR,
+        ) from exc
 
     finally:
         _chat_gate().release()
+
+_USER_ERROR = "Sorry, I couldn't answer that right now. Please try again in a moment."
+
 
 def _sse_data(payload):
     body = json.dumps(
@@ -713,12 +718,11 @@ async def ask_stream_endpoint(request: AskRequest):
                     "type": "usage",
                     "tokens_used": error_tokens,
                 })
+            logger.exception("ask stream failed")
             yield _sse_data(
                 {
                     "type": "error",
-                    "message": (
-                        f"ACOT processing error: {str(exc)}"
-                    )
+                    "message": _USER_ERROR,
                 },
             )
         finally:

@@ -155,7 +155,7 @@ TOOLS += [
            "property_type": {"type": "string", "enum": ["apartment", "villa", "hotel apartment", "office", "shop", "land", "warehouse", "building"]},
            "status": {"type": "string", "enum": ["any", "ready_only", "off_plan_only"], "description": "Default any (ready and off-plan sales both). Use ready_only only if the user said ready / completed; off_plan_only only if they said off-plan / under construction."},
            "month": {"type": "string", "description": "One calendar month, e.g. 2026-11."},
-           "last_days": {"type": "integer", "description": "Sales in the last N days, e.g. 30 or 365."},
+           "last_days": {"type": "integer", "description": "Sales in the last N days, e.g. 30 or 365. With no month, last_days or dates, the last 365 days are used; pass date_from for older or all-time sales."},
            "date_from": {"type": "string", "description": "YYYY-MM-DD."}, "date_to": {"type": "string", "description": "YYYY-MM-DD."},
            "min_price_aed": {"type": "number"}, "max_price_aed": {"type": "number"},
            "sort": {"type": "string", "enum": ["newest", "oldest", "cheapest", "priciest"], "description": "Default newest."},

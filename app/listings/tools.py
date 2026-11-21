@@ -11,7 +11,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.database.postgres import fetch
+from app.database.postgres import CLEAN_SALE, fetch
 from app.retrieval.place_lock import contains_place_sql, is_numbered_sibling
 
 MIN_SQFT = 100  # sizes outside this range are data errors (a studio claiming 4,000,000 sqft)
@@ -804,7 +804,7 @@ def _search_projects(a: dict) -> ToolResult:
     out = {
         "matching_projects": total, "showing": len(rows), "sorted_by": sort,
         "source": "propai",
-        "price_note": "price_kind recent_sale is the median sale price from the last 24 months in recorded sales data.",
+        "price_note": "price_kind recent_sale is the median sale price from the last 12 months in recorded sales data.",
         "projects": projects_out,
         "browse_note": (
             "These are recorded projects. List them now. Do not call search_projects again, "
@@ -1050,7 +1050,7 @@ def market_stats(raw) -> ToolResult:
     result = {
         "grouped_by": group_key, "rows": out, "handover_years": years,
         "note": "Project counts are from recorded project data. new_data, when present, is recorded sales "
-                "from the last 24 months and is the price to quote. There is no yield, ROI or price growth.",
+                "from the last 12 months and is the price to quote. There is no yield, ROI or price growth.",
     }
     if f.get("communities"):
         try:
@@ -1233,8 +1233,7 @@ def _sales_where(a: dict) -> tuple[str, list, dict]:
     """Shared filters for recorded sales: place, project/building name, bedrooms, kind, ready or off-plan, dates, price."""
     # Records priced under AED 150 per sq ft are partial transfers or typos (an AED 40,960 "1-bedroom"), not sales.
     a = _lenient(a)
-    parts = ["deleted_at is null", "coalesce(outlier_flag, '') <> 'True'", "sale_price > 0", "instance_date <= current_date",
-             "(property_type = 'Land' or price_per_sqft is null or price_per_sqft >= 150)"]
+    parts = [CLEAN_SALE]
     params: list = []
     used: dict = {}
     place = str(a.get("place") or "").strip()[:80]
@@ -1294,6 +1293,11 @@ def _sales_where(a: dict) -> tuple[str, list, dict]:
             parts.append("instance_date <= %s::date")
             params.append(date_to)
             used["date_to"] = date_to
+        if not (date_from or date_to):
+            # No period asked: the last 12 months, the same window every other price answer uses.
+            # Without this, "median price in X" averaged every sale since 1998.
+            parts.append("instance_date >= current_date - 365")
+            used["last_days"] = 365
     lo, hi = _num(a, "min_price_aed", 0, 10_000_000_000), _num(a, "max_price_aed", 0, 10_000_000_000)
     if lo is not None and hi is not None and lo > hi:
         raise ToolInputError("min_price_aed cannot exceed max_price_aed.")

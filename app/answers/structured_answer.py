@@ -1905,9 +1905,16 @@ def _build_fast_structured_answer(
             for index, project in enumerate(projects, start=1):
                 name = project.get("name") or "Unknown project"
                 value = project.get("handover_time")
-                value = value if value is not None else "Not available"
+                # "2029-09-30 00:00:00" reads as "September 2029".
+                try:
+                    if isinstance(value, (int, float)):
+                        value = _handover_label(value)
+                    elif value:
+                        value = datetime.fromisoformat(str(value)[:10]).strftime("%B %Y")
+                except (ValueError, OverflowError, OSError):
+                    pass
                 lines.append(
-                    f"{index}. {name} | Handover: {value}"
+                    f"{index}. **{name}** | Handover: {value or 'Not available'}"
                 )
             return "\n".join(lines)
 

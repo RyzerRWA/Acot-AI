@@ -18,7 +18,7 @@ import re
 import time
 from datetime import datetime
 
-from app.database.postgres import fetch
+from app.database.postgres import CLEAN_SALE, fetch
 from app.listings.tools import ALIASES
 from app.retrieval.place_lock import (
     asked_keys,
@@ -277,8 +277,7 @@ def _add_sale_facts(projects: list[dict], bedrooms=None) -> None:
     ]
     if missing:
         parts = [
-            "deleted_at is null",
-            "sale_price between 100000 and 2000000000",
+            CLEAN_SALE,
             f"instance_date >= current_date - interval '{int(RECENT_SALE_MONTHS)} months'",
             "upper(project_name_prop_ai) = any(%s)",
         ]
@@ -730,27 +729,63 @@ def agent_projects(
     # Cap candidates before sale stats; ranking still uses the same pool size as before.
     fetch_limit = 200
     query_params = [*params, name] if name else list(params)
+    # A price filter (min / max) is decided in SQL from each project's recent median sale price, so it looks at every
+    # project. Without this the 200 candidates were the first 200 by name and everything after "Ag..." was never seen.
+    band_join, band_params, band_select = "", [], ""
+    lo, hi = filters.get("min_price"), filters.get("max_price")
+    if lo is not None or hi is not None:
+        median = "percentile_cont(0.5) within group (order by sale_price)"
+        band_where = [
+            CLEAN_SALE, "coalesce(project_name_prop_ai, '') <> ''",
+            f"instance_date >= current_date - interval '{int(RECENT_SALE_MONTHS)} months'",
+        ]
+        having = []
+        if filters.get("bedrooms") is not None:
+            band_where.append("bedrooms = %s")
+            band_params.append(int(float(filters["bedrooms"])))
+        if lo is not None:
+            having.append(f"{median} >= %s")
+            band_params.append(lo)
+        if hi is not None:
+            having.append(f"{median} <= %s")
+            band_params.append(hi)
+        band_join = (
+            f"join (select upper(project_name_prop_ai) as band_name, {median} as band_price from propai_sales "
+            f"where {' and '.join(band_where)} group by 1 having {' and '.join(having)}) band on band.band_name = upper(name)"
+        )
+        band_select = ", band_price"
+        if sort == "priciest":
+            ranked = "band_price desc nulls last, name"
+        elif sort == "cheapest":
+            ranked = "band_price asc nulls last, name"
     rows = fetch(
         f"""
         select key, name, developer, area, master_project, offplan_status, end_date, description
         from (
             select distinct on (upper(name))
                    key, name, developer, area, master_project, offplan_status, end_date,
-                   left(description, 400) as description
+                   left(description, 400) as description{band_select}
             from propai_projects
+            {band_join}
             where {where}
             order by upper(name), (developer is not null) desc, name
         ) unique_projects
         order by {ranked}
         limit %s
         """,
-        tuple([*query_params, fetch_limit]),
+        tuple([*band_params, *query_params, fetch_limit]),
     )
     if not rows:
         return [], 0
     # Skip a second count scan when the page is already the full set.
     if len(rows) < fetch_limit:
         total = len(rows)
+    elif band_join:
+        count = fetch(
+            f"select count(distinct upper(name))::int as n from propai_projects {band_join} where {where}",
+            tuple([*band_params, *params]),
+        )
+        total = count[0]["n"] if count else len(rows)
     else:
         count = fetch(
             f"select count(distinct upper(name))::int as n from propai_projects where {where}",
@@ -833,7 +868,7 @@ def agent_projects(
             # Budget answers only from recent recorded sales — never stale catalog.
             and (project.get("last_sold_on") or project.get("last_sale"))
         ]
-        total = len(projects)
+        total = len(projects) if len(rows) < fetch_limit or not band_join else max(total, len(projects))
     elif filters.get("ready_only"):
         # Ready list without budget: still prefer projects with present-window sales.
         with_sales = [
@@ -1011,8 +1046,7 @@ def latest_sales(
     cap = max(1, min(int(limit or 8), 15))
     start = max(0, int(offset or 0))
     parts = [
-        "deleted_at is null",
-        "sale_price between 10000 and 2000000000",
+        CLEAN_SALE,
         "instance_date is not null",
         "coalesce(project_name_prop_ai, '') <> ''",
     ]
@@ -1179,32 +1213,29 @@ def project_named_in_question(question: str | None) -> str | None:
     hint = re.sub(r"^\d+\s*-?\s*", "", hint).strip(" .?-")
     if len(hint) < 3:
         return None
-    rows = fetch(
-        """
-        select project_name_prop_ai as project
-        from propai_sales
-        where deleted_at is null
-          and coalesce(project_name_prop_ai, '') <> ''
-          and upper(project_name_prop_ai) = upper(%s)
-        limit 1
-        """,
-        (hint,),
-    )
-    if rows:
-        return rows[0].get("project")
-    rows = fetch(
-        """
-        select project_name_prop_ai as project
-        from propai_sales
-        where deleted_at is null
-          and coalesce(project_name_prop_ai, '') <> ''
-          and upper(project_name_prop_ai) like upper(%s)
-        order by length(project_name_prop_ai)
-        limit 1
-        """,
-        (f"%{hint}%",),
-    )
-    return rows[0].get("project") if rows else None
+    names = _sale_project_names()
+    wanted = hint.upper()
+    exact = next((name for name in names if name.upper() == wanted), None)
+    if exact:
+        return exact
+    # Shortest name containing the hint (was LIKE '%hint%' over 1.4M rows: ~4 s per question).
+    return min((name for name in names if wanted in name.upper()), key=len, default=None)
+
+
+_SALE_PROJECT_NAMES: tuple[float, list[str]] | None = None
+
+
+def _sale_project_names() -> list[str]:
+    """Distinct project names in recorded sales (~4k), loaded once and kept for 6 hours."""
+    # ponytail: per-process copy refreshed every 6 h; new names after a data refresh show up within that window.
+    global _SALE_PROJECT_NAMES
+    if _SALE_PROJECT_NAMES is None or time.time() - _SALE_PROJECT_NAMES[0] > 6 * 3600:
+        rows = fetch(
+            "select distinct project_name_prop_ai as project from propai_sales "
+            "where deleted_at is null and coalesce(project_name_prop_ai, '') <> ''"
+        )
+        _SALE_PROJECT_NAMES = (time.time(), [row["project"] for row in rows if row.get("project")])
+    return _SALE_PROJECT_NAMES[1]
 
 
 def count_sales(
@@ -1215,8 +1246,7 @@ def count_sales(
 ) -> dict:
     """How many recorded sales match place / beds / calendar month."""
     parts = [
-        "deleted_at is null",
-        "sale_price between 10000 and 2000000000",
+        CLEAN_SALE,
         "instance_date is not null",
         "coalesce(project_name_prop_ai, '') <> ''",
     ]
@@ -1268,8 +1298,7 @@ def sale_window_stats(
     Uses the same outlier filters as cheapest_sale so the numbers agree.
     """
     parts = [
-        "deleted_at is null",
-        "sale_price between 100000 and 2000000000",
+        CLEAN_SALE,
         "(procedure_area_sqft is null or procedure_area_sqft between 200 and 100000)",
         "instance_date is not null",
         "coalesce(project_name_prop_ai, '') <> ''",
@@ -1323,9 +1352,7 @@ def cheapest_sale(
 ) -> dict | None:
     """Lowest (or, with highest=True, highest) non-outlier sale for a project or place."""
     parts = [
-        "deleted_at is null",
-        # Floor removes clear data errors (AED 6k–60k "1-bed" rows).
-        "sale_price between 100000 and 2000000000",
+        CLEAN_SALE,
         # Tiny areas are usually bad rows, not livable 1-beds.
         "(procedure_area_sqft is null or procedure_area_sqft between 200 and 100000)",
         "instance_date is not null",
@@ -1403,13 +1430,12 @@ def top_developers_by_value(limit: int = 5, months: int = 12) -> list[dict]:
     cap = max(1, min(int(limit or 5), 20))
     lookback = max(1, min(int(months or 12), 60))
     rows = fetch(
-        """
+        f"""
         select developer_group as developer,
                count(*)::int as sales,
                sum(sale_price)::bigint as value
         from propai_sales
-        where deleted_at is null
-          and sale_price between 100000 and 2000000000
+        where {CLEAN_SALE}
           and instance_date >= current_date - (%s * interval '1 month')
           and coalesce(developer_group, '') <> ''
         group by 1
@@ -1428,13 +1454,175 @@ def top_developers_by_value(limit: int = 5, months: int = 12) -> list[dict]:
     return out
 
 
-def count_projects() -> int:
-    """Distinct Prop-AI project names in Dubai."""
+_OFF_PLAN_STATUSES = ("ACTIVE", "PENDING", "NOT_STARTED", "CONDITIONAL_ACTIVATING")
+
+
+def count_projects(place: str | None = None, developer: str | None = None, status: str | None = None) -> int:
+    """Distinct residential project names, counted the way the site's project list counts them
+    (no land plots, no cancelled projects). Optional place, developer and status (off_plan / ready)."""
+    parts = [
+        "coalesce(name, '') <> ''", "not is_plot",
+        "coalesce(development_status, '') <> 'CANCELLED'", "lower(coalesce(usage, '')) = 'residential'",
+    ]
+    params: list = []
+    if place and str(place).strip().lower() != "dubai":
+        clause, extra = contains_place_sql(["master_project", "area", "name"], _expanded([str(place)]))
+        parts.append(clause)
+        params.extend(extra)
+    if developer:
+        parts.append("(developer ilike %s or developer_group ilike %s)")
+        params.extend([f"%{developer}%"] * 2)
+    if status == "off_plan":
+        parts.append("development_status = any(%s)")
+        params.append(list(_OFF_PLAN_STATUSES))
+    elif status == "ready":
+        parts.append("development_status = 'FINISHED'")
     rows = fetch(
-        "select count(distinct upper(name))::int as n "
-        "from propai_projects where coalesce(name, '') <> ''"
+        f"select count(distinct upper(name))::int as n from propai_projects where {' and '.join(parts)}",
+        tuple(params),
     )
     return int(rows[0]["n"]) if rows else 0
+
+
+def handover_projects(
+    when: str = "recent", place: str | None = None, limit: int = 10, year: int | None = None
+) -> list[dict]:
+    """Residential projects ranked by handover.
+
+    recent: DLD status FINISHED, newest completion date first (a past planned date alone is not a handover:
+    many such projects are still 0% built). upcoming: under construction, nearest planned handover first.
+    """
+    parts = [
+        "coalesce(name, '') <> ''", "not is_plot", "lower(coalesce(usage, '')) = 'residential'",
+    ]
+    params: list = []
+    if when == "upcoming":
+        parts += ["development_status = 'ACTIVE'", "end_date::date > current_date"]
+        order, date_col = "end_date::date asc", "end_date"
+    else:
+        parts += ["development_status = 'FINISHED'", "completion_date <= current_date"]
+        order, date_col = "completion_date desc", "completion_date"
+    if year:
+        # A named year: every project due (or completed) that year, in date order.
+        parts.append(f"extract(year from {date_col}) = %s")
+        params.append(int(year))
+    if place and str(place).strip().lower() != "dubai":
+        clause, extra = contains_place_sql(["master_project", "area", "name"], _expanded([str(place)]))
+        parts.append(clause)
+        params.extend(extra)
+    rows = fetch(
+        f"""
+        select * from (
+          select distinct on (upper(name)) key, name, area, master_project, developer, developer_group,
+                 percent_completed, {date_col}::date as handover_on
+          from propai_projects
+          where {' and '.join(parts)}
+          order by upper(name), {date_col} desc
+        ) one_per_name
+        order by handover_on {'asc' if when == 'upcoming' else 'desc'}, name
+        limit %s
+        """,
+        (*params, max(1, min(int(limit), 20))),
+    )
+    return [{
+        "id": row["key"],
+        "name": row.get("name"),
+        "developer_name": str(row.get("developer_group") or row.get("developer") or "").title() or None,
+        "community": row.get("master_project") or row.get("area"),
+        "sub_community": row.get("area"),
+        "city": "Dubai",
+        "handover_time": _handover(row.get("handover_on")),
+        "handover_on": row.get("handover_on"),
+        "percent_completed": float(row["percent_completed"]) if row.get("percent_completed") is not None else None,
+        "source": "propai",
+    } for row in rows]
+
+
+def _place_label(value) -> str:
+    text = str(value or "").strip()
+    return text.title() if text.isupper() else text
+
+
+def area_ranking(metric: str, beds: int | None = None, limit: int = 8) -> list[dict]:
+    """Dubai areas ranked over the last 12 months, apartments only so areas compare like for like.
+
+    cheapest_rent / priciest_rent: median yearly rent (registered contracts).
+    cheapest_buy / priciest_buy: median sale price (recorded sales).
+    best_yield: median yearly rent / median sale price (gross, rough: different homes on each side).
+    Areas need at least 200 rents / 100 sales so one odd building cannot top the list.
+    """
+    place = "coalesce(nullif(btrim(master_project_prop_ai), ''), area_name_prop_ai)"
+    bed_sql, bed_params = ("and bedrooms = %s", [int(beds)]) if beds is not None else ("", [])
+    rents = f"""
+        select {place} as place, count(*) as rents,
+               percentile_cont(0.5) within group (order by annual_amount) as rent
+        from propai_rents
+        where deleted_at is null and coalesce(outlier_flag, '') <> 'True' and annual_amount > 0
+          and property_type = 'Apartment' and contract_start_date between current_date - 365 and current_date
+          {bed_sql}
+        group by 1 having count(*) >= 200"""
+    # ponytail: name filter; labour-camp "apartments" in industrial zones are not homes people compare.
+    rents = f"select * from ({rents}) all_rents where place !~* 'industrial'"
+    # Yield compares rents with ready homes: off-plan launch prices are not what a rented flat costs.
+    ready_sql = "and development_status = 'Existing'" if metric == "best_yield" else ""
+    sales = f"""
+        select {place} as place, count(*) as sales,
+               percentile_cont(0.5) within group (order by sale_price) as price
+        from propai_sales
+        where {CLEAN_SALE} and property_sub_type_en = 'Flat' and instance_date >= current_date - 365
+          {ready_sql} {bed_sql}
+        group by 1 having count(*) >= 100"""
+    sales = f"select * from ({sales}) all_sales where place !~* 'industrial'"
+    cap = max(1, min(int(limit), 15))
+    if metric in ("cheapest_rent", "priciest_rent"):
+        sql = f"select place, rents, rent::bigint as rent from ({rents}) r order by rent {'desc' if metric == 'priciest_rent' else 'asc'} limit %s"
+        params = (*bed_params, cap)
+    elif metric in ("cheapest_buy", "priciest_buy"):
+        sql = f"select place, sales, price::bigint as price from ({sales}) s order by price {'desc' if metric == 'priciest_buy' else 'asc'} limit %s"
+        params = (*bed_params, cap)
+    else:
+        sql = f"""select r.place, r.rents, s.sales, r.rent::bigint as rent, s.price::bigint as price,
+                         round((100 * r.rent / s.price)::numeric, 1)::float as yield_pct
+                  from ({rents}) r join ({sales}) s using (place)
+                  order by yield_pct desc limit %s"""
+        params = (*bed_params, *bed_params, cap)
+    return [{**row, "place": _place_label(row["place"])} for row in fetch(sql, params)]
+
+
+def top_projects_by_sales(
+    place: str | None = None, year: int | None = None, months: int = 12, limit: int = 10
+) -> list[dict]:
+    """Projects ranked by number of recorded sales: a calendar year when given, else the last N months."""
+    parts, params = [CLEAN_SALE, "coalesce(project_name_prop_ai, '') <> ''"], []
+    if year:
+        parts.append("extract(year from instance_date) = %s")
+        params.append(int(year))
+    else:
+        parts.append("instance_date >= current_date - (%s * interval '1 month')")
+        params.append(max(1, min(int(months or 12), 60)))
+    if place and str(place).strip().lower() != "dubai":
+        clause, extra = contains_place_sql(
+            ["area_name_prop_ai", "master_project_prop_ai", "project_name_prop_ai"], _expanded([str(place)])
+        )
+        parts.append(clause)
+        params.extend(extra)
+    rows = fetch(
+        f"""
+        select project_name_prop_ai as name,
+               max(coalesce(nullif(btrim(master_project_prop_ai), ''), area_name_prop_ai)) as community,
+               max(developer_group) as developer,
+               count(*)::int as sales,
+               percentile_cont(0.5) within group (order by sale_price)::bigint as median_price
+        from propai_sales
+        where {' and '.join(parts)}
+        group by 1
+        order by sales desc, name
+        limit %s
+        """,
+        (*params, max(1, min(int(limit), 15))),
+    )
+    return [{**row, "name": _place_label(row["name"]), "community": _place_label(row["community"]),
+             "developer": _place_label(row["developer"])} for row in rows]
 
 
 def agent_by_id(agent_id: str) -> dict | None:
@@ -1609,7 +1797,9 @@ def rent_stats(areas=None, beds_min=None, beds_max=None) -> dict | None:
     lock, lock_params = sales_place_sql(asked, _official_areas(asked))
     clauses = [
         "deleted_at is null",
-        "annual_amount > 0",
+        # Under AED 10k a year is a typo or a parking/storage contract (a "2-bed" at AED 125 was the lowest).
+        "coalesce(outlier_flag, '') <> 'True'",
+        "annual_amount >= 10000",
         "contract_start_date >= date '2025-09-01'",
         lock,
     ]
@@ -2090,7 +2280,7 @@ def sale_summary(communities) -> dict | None:
             select count(*)::int as n,
                    percentile_cont(0.5) within group (order by sale_price)::bigint as median
             from propai_sales
-            where deleted_at is null and sale_price > 0
+            where {CLEAN_SALE}
               and instance_date >= current_date - interval '{int(RECENT_SALE_MONTHS)} months'
               and {sales_lock}
             """,
