@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from difflib import get_close_matches
 
-from app.database.postgres import fetch
+from app.database.postgres import CLEAN_SALE, fetch
 from app.listings.tools import ALIASES, area_stats, market_stats
 
 # Short, safe descriptions of well-known areas. General knowledge, not ACOT data.
@@ -155,7 +155,7 @@ def market_signals(official: str) -> dict | None:
     if official not in _signals:
         rows = fetch(
             "with s as (select instance_date, price_per_sqft from public.propai_sales"
-            " where upper(area_name_prop_ai) = upper(%s) and deleted_at is null and coalesce(outlier_flag,'') <> 'True'"
+            f" where upper(area_name_prop_ai) = upper(%s) and {CLEAN_SALE}"
             " and instance_date between current_date - interval '24 months' and current_date),"
             " cur as (select * from s where instance_date >= current_date - interval '12 months'),"
             " prev as (select * from s where instance_date < current_date - interval '12 months')"
