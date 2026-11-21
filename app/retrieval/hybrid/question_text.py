@@ -121,6 +121,12 @@ _KEEP_WORDS = {
     "rent", "rents", "rental", "rentals", "renting", "tenant", "tenants", "lease", "leases",
     "yield", "yields", "sale", "sales", "sold", "parents", "family", "families", "schools", "central",
     "date", "dates", "rate", "rates", "area", "areas", "data",
+    # Real comparatives/superlatives two edits from a domain word: "nearest hotel" became "newest hotel"
+    # (a handover list), "closest" -> "lowest", "largest" -> "latest", "visas" -> "villas".
+    "near", "nearer", "nearest", "nearby", "close", "closer", "closest", "big", "bigger", "biggest",
+    "large", "larger", "largest", "small", "smaller", "smallest", "nice", "nicer", "nicest", "new", "newer",
+    "old", "older", "oldest", "cheaper", "safest", "quietest", "busiest", "tallest", "hottest", "highest",
+    "visa", "visas", "hotel", "hotels",
 }
 
 _GENERIC_WORDS = {
