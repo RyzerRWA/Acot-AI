@@ -1,0 +1,1 @@
+python -m app.Viedo_generation.run fd9420b8-819e-4ace-817d-01e8c04ce9d1 --job-id preview
