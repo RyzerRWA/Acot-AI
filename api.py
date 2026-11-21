@@ -478,7 +478,7 @@ def health_check():
     return {
         "status": "ok",
         "service": "ACOT",
-        "message": "ACOT FastAPI backend is running. in open ai creditinale"
+        "message": "ACOT FastAPI backend is running. in open ai creditinale new api key onfigure"
     }
 
 
