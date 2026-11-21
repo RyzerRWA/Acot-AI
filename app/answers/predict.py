@@ -5,7 +5,7 @@ import re
 from datetime import datetime
 from typing import Any
 
-from app.database.postgres import fetch
+from app.database.postgres import CLEAN_SALE, fetch
 
 
 def _change_pct(now, before) -> float | None:
@@ -61,9 +61,7 @@ def fetch_place_trend(place: str) -> dict[str, Any] | None:
             with s as (
               select instance_date, sale_price, price_per_sqft
               from public.propai_sales
-              where deleted_at is null
-                and coalesce(outlier_flag, '') <> 'True'
-                and sale_price > 0
+              where {CLEAN_SALE}
                 and instance_date between current_date - interval '24 months' and current_date
                 and {lock}
             ),
@@ -118,9 +116,7 @@ def fetch_bedroom_median(place: str, bedrooms: int) -> dict[str, Any] | None:
                    percentile_cont(0.5) within group (order by sale_price)::float8 as median,
                    max(instance_date) as as_of
             from public.propai_sales
-            where deleted_at is null
-              and coalesce(outlier_flag, '') <> 'True'
-              and sale_price > 0
+            where {CLEAN_SALE}
               and instance_date >= current_date - interval '12 months'
               and bedrooms between %s - 0.2 and %s + 0.2
               and {lock}
@@ -196,7 +192,7 @@ def attach_latest_project_sales(projects: list[dict] | None) -> list[dict]:
         return rows
     try:
         stats = fetch(
-            """
+            f"""
             select upper(project_name_prop_ai) as name,
                    max(instance_date) as sold_on,
                    (array_agg(sale_price order by instance_date desc))[1] as price,
@@ -209,9 +205,7 @@ def attach_latest_project_sales(projects: list[dict] | None) -> list[dict]:
                        and bedrooms between 0 and 10
                    ) as bedroom_max
             from public.propai_sales
-            where deleted_at is null
-              and sale_price > 0
-              and coalesce(outlier_flag, '') <> 'True'
+            where {CLEAN_SALE}
               and upper(project_name_prop_ai) = any(%s)
             group by 1
             """,
@@ -411,13 +405,8 @@ def format_trend_answer(place: str, trend: dict | None, projects: list[dict] | N
             lines.append("Example projects from this area are on the cards below.")
         lines.append(f"I can show recent {place} 1-beds or 2-beds next.")
         return "\n".join(lines)
-    if names:
-        return (
-            f"I can help with {place} from the projects we have. "
-            "They are on the cards below.\n\n"
-            "Want these, or a nearby area with recorded sales?"
-        )
+    # No recorded trend: say so instead of a vague offer (users read it as a dodge).
     return (
-        f"I can help with {place} from the projects and sales in our data. "
-        "Share a budget or bedroom count and I’ll match options."
+        f"We don't have enough recorded sales for {place} to show a price trend, "
+        "so I can't make a prediction there."
     )

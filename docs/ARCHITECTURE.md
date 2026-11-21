@@ -11,7 +11,7 @@ ACOT (Automated Real Estate Advisory & Operational Intelligence) is a grounded A
 When a user submits a query through `run.py`, the following sequence executes:
 
 ```mermaid
-sequenceDiagram
+sequenceDiagram 
     autonumber
     actor User
     participant CLI as CLI / run.py

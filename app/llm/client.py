@@ -258,11 +258,13 @@ class AICreditsClient:
                     "content": prompt,
                 }
             ],
-            max_tokens=(
+            # OpenAI rejects max_tokens for gpt-6 models; max_completion_tokens works everywhere.
+            max_completion_tokens=(
                 max_output_tokens
                 if max_output_tokens is not None
                 else self.max_output_tokens
             ),
+            temperature=0,  # same question, same answer
             **llm_chat_extras(model),
         )
 
@@ -332,7 +334,8 @@ class AICreditsClient:
                     "content": prompt,
                 }
             ],
-            max_tokens=(
+            # OpenAI rejects max_tokens for gpt-6 models; max_completion_tokens works everywhere.
+            max_completion_tokens=(
                 max_output_tokens
                 if max_output_tokens is not None
                 else self.max_output_tokens
@@ -341,6 +344,7 @@ class AICreditsClient:
             stream_options={
                 "include_usage": True
             },
+            temperature=0,  # same question, same answer
             **llm_chat_extras(model),
         )
 

@@ -742,17 +742,8 @@ class EntityResolver:
             ):
                 return self._listing_sub_communities_cache
 
-        try:
-            rows = fetch(
-                "select distinct sub_community as name, community "
-                "from listings "
-                "where sub_community is not null "
-                "  and btrim(sub_community) <> '' "
-                "limit 5000"
-            ) or []
-        except Exception as exc:
-            print(f"Listing sub-community catalog failed: {exc}")
-            rows = []
+        # Old Bayut `listings` table is retired — no sub-community catalog from it.
+        rows: List[Dict[str, Any]] = []
 
         with self._catalog_lock:
             self._listing_sub_communities_cache = rows

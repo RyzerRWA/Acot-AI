@@ -3,6 +3,7 @@
 import re
 from datetime import datetime, timezone
 
+from app.answers.grounding import ground_project_row, ground_project_rows
 from app.retrieval.hybrid.question_text import collapse_stretched_letters
 
 
@@ -124,9 +125,17 @@ def _format_aed(value):
 
 
 def _recent_sale_row(record) -> bool:
-    kind = str((record or {}).get("price_kind") or "").lower()
-    source = str((record or {}).get("source") or "").lower()
-    return kind in {"recent_sale", "latest_sale"} or source == "propai"
+    """True only when sale kind is set and a grounded price (or sale date) exists."""
+    record = record or {}
+    kind = str(record.get("price_kind") or "").lower()
+    if kind not in {"recent_sale", "latest_sale"}:
+        return False
+    try:
+        has_price = record.get("price") is not None and float(record["price"]) > 0
+    except (TypeError, ValueError):
+        has_price = False
+    has_sale_date = bool(record.get("last_sold_on") or record.get("last_sale"))
+    return has_price or has_sale_date
 
 
 def _price_clause(record, *, sentence: bool = False) -> str | None:
@@ -134,6 +143,12 @@ def _price_clause(record, *, sentence: bool = False) -> str | None:
     if not text:
         return None
     if _recent_sale_row(record):
+        sold = str(
+            (record or {}).get("last_sold_on") or (record or {}).get("last_sale") or ""
+        ).strip()[:10]
+        if sold and re.match(r"^\d{4}-\d{2}-\d{2}$", sold):
+            bit = f"Recent sale {text} (recorded {sold})."
+            return bit if sentence else bit.rstrip(".")
         return f"Recent sale {text}." if sentence else f"recent sale {text}"
     return f"Starting price {text}." if sentence else f"Starting price: {text}"
 
@@ -152,6 +167,22 @@ def _format_handover_month(value):
         return None
 
     return parsed.strftime("%B %Y")
+
+
+def _handover_is_upcoming(value) -> bool:
+    """True only when handover is still ahead — past completion years are not 'current'."""
+    if value is None:
+        return False
+    text = str(value).strip()
+    if not text:
+        return False
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if parsed.tzinfo is not None:
+        parsed = parsed.replace(tzinfo=None)
+    return parsed.date() >= datetime.now().date()
 
 
 def _listing_photo_urls(record):
@@ -242,6 +273,11 @@ def _format_project_card(record):
     investment metrics are invented here.
     """
 
+    record = ground_project_row(record)
+    price_kind = record.get("price_kind")
+    if not price_kind and _recent_sale_row(record):
+        price_kind = "recent_sale"
+
     return {
         "id": _json_safe(record.get("id")),
         "name": record.get("name"),
@@ -251,9 +287,7 @@ def _format_project_card(record):
         "community": record.get("community"),
         "sub_community": record.get("sub_community"),
         "price": _json_safe(record.get("price")),
-        "price_kind": record.get("price_kind") or (
-            "recent_sale" if _recent_sale_row(record) else None
-        ),
+        "price_kind": price_kind,
         "price_label": (
             _price_clause(record)
             if record.get("price") is not None
@@ -277,8 +311,10 @@ def _format_project_card(record):
         "handover_time": _json_safe(
             record.get("handover_time")
         ),
-        "last_sold_on": _json_safe(
-            record.get("last_sold_on") or record.get("last_sale")
+        # Sale facts use last_sale; cards and chat text must show the same date.
+        "last_sold_on": _json_safe(record.get("last_sold_on")),
+        "last_sale": _json_safe(
+            record.get("last_sale") or record.get("last_sold_on")
         ),
         "sales_count": _json_safe(
             record.get("sales_count") or record.get("sales")
@@ -555,10 +591,105 @@ def _side_snapshot(name, records):
     }
 
 
+def _clean_check_bullet(text: str) -> str:
+    """Turn a scored-factor sentence into a Why bullet without markdown labels."""
+    clean = re.sub(r"\*\*", "", str(text or "")).strip()
+    clean = re.sub(
+        r"^(?:Price|Yearly rent|Size|Bedrooms|Handover|Readiness|"
+        r"More space|More bedrooms|More recent sales activity|"
+        r"Recorded price|Recorded size|Recorded bedrooms|"
+        r"Recorded sales activity|Lower price|Lower yearly rent)\s*:\s*",
+        "",
+        clean,
+        flags=re.I,
+    ).strip()
+    return clean.rstrip(".")
+
+
+def _pairwise_why_bullets(winner, loser, checks) -> list[str]:
+    """Fact-rich head-to-head Why lines for the pairwise recommend block."""
+    bullets = []
+    seen = set()
+    for name, _factor, text in checks:
+        if name != winner["name"]:
+            continue
+        line = _clean_check_bullet(text)
+        if not line:
+            continue
+        key = line.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        bullets.append(f"- {line}.")
+
+    joined = " ".join(bullets).lower()
+    # Extra contrast only when checks did not already cover that field.
+    if (
+        winner.get("price") is not None
+        and loser.get("price") is None
+        and "price" not in joined
+    ):
+        bullets.append(
+            f"- {winner['name']} shows a recorded price of {_format_aed(winner['price'])}, "
+            f"while {loser['name']} has no price on these records."
+        )
+    elif (
+        winner.get("price") is not None
+        and loser.get("price") is not None
+        and winner["price"] != loser["price"]
+        and "price" not in joined
+    ):
+        bullets.append(
+            f"- Recorded price {_format_aed(winner['price'])} for "
+            f"{winner['name']} vs {_format_aed(loser['price'])} for {loser['name']}."
+        )
+
+    joined = " ".join(bullets).lower()
+    if (
+        winner.get("sales_count")
+        and not loser.get("sales_count")
+        and "sales" not in joined
+    ):
+        bullets.append(
+            f"- Stronger recent sales evidence on {winner['name']} "
+            f"({int(winner['sales_count'])} recorded sales) than {loser['name']}."
+        )
+    elif (
+        winner.get("sales_count")
+        and loser.get("sales_count")
+        and winner["sales_count"] != loser["sales_count"]
+        and "sales" not in joined
+    ):
+        bullets.append(
+            f"- More recent sales on {winner['name']} "
+            f"({int(winner['sales_count'])} vs {int(loser['sales_count'])} for "
+            f"{loser['name']})."
+        )
+
+    loser_edges = [
+        _clean_check_bullet(text)
+        for name, _factor, text in checks
+        if name == loser["name"]
+    ]
+    if loser_edges:
+        edge = loser_edges[0]
+        bullets.append(
+            f"- Also worth reviewing {loser['name']}: {edge}."
+        )
+    else:
+        bullets.append(f"- Also worth reviewing: {loser['name']}.")
+    return bullets[:6]
+
+
 def _score_snapshots(left, right):
-    """Score two sides from shared fields. Higher means stronger on those fields."""
+    """Score two sides from shared fields. Higher means stronger on those fields.
+
+    A side with recorded price/beds/size/sales must not lose solely because the
+    other side only has an earlier handover (thin catalog row).
+    """
 
     checks = []
+    _MARKET_KEYS = ("price", "beds", "size", "sales_count")
 
     def _table_cell(value):
         return (
@@ -567,6 +698,9 @@ def _score_snapshots(left, right):
             .replace("|", "\\|")
             .replace("\n", " ")
         )
+
+    def _coverage(side):
+        return sum(1 for key in _MARKET_KEYS if side.get(key) is not None)
 
     rent_frequency = left.get("frequency")
     if rent_frequency == right.get("frequency") and rent_frequency:
@@ -613,8 +747,38 @@ def _score_snapshots(left, right):
             ),
         ))
 
+    def prefer_present(key, factor, formatter, noun):
+        """Credit the side that has a recorded value when the other does not."""
+        left_value = left.get(key)
+        right_value = right.get(key)
+        if (left_value is None) == (right_value is None):
+            return
+        present = left if left_value is not None else right
+        missing = right if present is left else left
+        value = present.get(key)
+        checks.append((
+            present["name"],
+            factor,
+            (
+                f"{present['name']} has a recorded {noun} ({formatter(value)}), "
+                f"while {missing['name']} does not on these records."
+            ),
+        ))
+
     prefer_low("price", price_factor, lambda value: _format_aed(value) or str(value))
+    prefer_present(
+        "price",
+        "recorded price",
+        lambda value: _format_aed(value) or str(value),
+        "price",
+    )
     prefer_high("size", "more space", lambda value: f"{int(value):,} sqft")
+    prefer_present(
+        "size",
+        "recorded size",
+        lambda value: f"{int(value):,} sqft",
+        "size",
+    )
 
     def _bedroom_text(value):
         if value == 0:
@@ -624,10 +788,17 @@ def _score_snapshots(left, right):
         return f"{value:g} bedrooms"
 
     prefer_high("beds", "more bedrooms", _bedroom_text)
+    prefer_present("beds", "recorded bedrooms", _bedroom_text, "bedroom count")
     prefer_high(
         "sales_count",
         "more recent sales activity",
         lambda value: f"{int(value):,} sales",
+    )
+    prefer_present(
+        "sales_count",
+        "recorded sales activity",
+        lambda value: f"{int(value):,} sales",
+        "sales activity",
     )
     left_handover = left.get("handover")
     right_handover = right.get("handover")
@@ -663,6 +834,28 @@ def _score_snapshots(left, right):
     right["score"] = right_score
     winner = left if left_score >= right_score else right
     loser = right if winner is left else left
+    # Handover-only wins must not crown a thin catalog row over a fuller record.
+    winner_factors = [factor for name, factor, _text in checks if name == winner["name"]]
+    if (
+        winner_factors
+        and set(winner_factors) <= {"earlier handover"}
+        and _coverage(loser) > _coverage(winner)
+    ):
+        checks[:] = [
+            item for item in checks
+            if item[1] != "earlier handover"
+        ]
+        left_wins = sum(1 for name, _factor, _text in checks if name == left["name"])
+        right_wins = len(checks) - left_wins
+        if not checks or left_wins == right_wins:
+            left_score = right_score = 50
+        else:
+            left_score = round(40 + 60 * left_wins / len(checks))
+            right_score = round(40 + 60 * right_wins / len(checks))
+        left["score"] = left_score
+        right["score"] = right_score
+        winner = left if left_score >= right_score else right
+        loser = right if winner is left else left
     table_rows = [
         f"| Factor | {_table_cell(left['name'])} | {_table_cell(right['name'])} |",
         "| --- | --- | --- |",
@@ -714,37 +907,53 @@ def _score_snapshots(left, right):
         recommendation = (
             f"**Acot Recommend:** {left['name']} and {right['name']}\n"
             "**Why:**\n"
-            "- Each brings helpful recorded details to compare next.\n"
-            "- A good next step is to match them to your preferred layout and community feel."
+            "- Recorded price, size, bedroom and handover details are still light "
+            "for a firm pick.\n"
+            "- Match them next to the layout, community and budget you care about most."
         )
     elif left_score == right_score:
-        left_advantages = ", ".join(factor_wins[left["name"]])
-        right_advantages = ", ".join(factor_wins[right["name"]])
+        left_bullets = _pairwise_why_bullets(left, right, checks)
+        right_bullets = _pairwise_why_bullets(right, left, checks)
+        # Drop the mutual "also worth reviewing" tails for a balanced block.
+        left_core = [line for line in left_bullets if "also worth reviewing" not in line.lower()]
+        right_core = [line for line in right_bullets if "also worth reviewing" not in line.lower()]
+        left_advantages = ", ".join(factor_wins[left["name"]]) or "balanced factors"
+        right_advantages = ", ".join(factor_wins[right["name"]]) or "balanced factors"
         conclusion = (
             f"Conclusion: The comparison is balanced. {left['name']} leads on "
             f"{left_advantages}, while {right['name']} leads on {right_advantages}."
         )
+        why_parts = left_core[:2] + right_core[:2]
+        if not why_parts:
+            why_parts = [
+                f"- {left['name']} and {right['name']} split the recorded factors evenly."
+            ]
+        why_parts.append(
+            "- Pick the one that matches the lifestyle factor you value most."
+        )
         recommendation = (
             f"**Acot Recommend:** {left['name']} and {right['name']}\n"
             f"**Why:**\n"
-            f"- {left['name']} stands out for {left_advantages}.\n"
-            f"- {right['name']} stands out for {right_advantages}.\n"
-            f"- Pick the one that matches the lifestyle factor you value most."
+            + "\n".join(why_parts)
         )
     else:
-        winning_factors = ", ".join(factor_wins[winner["name"]])
+        winning_factors = ", ".join(factor_wins[winner["name"]]) or "recorded factors"
         conclusion = (
             f"Conclusion: {winner['name']} leads on the recorded factors "
             f"({winning_factors})."
         )
-        why_lines = "\n".join(
-            f"- Stands out for {factor}" for factor in factor_wins[winner["name"]]
-        )
+        why_lines = _pairwise_why_bullets(winner, loser, checks)
         recommendation = (
             f"**Acot Recommend:** {winner['name']}\n"
             f"**Why this is the strongest match:**\n"
-            f"{why_lines or '- Strong balance across the recorded comparison factors.'}\n"
-            f"- Also worth reviewing: {loser['name']}."
+            + "\n".join(
+                why_lines
+                or [
+                    f"- Stronger balance of recorded price, size, bedrooms and market "
+                    f"activity than {loser['name']}.",
+                    f"- Also worth reviewing: {loser['name']}.",
+                ]
+            )
         )
 
     return f"{intro}\n\n{table}\n\n{conclusion}\n{recommendation}"
@@ -1011,10 +1220,12 @@ def build_frontend_response(
     Structured database records are exposed as frontend-friendly `data`.
     """
 
-    projects = structured_summary.get(
-        "projects",
-        []
-    ) or []
+    # Phase 6: ground before cards so price_kind / last_sold_on match answer text.
+    projects = ground_project_rows(
+        structured_summary.get("projects", []) or []
+    )
+    if isinstance(structured_summary, dict):
+        structured_summary["projects"] = projects
 
     communities = structured_summary.get(
         "community",
@@ -1029,7 +1240,6 @@ def build_frontend_response(
     formatted_projects = [
         _format_project_card(project)
         for project in projects
-        if isinstance(project, dict)
     ]
 
     formatted_communities = [
@@ -1327,13 +1537,94 @@ def _listing_answer(listings, structured_summary, question=None):
 
 
 _BROWSE_REQUEST = re.compile(
-    r"\b(?:i want|i need|looking for|interested in|show me|give me|list|find|suggest)\b"
+    r"\b(?:i want|i need|looking for|interested in|"
+    r"show(?:\s+me|\s+only)?|give me|list|find|suggest|browse)\b",
+    re.I,
 )
 _REQUESTED_COUNT = re.compile(
     r"\b(?:want|need|show me|give me|list|find|top|any|suggest)\s+(\d{1,2})\b"
     r"(?!\s*-?\s*(?:bed|bedroom|bedrooms|br|bath|sqft|million|m|k)\b)"
 )
 DEFAULT_BROWSE_COUNT = 10
+
+
+def _is_project_browse_question(question: str | None) -> bool:
+    """True when the user is searching/filtering projects, not asking one field about a shortlist."""
+    text = question or ""
+    if _BROWSE_REQUEST.search(text):
+        return True
+    return bool(
+        re.search(r"\b(?:show|find|list)\b", text, re.I)
+        and re.search(
+            r"\b(?:apartments?|projects?|villas?|townhouses?|homes?|propert(?:y|ies)|flats?)\b",
+            text,
+            re.I,
+        )
+    )
+
+
+def _filter_aware_browse_intro(question, projects, structured_summary) -> str | None:
+    """Open with matching count (ready / beds / place / budget) — no Understood line."""
+    from app.answers.intent_route import parse_bedrooms, parse_budget_aed, extract_place
+
+    text = question or ""
+    place = (
+        str(structured_summary.get("catalog_place") or "").strip()
+        or extract_place(text)
+    )
+    beds = parse_bedrooms(text)
+    budget = parse_budget_aed(text)
+    asked_max = structured_summary.get("asked_max_price")
+    if asked_max is None:
+        asked_max = budget
+    ready = bool(re.search(r"\b(?:ready(?:\s+only)?|only\s+ready|completed)\b", text, re.I))
+    under = bool(re.search(r"\b(?:under|below|up\s+to|max(?:imum)?)\b", text, re.I))
+    above = bool(re.search(r"\b(?:above|over|starting)\b", text, re.I))
+    # Place-only browse keeps the plain "I found N projects in X" opener.
+    if not (beds or budget is not None or ready or structured_summary.get("budget_miss")):
+        return None
+
+    bits = []
+    if ready:
+        bits.append("ready")
+    if beds:
+        if beds[0] == 0:
+            bits.append("studio")
+        else:
+            bits.append(f"{beds[0]}-bedroom")
+    where = f" in {place}" if place and str(place).lower() != "dubai" else ""
+    count = len(projects)
+
+    # Budget miss: explain the miss, then show related projects near that range.
+    if structured_summary.get("budget_miss") and asked_max is not None:
+        lowest = structured_summary.get("lowest_price")
+        low_bit = (
+            f" Related recorded sales in that area start around AED {int(lowest):,}."
+            if lowest is not None
+            else " I do have related projects nearby in price."
+        )
+        bed_bit = ""
+        if beds:
+            bed_bit = "studio " if beds[0] == 0 else f"{beds[0]}-bedroom "
+        ready_bit = "ready " if ready else ""
+        return (
+            f"I don't have recorded {ready_bit}{bed_bit}sales{where} "
+            f"under AED {int(asked_max):,} in the last 12 months.{low_bit} "
+            f"Here are {count} related options in that range:"
+        )
+
+    bits.append("options" if count != 1 else "option")
+    budget_bit = ""
+    if budget is not None:
+        budget_bit = (
+            f" under AED {int(budget):,}"
+            if under or not above
+            else f" from AED {int(budget):,}"
+        )
+    return (
+        f"Here are {count} {' '.join(bits)}{where}{budget_bit} "
+        "from recorded sales in the last 12 months when available:"
+    )
 
 
 def _limit_browse_projects(question, projects, structured_summary):
@@ -1343,7 +1634,7 @@ def _limit_browse_projects(question, projects, structured_summary):
     (the conversation memory keeps the full list in the same order). The summary is cut in place, so the
     cards the app draws match the text, and it gains project_total ("I found 165 projects. Here are 10").
     """
-    if len(projects) <= 1 or not _BROWSE_REQUEST.search(question):
+    if len(projects) <= 1 or not _is_project_browse_question(question):
         return projects, structured_summary, False
 
     match = _REQUESTED_COUNT.search(question)
@@ -1433,7 +1724,9 @@ def _build_fast_structured_answer(
             lines.append(f"- **{title}**. {bedroom_text}.")
         return "\n".join(lines)
 
-    projects = structured_summary.get("projects", []) or []
+    projects = ground_project_rows(structured_summary.get("projects", []) or [])
+    if isinstance(structured_summary, dict):
+        structured_summary["projects"] = projects
     communities = structured_summary.get("community", []) or []
     sub_communities = structured_summary.get("sub_communities", []) or []
 
@@ -1448,13 +1741,15 @@ def _build_fast_structured_answer(
     # filter. `filter_evidence_projects` contains the previous candidates
     # so we can explain the result using the PostgreSQL data.
     if structured_summary.get("filter_no_match"):
-        evidence_projects = (
-            structured_summary.get(
-                "filter_evidence_projects",
-                []
-            )
-            or []
+        # Honest empty: never leave stale matched cards when the filter failed.
+        if isinstance(structured_summary, dict):
+            structured_summary["projects"] = []
+        projects = []
+        evidence_projects = ground_project_rows(
+            structured_summary.get("filter_evidence_projects", []) or []
         )
+        if isinstance(structured_summary, dict):
+            structured_summary["filter_evidence_projects"] = evidence_projects
 
         bedroom_match = re.search(
             r"\b(\d+)\s*(?:-?\s*)bed(?:room)?s?\b",
@@ -1494,6 +1789,10 @@ def _build_fast_structured_answer(
                 "Share the area, budget, or bedroom count again and I’ll search fresh "
                 "instead of filtering the old list."
             )
+        return (
+            "None of the projects I have matched that filter. "
+            "Share the area, budget, or bedroom count again and I’ll search fresh."
+        )
 
     if projects:
         lines = []
@@ -1519,11 +1818,20 @@ def _build_fast_structured_answer(
             for term in ("price", "prices", "cost", "budget", "budgets")
         )
 
-        if browsing:
-            # "I want 1-bedroom apartments" names a bedroom FILTER; it is not a question
-            # about the bedroom field, so show the normal list (price, bedrooms, handover).
+        # Browse/filter asks ("show only ready 1-bedroom…") must explain the match
+        # with price/ready facts — never collapse to a bedrooms-only stub list.
+        if browsing or _is_project_browse_question(question):
             wants_bedrooms = wants_handover = wants_developer = False
             wants_status = wants_price = False
+        else:
+            try:
+                from app.retrieval.hybrid.question_text import is_group_attribute_question
+
+                if not is_group_attribute_question(question):
+                    wants_bedrooms = wants_handover = wants_developer = False
+                    wants_status = wants_price = False
+            except Exception:
+                pass
 
         # Field-specific follow-up answers.
         if len(projects) == 1:
@@ -1597,9 +1905,16 @@ def _build_fast_structured_answer(
             for index, project in enumerate(projects, start=1):
                 name = project.get("name") or "Unknown project"
                 value = project.get("handover_time")
-                value = value if value is not None else "Not available"
+                # "2029-09-30 00:00:00" reads as "September 2029".
+                try:
+                    if isinstance(value, (int, float)):
+                        value = _handover_label(value)
+                    elif value:
+                        value = datetime.fromisoformat(str(value)[:10]).strftime("%B %Y")
+                except (ValueError, OverflowError, OSError):
+                    pass
                 lines.append(
-                    f"{index}. {name} | Handover: {value}"
+                    f"{index}. **{name}** | Handover: {value or 'Not available'}"
                 )
             return "\n".join(lines)
 
@@ -1632,13 +1947,23 @@ def _build_fast_structured_answer(
                 )
             return "\n".join(lines)
 
-        # Default browse answer.
+        # Default browse answer — explain the ask, then grounded project facts.
         intro = _browse_intro(
             projects,
             ambiguous_label=structured_summary.get("ambiguous_label"),
         )
+        filter_intro = _filter_aware_browse_intro(
+            question, projects, structured_summary
+        )
+        if filter_intro:
+            intro = filter_intro
         project_total = structured_summary.get("project_total")
-        if isinstance(project_total, int) and project_total > len(projects):
+        # Budget-miss intros must not be replaced by a generic "I found N projects" block.
+        if (
+            not structured_summary.get("budget_miss")
+            and isinstance(project_total, int)
+            and project_total > len(projects)
+        ):
             where = ""
             named_place = str(structured_summary.get("catalog_place") or "").strip()
             if named_place:
@@ -1653,10 +1978,34 @@ def _build_fast_structured_answer(
                 else:
                     bed_bit = f" that include {beds[0]}-bedroom units"
             more = " more" if wants_more_results(question) else ""
-            intro = (
-                f"I found {project_total} projects{where}{bed_bit}. "
-                f"Here are {len(projects)}{more} of them:"
+            ready_bit = (
+                " ready"
+                if re.search(r"\b(?:ready(?:\s+only)?|only\s+ready)\b", q, re.I)
+                else ""
             )
+            from app.answers.explain_contract import build_browse_narrative
+
+            named_for_narrative = str(structured_summary.get("catalog_place") or "").strip() or None
+            intro = build_browse_narrative(
+                place=named_for_narrative,
+                total=project_total,
+                shown=len(projects),
+                beds=beds[0] if beds else None,
+                ready_only=bool(ready_bit),
+                more=bool(more),
+            )
+            # Keep the classic count sentence for downstream asserts / scanners.
+            intro = (
+                f"I found {project_total}{ready_bit} projects{where}{bed_bit}. "
+                f"Here are {len(projects)}{more} of them "
+                "(prices from recorded sales in the last 12 months when available):\n\n"
+                + "\n\n".join(intro.split("\n\n")[1:])
+            )
+            if filter_intro and project_total <= len(projects):
+                intro = filter_intro
+        elif structured_summary.get("budget_miss") and filter_intro:
+            intro = filter_intro
+        # Browse lists: facts only — no duplicated Understood / motive block.
         lines = [intro, ""]
 
         for project in projects:
@@ -1679,9 +2028,23 @@ def _build_fast_structured_answer(
             if bedroom_text:
                 details.append(f"{bedroom_text}.")
 
-            handover_text = _format_handover_month(project.get("handover_time"))
-            if handover_text:
-                details.append(f"Handover {handover_text}.")
+            # Ready stock: never lead with decade-old handover years — quote the
+            # recorded sale date instead. Upcoming handover stays for off-plan.
+            handover_raw = project.get("handover_time")
+            if _handover_is_upcoming(handover_raw):
+                handover_text = _format_handover_month(handover_raw)
+                if handover_text:
+                    details.append(f"Handover {handover_text}.")
+            else:
+                sold = str(
+                    project.get("last_sold_on") or project.get("last_sale") or ""
+                ).strip()[:10]
+                if sold and re.match(r"^\d{4}-\d{2}-\d{2}$", sold) and "recorded" not in (
+                    price_text or ""
+                ).lower():
+                    details.append(f"Last recorded sale {sold}.")
+                elif not price_text:
+                    details.append("Ready (completed).")
 
             community = str(project.get("community") or "").strip()
             if community and len(projects) == 1:

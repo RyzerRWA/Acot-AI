@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from app.listings.agent import AgentResult, ListingAgent, strip_links
 from app.listings.router import is_rent_browse, is_rent_question
-from app.listings.tools import ToolInputError, parse_filters, run_tool
+from app.listings.tools import ToolInputError, _lenient, _sales_where, parse_filters, run_tool
 
 
 class FilterTests(unittest.TestCase):
@@ -703,6 +703,25 @@ class SessionStoreTests(unittest.TestCase):
             self.store.save("s3", [], {})                     # must not raise
             self.assertEqual(self.store.load("s3"), ([], {}))
 
+class SalesToolTests(unittest.TestCase):
+    def test_empty_values_mean_not_given_but_studio_stays(self):
+        a = _lenient({"bedrooms": -1, "handover_year": 0, "max_price_aed": 0, "limit": 0, "min_price_aed": 5_000_000})
+        self.assertEqual(a, {"min_price_aed": 5_000_000})
+        self.assertEqual(_lenient({"bedrooms": 0}), {"bedrooms": 0})  # 0 bedrooms is a studio
+
+    def test_sales_filters(self):
+        where, params, used = _sales_where({"place": "Dubai", "bedrooms": 1, "status": "ready", "month": "2026-11"})
+        self.assertNotIn("place", used)  # "Dubai" is the whole city, not a place filter
+        self.assertEqual(used["status"], "ready")
+        self.assertIn("development_status = 'Existing'", where)
+        self.assertIn(1, params)
+        for bad in ({"month": "Nov 2026"}, {"date_from": "yesterday"}, {"property_type": "castle"}, {"min_price_aed": 9, "max_price_aed": 1}):
+            with self.assertRaises(ToolInputError, msg=str(bad)):
+                _sales_where(bad)
+        with self.assertRaises(ToolInputError):
+            run_tool("sales_search", {"sort": "random"})
+
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -744,41 +763,54 @@ class RentBrowseSearchTests(unittest.TestCase):
         self.assertEqual((args["beds_min"], args["beds_max"]), (1, 1))
         self.assertEqual(args["property_types"], ["Apartments"])
         self.assertEqual(args["limit"], 10)
+        self.assertEqual(args["sort"], "newest")
+
+        cheap = listing_search_args(
+            "Show me the cheapest 1 bedroom rentals in Dubai Marina.",
+            {"bedrooms": 1},
+        )
+        self.assertEqual(cheap["sort"], "cheapest")
 
     def test_retrieve_listings_uses_the_sql_tool(self):
         from app.retrieval.hybrid import listing_turns
 
-        class FakeResult:
-            def __init__(self):
-                self.output = {"matching_listings": 69, "showing": 2}
-                self.cards = [
-                    {
-                        "listing_id": "12516347",
-                        "title": "Chiller Free | High Floor | Vacant",
-                        "community": "Dubai Marina",
-                        "beds": 1,
-                        "annual_rent_aed": 95000,
-                        "property_type": "Apartments",
-                    },
-                    {
-                        "listing_id": "16792381",
-                        "title": "Spacious 1BR | Multiple Cheques | Prime Location",
-                        "community": "Dubai Marina",
-                        "beds": 1,
-                        "annual_rent_aed": 84999,
-                        "property_type": "Apartments",
-                    },
-                ]
+        rows = [
+            {
+                "listing_id": "12516347",
+                "title": "Chiller Free | High Floor | Vacant",
+                "community": "Dubai Marina",
+                "beds": 1,
+                "annual_rent_aed": 95000,
+                "price_aed": 95000,
+                "property_type": "Apartments",
+            },
+            {
+                "listing_id": "16792381",
+                "title": "Spacious 1BR | Multiple Cheques | Prime Location",
+                "community": "Dubai Marina",
+                "beds": 1,
+                "annual_rent_aed": 84999,
+                "price_aed": 84999,
+                "property_type": "Apartments",
+            },
+        ]
 
-        with patch.object(listing_turns, "ListingRetriever") as retriever:
-            with patch("app.listings.tools.search_listings", return_value=FakeResult()) as search:
-                result = listing_turns.retrieve_listings(
-                    object(),
-                    "Show me 1 bedroom apartments for rent in Dubai Marina.",
-                    {"bedrooms": 1, "property_types": ["apartment"]},
-                )
-        search.assert_called_once()
-        retriever.assert_not_called()
+        with patch(
+            "app.retrieval.propai_catalog.list_rents",
+            return_value={
+                "matching_listings": 69,
+                "showing": 2,
+                "sorted_by": "newest",
+                "listings": rows,
+            },
+        ) as rents:
+            result = listing_turns.retrieve_listings(
+                object(),
+                "Show me 1 bedroom apartments for rent in Dubai Marina.",
+                {"bedrooms": 1, "property_types": ["apartment"]},
+            )
+        rents.assert_called_once()
+        self.assertEqual(rents.call_args.kwargs.get("sort"), "newest")
         self.assertEqual(result["listing_total"], 69)
         self.assertEqual(len(result["listings"]), 2)
         self.assertEqual(result["listings"][0]["price_aed"], 95000)
@@ -787,9 +819,9 @@ class RentBrowseSearchTests(unittest.TestCase):
     def test_retrieve_listings_drops_reposts_and_caps_at_ten(self):
         from app.retrieval.hybrid import listing_turns
 
-        cards = []
+        rows = []
         for index in range(12):
-            cards.append({
+            rows.append({
                 "listing_id": str(1000 + index),
                 "title": (
                     "BIG LAYOUT I GOOD BUILDING I NEAR TO TRAM"
@@ -799,6 +831,7 @@ class RentBrowseSearchTests(unittest.TestCase):
                 "sub_community": "Elite Residence",
                 "beds": 1,
                 "annual_rent_aed": 74999 if index < 2 else 65000 + index,
+                "price_aed": 74999 if index < 2 else 65000 + index,
                 "size_sqft": 714.0,
                 "agency_name": (
                     "Banke International Properties - Commercial"
@@ -806,19 +839,20 @@ class RentBrowseSearchTests(unittest.TestCase):
                 ),
             })
 
-        class FakeResult:
-            def __init__(self):
-                self.output = {"matching_listings": 69, "showing": 12}
-                self.cards = cards
-
-        with patch.object(listing_turns, "ListingRetriever") as retriever:
-            with patch("app.listings.tools.search_listings", return_value=FakeResult()):
-                result = listing_turns.retrieve_listings(
-                    object(),
-                    "Show me 1 bedroom apartments for rent in Dubai Marina.",
-                    {"bedrooms": 1, "property_types": ["apartment"]},
-                )
-        retriever.assert_not_called()
+        with patch(
+            "app.retrieval.propai_catalog.list_rents",
+            return_value={
+                "matching_listings": 69,
+                "showing": 12,
+                "sorted_by": "newest",
+                "listings": rows,
+            },
+        ):
+            result = listing_turns.retrieve_listings(
+                object(),
+                "Show me 1 bedroom apartments for rent in Dubai Marina.",
+                {"bedrooms": 1, "property_types": ["apartment"]},
+            )
         self.assertEqual(result["listing_total"], 69)
         self.assertEqual(len(result["listings"]), 10)
         titles = [row["title"] for row in result["listings"]]

@@ -86,3 +86,12 @@ def scalar(sql: str, params: tuple = ()):
             row = conn.execute(sql, params).fetchone()
             return row[0] if row else None
     return _retry(work)
+
+# The one definition of a usable recorded sale. Every sales statistic filters with this,
+# so the same question gets the same number whichever answer path handles it.
+# Under AED 100k, or AED 150/sq ft (non-land), is a partial transfer or a typo, not a market sale.
+CLEAN_SALE = (
+    "deleted_at is null and coalesce(outlier_flag, '') <> 'True' and sale_price >= 100000 "
+    "and instance_date <= current_date "
+    "and (property_type = 'Land' or price_per_sqft is null or price_per_sqft >= 150)"
+)

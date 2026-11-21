@@ -11,7 +11,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.database.postgres import fetch
+from app.database.postgres import CLEAN_SALE, fetch
 from app.retrieval.place_lock import contains_place_sql, is_numbered_sibling
 
 MIN_SQFT = 100  # sizes outside this range are data errors (a studio claiming 4,000,000 sqft)
@@ -84,6 +84,21 @@ _BROWSE_NAME = re.compile(
     r"villas?|rentals?|listings?)\b",
     re.I,
 )
+
+
+# Some models fill every optional field with an "empty" value (-1, or 0 for a maximum, a year or a count). For the
+# project and sales tools that means "not given"; the rental tools keep their strict checks.
+_EMPTY_KEYS = ("min_price_aed", "max_price_aed", "handover_year", "min_size_sqft", "max_size_sqft", "bedrooms",
+               "last_days", "limit", "months")
+
+
+def _lenient(a: dict) -> dict:
+    out = dict(a)
+    for key in _EMPTY_KEYS:
+        v = out.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and (v < 0 or (v == 0 and key != "bedrooms")):
+            out.pop(key)
+    return out
 
 
 def _num(args: dict, key: str, lo: float, hi: float):
@@ -340,164 +355,201 @@ def _new_projects(filters: dict, limit: int, sort: str, skip_names=None) -> tupl
 
 
 def find_areas(raw) -> ToolResult:
+    """Place lookup via propai_places."""
     a = _obj(raw)
     text = str(a.get("text") or "").strip()[:80]
     if not text:
         raise ToolInputError("text is required.")
     names = [n for n in (text, ALIASES.get(text.lower())) if n]
     patterns = _like(names)
-    lock, lock_params = contains_place_sql(["community", "sub_community", "location"], names)
-    areas = fetch("select community, count(*)::int as listings from listings where community ILIKE ANY(%s::text[]) "
-                  "group by community order by listings desc limit 10", (patterns,))
-    areas = [row for row in areas if not is_numbered_sibling(text, row.get("community") or "")]
-    subs = fetch("select sub_community, community, count(*)::int as listings from listings "
-                 "where sub_community ILIKE ANY(%s::text[]) group by sub_community, community "
-                 "order by listings desc limit 10", (patterns,))
-    subs = [
-        row for row in subs
-        if not is_numbered_sibling(text, row.get("community") or "")
-        and not is_numbered_sibling(text, row.get("sub_community") or "")
-    ]
-    buildings = fetch("select regexp_replace(location, '^.*>\\s*', '') as building, community, count(*)::int as listings "
-                      "from listings where location ILIKE ANY(%s::text[]) group by 1, community "
-                      "order by listings desc limit 10", (patterns,))
-    buildings = [row for row in buildings if not is_numbered_sibling(text, row.get("community") or "")]
-    total = fetch(f"select count(*)::int as total from listings where {lock}", tuple(lock_params))[0]["total"]
     places = [
         row for row in _new_places(patterns)
         if not is_numbered_sibling(text, row.get("label") or "")
     ]
-    if not (areas or subs or buildings):
-        if places:
-            return ToolResult({
-                "matches": [],
-                "new_places": places,
-                "note": f'No advertised rental listing matching "{text}". The new project data has these places. '
-                        "Call search_projects with the label.",
-            })
-        top = fetch("select community, count(*)::int as listings from listings group by community "
-                    "order by listings desc limit 15")
-        return ToolResult({"matches": [], "note": f'No area or building matching "{text}" in the data.',
-                           "most_listed_areas": top})
-    result = {
-        "total_listings_matching": total,  # exact, across ALL matches; the lists show only the top 10
-        "communities": areas, "sub_areas": subs, "buildings": buildings,
-    }
     if places:
-        result["new_places"] = places
-    return ToolResult(result)
+        return ToolResult({
+            "matches": places,
+            "new_places": places,
+            "note": (
+                f'Prop-AI places matching "{text}". '
+                "Call search_projects for projects or search_listings for registered rents."
+            ),
+        })
+    return ToolResult({
+        "matches": [],
+        "note": f'No Prop-AI place matching "{text}".',
+    })
 
 
 def search_listings(raw) -> ToolResult:
+    """Browse registered rents from propai_rents (main Prop-AI rent data)."""
+    from app.retrieval.propai_catalog import list_rents
+
     a = _obj(raw)
     f = parse_filters(a)
-    sort = str(a.get("sort") or "cheapest")
-    if sort not in SORTS:
-        raise ToolInputError(f"sort must be one of: {', '.join(SORTS)}.")
+    # Newest rent contracts first unless the agent/user asked cheap/pricey.
+    sort = str(a.get("sort") or "newest")
+    if sort not in SORTS and sort not in {"newest"}:
+        sort = ["newest","Cheapest"]
     limit = int(round(_num(a, "limit", 1, 10) or 5))
-    where, params = _where(f)
-    # The same advert is often reposted many times (same title and rent); show each once.
-    rows = fetch(f"select {COLUMNS} from (select distinct on (lower(btrim(title)), price_aed) * from listings "
-                 f"where {where} order by lower(btrim(title)), price_aed, listing_id) t "
-                 f"order by {SORTS[sort]} limit %s", (*params, limit))
-    total = fetch(f"select count(*)::int as total from listings where {where}", tuple(params))[0]["total"]
-    cards = [_card(r) for r in rows]
-    output = {"matching_listings": total, "showing": len(cards), "sorted_by": sort,
-              "listings": [_for_model(c) for c in cards]}
+    found = list_rents(
+        f.get("areas"),
+        f.get("beds_min"),
+        f.get("beds_max"),
+        limit=limit,
+        sort=sort,
+    )
+    rows = found.get("listings") or []
+    cards = []
+    for row in rows:
+        # Shape expected by the agent card builder.
+        cards.append({
+            "listing_id": row.get("listing_id") or "",
+            "title": row.get("title"),
+            "property_type": row.get("property_type"),
+            "beds": row.get("beds"),
+            "baths": None,
+            "size_sqft": row.get("size_sqft"),
+            "furnishing": None,
+            "community": row.get("community"),
+            "sub_community": row.get("sub_community"),
+            "agency_name": None,
+            "annual_rent_aed": row.get("annual_rent_aed"),
+            "monthly_rent_aed": row.get("monthly_rent_aed"),
+            "cover_photo": None,
+            "path": None,
+            "kind": "listing",
+            "row": row,
+        })
+    output = {
+        "matching_listings": found.get("matching_listings") or 0,
+        "showing": len(cards),
+        "sorted_by": found.get("sorted_by") or sort,
+        "listings": [
+            {
+                "listing_id": c.get("listing_id"),
+                "title": c.get("title"),
+                "property_type": c.get("property_type"),
+                "beds": c.get("beds"),
+                "size_sqft": c.get("size_sqft"),
+                "community": c.get("community"),
+                "annual_rent_aed": c.get("annual_rent_aed"),
+                "monthly_rent_aed": c.get("monthly_rent_aed"),
+                "contract_start": (c.get("row") or {}).get("contract_start"),
+            }
+            for c in cards
+        ],
+        "note": found.get("note"),
+    }
     recorded = _recorded_rents(f)
     if recorded:
         output["recorded_rents"] = recorded
-    if total == 0 and (f.get("property_types") or f.get("beds_min") is not None or f.get("beds_max") is not None):
-        # nothing matched: tell the model what the same place does have, so it can offer a real alternative
-        loose_where, loose_params = _where({**f, "property_types": None, "beds_min": None, "beds_max": None})
-        nearby = fetch(f"select property_type, beds, count(*)::int as listings from listings where {loose_where} "
-                       "group by property_type, beds order by listings desc limit 8", tuple(loose_params))
-        if nearby:
-            output["note"] = ("No listing matches the property type or bedrooms asked for. "
-                              "In the same place and budget the data has these instead:")
-            output["available_instead"] = nearby
     return ToolResult(output, cards)
 
 
 def area_stats(raw) -> ToolResult:
+    """Rent aggregates from propai_rents."""
+    from app.retrieval.propai_catalog import rent_stats
+
     a = _obj(raw)
     f = parse_filters(a)
-    group_key = str(a.get("group_by") or "none")
-    if group_key != "none" and group_key not in GROUPS:
-        raise ToolInputError(f"group_by must be one of: none, {', '.join(GROUPS)}.")
-    group = None if group_key == "none" else GROUPS[group_key]
-    where, params = _where(f)
-    sql = (
-        f"select {group + ' as grp,' if group else ''} count(*)::int as listings, "
-        "round(avg(price_aed))::int as avg_annual, "
-        "round(percentile_cont(0.5) within group (order by price_aed))::int as median_annual, "
-        "round(percentile_cont(0.25) within group (order by price_aed))::int as p25_annual, "
-        "round(percentile_cont(0.75) within group (order by price_aed))::int as p75_annual, "
-        "min(price_aed)::int as min_annual, max(price_aed)::int as max_annual, "
-        f"round((avg(price_aed / size_sqft) filter (where size_sqft between {MIN_SQFT} and {MAX_SQFT}))::numeric, 1) "
-        f"as psf from listings where {where}"
-        + (f" group by {group} order by {'grp' if group_key == 'beds' else 'count(*) desc'} limit 15" if group else "")
-    )
-    rows = fetch(sql, tuple(params))
-    out = []
-    for r in rows:
-        row = {group_key: r["grp"]} if group else {}
-        n = r["listings"]
-        row.update({
-            "listings": n, "reliability": _reliability(n),
-            "avg_annual_rent_aed": r["avg_annual"], "avg_monthly_rent_aed": _monthly(r["avg_annual"]),
-            "median_annual_rent_aed": r["median_annual"], "median_monthly_rent_aed": _monthly(r["median_annual"]),
-            "typical_range_annual_aed": [r["p25_annual"], r["p75_annual"]],
-            "typical_range_monthly_aed": [_monthly(r["p25_annual"]), _monthly(r["p75_annual"])],
-            "min_annual_rent_aed": r["min_annual"], "max_annual_rent_aed": r["max_annual"],
-            "avg_rent_per_sqft_per_year_aed": None if r["psf"] is None else float(r["psf"]),
+    stats = rent_stats(f.get("areas"), f.get("beds_min"), f.get("beds_max"))
+    if not stats:
+        return ToolResult({
+            "grouped_by": "none",
+            "rows": [],
+            "note": "No Prop-AI rent stats for that place. Name a Dubai area.",
         })
-        out.append(row)
-    return ToolResult({"grouped_by": group_key,
-                       "note": "Statistics describe the listings in our dataset, which is a sample of the market.",
-                       "rows": out})
+    row = {
+        "listings": stats.get("listings"),
+        "reliability": _reliability(int(stats.get("listings") or 0)),
+        "avg_annual_rent_aed": stats.get("avg_annual_rent_aed"),
+        "avg_monthly_rent_aed": _monthly(stats.get("avg_annual_rent_aed")),
+        "median_annual_rent_aed": stats.get("median_annual_rent_aed"),
+        "median_monthly_rent_aed": _monthly(stats.get("median_annual_rent_aed")),
+        "typical_range_annual_aed": stats.get("typical_range_annual_aed"),
+        "min_annual_rent_aed": stats.get("min_annual_rent_aed"),
+        "max_annual_rent_aed": stats.get("max_annual_rent_aed"),
+    }
+    return ToolResult({
+        "grouped_by": "none",
+        "rows": [row],
+        "note": stats.get("note") or "Registered Prop-AI rents.",
+    })
 
 
 def get_listing(raw) -> ToolResult:
+    """One registered rent contract from propai_rents by pai_contract_id."""
     listing_id = str(_obj(raw).get("listing_id") or "").strip()
-    if not re.fullmatch(r"\d{1,12}", listing_id):
-        raise ToolInputError("listing_id must be the numeric listing id.")
-    rows = fetch(f"select {COLUMNS}, listed_at, agency_name, amenities from listings where listing_id = %s", (listing_id,))
+    if not listing_id:
+        raise ToolInputError("listing_id must be the Prop-AI contract id.")
+    rows = fetch(
+        """
+        select pai_contract_id, property_type, bedrooms, actual_area_sqft, annual_amount,
+               contract_start_date, area_name_prop_ai, master_project_prop_ai,
+               project_name_prop_ai, building_name_prop_ai
+        from propai_rents
+        where deleted_at is null and pai_contract_id = %s
+        limit 1
+        """,
+        (listing_id,),
+    )
     if not rows:
-        return ToolResult({"found": False, "note": f"No listing with id {listing_id} in the data."})
-    row = rows[0]
-    peers = fetch(
-        "select count(*)::int as n, round(percentile_cont(0.5) within group (order by price_aed))::int as median_annual, "
-        "round(100.0 * count(*) filter (where price_aed < %s) / nullif(count(*), 0))::int as pct_cheaper "
-        "from listings where community = %s and beds is not distinct from %s",
-        (row["price_aed"], row["community"], row["beds"]))[0]
-    card = _card(row)
-    return ToolResult({
-        "found": True,
-        "listing": {**_for_model(card), "listed_at": row.get("listed_at"), "agency": row.get("agency_name"),
-                    "amenities": row.get("amenities") or None},
-        "compared_with_same_area_and_bedrooms": {
-            "listings": peers["n"], "reliability": _reliability(peers["n"]),
-            "median_annual_rent_aed": peers["median_annual"], "median_monthly_rent_aed": _monthly(peers["median_annual"]),
-            "percent_of_them_cheaper_than_this_one": peers["pct_cheaper"],
-        },
-    }, [card])
+        return ToolResult({
+            "found": False,
+            "note": f"No Prop-AI rent contract with id {listing_id}.",
+        })
+    from app.retrieval.propai_catalog import _rent_row_public
+
+    pub = _rent_row_public(rows[0])
+    card = {
+        "listing_id": pub.get("listing_id") or listing_id,
+        "title": pub.get("title"),
+        "property_type": pub.get("property_type"),
+        "beds": pub.get("beds"),
+        "size_sqft": pub.get("size_sqft"),
+        "community": pub.get("community"),
+        "annual_rent_aed": pub.get("annual_rent_aed"),
+        "monthly_rent_aed": pub.get("monthly_rent_aed"),
+        "kind": "listing",
+        "row": pub,
+    }
+    return ToolResult({"found": True, "listing": pub}, [card])
 
 
 def dataset_info(raw=None) -> ToolResult:
-    t = fetch("select count(*)::int as listings, count(distinct community)::int as areas, "
-              "max(scraped_at) as last_scraped, "
-              "round(percentile_cont(0.5) within group (order by price_aed))::int as median_annual from listings")[0]
-    types = fetch("select property_type, count(*)::int as listings from listings group by 1 order by 2 desc")
-    beds = fetch("select beds, count(*)::int as listings from listings group by 1 order by 1")
+    """Prop-AI dataset counts (projects + registered rents)."""
+    _ = raw
+    try:
+        rents = fetch(
+            "select count(*)::int as n, "
+            "round(percentile_cont(0.5) within group (order by annual_amount))::bigint as median "
+            "from propai_rents where deleted_at is null and annual_amount > 0 "
+            "and contract_start_date >= date '2025-09-01'"
+        )[0]
+        projects = fetch(
+            "select count(*)::int as n from propai_projects where coalesce(name, '') <> ''"
+        )[0]["n"]
+        sales = fetch(
+            "select count(*)::int as n from propai_sales "
+            "where deleted_at is null and sale_price > 0 "
+            "and instance_date >= current_date - interval '24 months'"
+        )[0]["n"]
+    except Exception:
+        return ToolResult({"note": "Prop-AI dataset info unavailable."})
+    places = _available_places()
     return ToolResult({
-        "total_listings": t["listings"], "areas": t["areas"], "snapshot_taken": str(t["last_scraped"])[:10],
-        "median_annual_rent_aed": t["median_annual"], "median_monthly_rent_aed": _monthly(t["median_annual"]),
-        "property_types": types,
-        "bedrooms": [{"bedrooms": "studio" if b["beds"] == 0 else b["beds"], "listings": b["listings"]} for b in beds],
-        "what_this_is": "Advertised (asking) yearly rents from Bayut for Dubai residential listings, one snapshot, "
-                        "a sample of the market.",
-        "not_included": "No sale prices, no property values or yields, no official RERA index, no Ejari contract rents.",
+        "total_listings": rents.get("n") or 0,
+        "projects": projects,
+        "sales_24m": sales,
+        "areas": places.get("communities_with_projects") or [],
+        "median_annual_rent_aed": None if rents.get("median") is None else int(rents["median"]),
+        "median_monthly_rent_aed": _monthly(rents.get("median")),
+        "what_this_is": (
+            "Prop-AI registered rents, projects, sales, brokers, places, "
+            "project plans and status."
+        ),
+        "not_included": "Old Bayut advertised listings / communities / document_chunks.",
     })
 
 
@@ -526,6 +578,7 @@ MAX_PROFILE_NOTE = 200
 
 
 def _project_filters(a: dict) -> dict:
+    a = _lenient(a)
     f = {
         "communities": _strings(a, "communities"),
         "developers": _strings(a, "developers"),
@@ -653,7 +706,6 @@ def mentions_known_name(text: str) -> bool:
         try:
             rows = fetch("select lower(btrim(coalesce(nullif(btrim(master_project), ''), area))) as n "
                          "from propai_projects union "
-                         "select lower(btrim(community)) from listings union "
                          "select lower(btrim(developer)) from propai_projects union "
                          "select lower(btrim(name)) from propai_projects")
             extra = fetch("select lower(btrim(label)) as n from propai_places "
@@ -687,7 +739,7 @@ def _closest_place(text: str) -> str | None:
 
 def search_projects(raw) -> ToolResult:
     """Project search that also reads a misspelt place the way the user meant it."""
-    a = _normalize_project_search(_obj(raw))
+    a = _normalize_project_search(_lenient(_obj(raw)))
     result = _search_projects(a)
     if result.output.get("matching_projects"):
         return result
@@ -752,7 +804,7 @@ def _search_projects(a: dict) -> ToolResult:
     out = {
         "matching_projects": total, "showing": len(rows), "sorted_by": sort,
         "source": "propai",
-        "price_note": "price_kind recent_sale is the median sale price from the last 24 months in recorded sales data.",
+        "price_note": "price_kind recent_sale is the median sale price from the last 12 months in recorded sales data.",
         "projects": projects_out,
         "browse_note": (
             "These are recorded projects. List them now. Do not call search_projects again, "
@@ -843,6 +895,8 @@ def _find_projects(ref: str, limit: int = 6) -> list[dict]:
 
 
 def get_project(raw) -> ToolResult:
+    from app.retrieval.propai_catalog import project_payment_plans
+
     a = _obj(raw)
     ref = str(a.get("project_id") or a.get("name") or "").strip()
     if not ref:
@@ -858,13 +912,21 @@ def get_project(raw) -> ToolResult:
     row = rows[0]
     description = re.sub(r"\s+", " ", str(row.get("description") or "")).strip()[:1200] or None
     shown = _project_for_model(row)
-    return ToolResult({
+    plans = project_payment_plans(
+        project_key=str(row.get("key") or ""),
+        name=str(row.get("name") or ref),
+    )
+    out = {
         "found": True,
         "project": shown,
         "developer_marketing_description": description,
         "marketing_note": "The description is developer marketing text: say 'the developer describes it as', "
                           "never state its claims as verified fact.",
-    }, [_project_card(row)])
+    }
+    if plans:
+        out["payment_plans"] = plans.get("payment_plans") or []
+        out["payment_plans_note"] = plans.get("note")
+    return ToolResult(out, [_project_card(row)])
 
 
 def compare_projects(raw) -> ToolResult:
@@ -935,12 +997,16 @@ def compare_projects(raw) -> ToolResult:
 
 
 def market_stats(raw) -> ToolResult:
-    a = _obj(raw)
+    a = _lenient(_obj(raw))
     f = _project_filters(a)
     group_key = str(a.get("group_by") or "none")
     if group_key != "none" and group_key not in PROJECT_GROUPS:
         raise ToolInputError(f"group_by must be one of: none, {', '.join(PROJECT_GROUPS)}.")
-    parts, params = ["coalesce(name, '') <> ''"], []
+    parts, params = ["coalesce(name, '') <> ''", "not is_plot", "coalesce(development_status, '') <> 'CANCELLED'"], []
+    use = str(a.get("use") or "").strip().lower()
+    if use in ("residential", "office", "commercial", "land"):
+        parts.append("lower(usage) = %s")
+        params.append(use)
     if f.get("communities"):
         names = [n for c in f["communities"] for n in (c, ALIASES.get(c.lower())) if n]
         clause, extra = contains_place_sql(["master_project", "area", "name"], names)
@@ -984,7 +1050,7 @@ def market_stats(raw) -> ToolResult:
     result = {
         "grouped_by": group_key, "rows": out, "handover_years": years,
         "note": "Project counts are from recorded project data. new_data, when present, is recorded sales "
-                "from the last 24 months and is the price to quote. There is no yield, ROI or price growth.",
+                "from the last 12 months and is the price to quote. There is no yield, ROI or price growth.",
     }
     if f.get("communities"):
         try:
@@ -999,28 +1065,58 @@ def market_stats(raw) -> ToolResult:
 
 
 def search_brochures(raw, pgvector=None) -> ToolResult:
+    """Semantic search over Prop-AI project text (propai_raw / propai_project_status)."""
+    from app.retrieval.propai_vector_search import search_propai
+
     a = _obj(raw)
     query = str(a.get("query") or "").strip()[:300]
     if not query:
         raise ToolInputError("query is required.")
     project = str(a.get("project_name") or "").strip()[:80]
-    if pgvector is None:
-        return ToolResult({"passages": [], "note": "Brochure search is not available right now."})
-    chunks = pgvector.search_documents(f"{project} {query}".strip(), match_threshold=0.25, match_count=10) or []
+    _ = pgvector  # old document_chunks path retired
+    text = f"{project} {query}".strip()
+    chunks = []
+    try:
+        for table in ("raw", "status"):
+            for row in search_propai(text, table=table, limit=5) or []:
+                chunks.append({
+                    "content": (
+                        f"{row.get('name') or ''} — "
+                        f"{row.get('developer') or row.get('status') or row.get('area') or ''}"
+                    ).strip(" —"),
+                    "score": row.get("score"),
+                    "source": f"propai_{table}",
+                })
+    except Exception as exc:
+        print(f"Prop-AI brochure search unavailable: {exc}")
+        chunks = []
     tokens = _name_tokens(project)
     if tokens:
-        about = [c for c in chunks if all(t in f"{c.get('document_title') or ''} {c.get('content') or ''}".lower()
-                                          for t in tokens)]
+        about = [
+            c for c in chunks
+            if all(t in str(c.get("content") or "").lower() for t in tokens)
+        ]
         if not about:
-            return ToolResult({"passages": [], "note": f'No brochure text found that mentions "{project}".'})
+            return ToolResult({
+                "passages": [],
+                "note": f'No Prop-AI project text found that mentions "{project}".',
+            })
         chunks = about
-    passages = [{"document": c.get("document_title"), "type": c.get("document_type"),
-                 "similarity": None if c.get("similarity") is None else round(float(c["similarity"]), 2),
-                 "text": re.sub(r"\s+", " ", str(c.get("content") or "")).strip()[:900]} for c in chunks[:4]]
+    passages = [
+        {
+            "document": c.get("source"),
+            "type": "propai",
+            "similarity": None if c.get("score") is None else round(float(c["score"]), 2),
+            "text": re.sub(r"\s+", " ", str(c.get("content") or "")).strip()[:900],
+        }
+        for c in chunks[:4]
+    ]
     return ToolResult({
         "passages": passages,
-        "note": "Brochure and document text. Brochure claims are developer marketing: say 'the brochure says', "
-                "and only use what a passage actually states.",
+        "note": (
+            "Prop-AI project text (propai_raw / propai_project_status). "
+            "Treat as developer-facing facts; only quote what a passage states."
+        ),
     })
 
 
@@ -1110,6 +1206,198 @@ def area_sales(raw) -> ToolResult:
         "note": "Dubai Land Department sale transactions in the last 12 months, all property types, ranked by count. "
                 "'area' is the name people use; 'official_area' is the land-registry name. The app shows this list.",
     })
+
+
+# ---------------------------------------------------------------- recorded sales (Dubai Land Department)
+
+SALE_SORTS = {
+    "newest": "instance_date desc, sale_price desc",
+    "oldest": "instance_date asc, sale_price asc",
+    "cheapest": "sale_price asc, instance_date desc",
+    "priciest": "sale_price desc, instance_date desc",
+}
+SALE_TYPES = {"apartment": "Apartment", "villa": "Villa", "hotel apartment": "Hotel Apartment", "office": "Office",
+              "shop": "Shop", "land": "Land", "warehouse": "Warehouse", "building": "Building"}
+
+
+def _date(args: dict, key: str):
+    value = str(args.get(key) or "").strip()
+    if not value:
+        return None
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise ToolInputError(f"{key} must be a date like 2026-11-30.")
+    return value
+
+
+def _sales_where(a: dict) -> tuple[str, list, dict]:
+    """Shared filters for recorded sales: place, project/building name, bedrooms, kind, ready or off-plan, dates, price."""
+    # Records priced under AED 150 per sq ft are partial transfers or typos (an AED 40,960 "1-bedroom"), not sales.
+    a = _lenient(a)
+    parts = [CLEAN_SALE]
+    params: list = []
+    used: dict = {}
+    place = str(a.get("place") or "").strip()[:80]
+    if place.lower() in ("dubai", "all dubai", "all of dubai", "uae", "city wide", "citywide"):
+        place = ""  # the whole city is the default, not a place filter
+    if place:
+        from app.answers.predict import _sales_place_filter
+        clause, extra = _sales_place_filter(place)
+        parts.append(clause)
+        params.extend(extra)
+        used["place"] = place
+    name = str(a.get("name") or "").strip()[:80]
+    for token in _name_tokens(name):
+        parts.append("(project_name_prop_ai ilike %s or building_name_prop_ai ilike %s)")
+        like = _like([token])[0]
+        params.extend([like, like])
+    if name:
+        used["name"] = name
+    beds = _beds(a, "bedrooms", 0, 12)
+    if beds is not None:
+        parts.append("bedrooms = %s")
+        params.append(beds)
+        used["bedrooms"] = "studio" if beds == 0 else int(beds)
+    kind = str(a.get("property_type") or "").strip().lower()
+    if kind:
+        if kind not in SALE_TYPES:
+            raise ToolInputError(f"property_type must be one of: {', '.join(SALE_TYPES.values())}.")
+        parts.append("property_type = %s")
+        params.append(SALE_TYPES[kind])
+        used["property_type"] = SALE_TYPES[kind]
+    status = str(a.get("status") or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if status in ("ready", "ready_only", "existing", "completed"):
+        parts.append("development_status = 'Existing'")
+        used["status"] = "ready"
+    elif status in ("off_plan", "offplan", "off_plan_only"):
+        parts.append("development_status = 'Off-Plan'")
+        used["status"] = "off-plan"
+    month = str(a.get("month") or "").strip()
+    last_days = _num(a, "last_days", 1, 3650)
+    date_from, date_to = _date(a, "date_from"), _date(a, "date_to")
+    if month:
+        if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", month):
+            raise ToolInputError("month must look like 2026-11.")
+        parts.append("instance_date >= %s::date and instance_date < (%s::date + interval '1 month')")
+        params.extend([month + "-01", month + "-01"])
+        used["month"] = month
+    elif last_days:
+        parts.append("instance_date >= current_date - %s::int")
+        params.append(int(last_days))
+        used["last_days"] = int(last_days)
+    else:
+        if date_from:
+            parts.append("instance_date >= %s::date")
+            params.append(date_from)
+            used["date_from"] = date_from
+        if date_to:
+            parts.append("instance_date <= %s::date")
+            params.append(date_to)
+            used["date_to"] = date_to
+        if not (date_from or date_to):
+            # No period asked: the last 12 months, the same window every other price answer uses.
+            # Without this, "median price in X" averaged every sale since 1998.
+            parts.append("instance_date >= current_date - 365")
+            used["last_days"] = 365
+    lo, hi = _num(a, "min_price_aed", 0, 10_000_000_000), _num(a, "max_price_aed", 0, 10_000_000_000)
+    if lo is not None and hi is not None and lo > hi:
+        raise ToolInputError("min_price_aed cannot exceed max_price_aed.")
+    if lo is not None:
+        parts.append("sale_price >= %s")
+        params.append(lo)
+        used["min_price_aed"] = lo
+    if hi is not None:
+        parts.append("sale_price <= %s")
+        params.append(hi)
+        used["max_price_aed"] = hi
+    return " and ".join(parts), params, used
+
+
+def sales_search(raw) -> ToolResult:
+    """Individual recorded sales (Dubai Land Department), with the count of all matches and their price range."""
+    a = _lenient(_obj(raw))
+    where, params, used = _sales_where(a)
+    sort = str(a.get("sort") or "newest").strip().lower()
+    if sort not in SALE_SORTS:
+        raise ToolInputError(f"sort must be one of: {', '.join(SALE_SORTS)}.")
+    limit = int(round(_num(a, "limit", 1, 10) or 5))
+    summary = fetch(
+        "select count(*)::int as n, min(sale_price) as lowest, max(sale_price) as highest, "
+        "(percentile_cont(0.5) within group (order by sale_price))::float8 as median, "
+        "min(instance_date)::text as first_sale, max(instance_date)::text as last_sale "
+        f"from propai_sales where {where}", tuple(params))[0]
+    rows = fetch(
+        "select instance_date::text as date, sale_price, bedrooms, property_type, property_sub_type_en as sub_type, "
+        "coalesce(nullif(project_name_prop_ai, ''), building_name_prop_ai) as project, building_name_prop_ai as building, "
+        "master_project_prop_ai as master_project, area_name_prop_ai as area, development_status as status, "
+        "procedure_area_sqft as size_sqft, price_per_sqft "
+        f"from propai_sales where {where} order by {SALE_SORTS[sort]} limit {limit}", tuple(params))
+    sales = []
+    for r in rows:
+        sales.append({
+            "date": r["date"], "price_aed": round(float(r["sale_price"])),
+            "bedrooms": ("studio" if r["bedrooms"] == 0 else int(r["bedrooms"])) if r.get("bedrooms") is not None and r["bedrooms"] < 20 else None,
+            "type": r["property_type"], "project": r["project"], "building": r["building"] or None,
+            "community": r["master_project"] or r["area"],
+            "ready_or_off_plan": "ready" if r["status"] == "Existing" else "off-plan" if r["status"] == "Off-Plan" else None,
+            "size_sqft": round(float(r["size_sqft"])) if r.get("size_sqft") else None,
+            "price_per_sqft_aed": round(float(r["price_per_sqft"])) if r.get("price_per_sqft") else None,
+        })
+    return ToolResult({
+        "matching_sales": summary["n"], "showing": len(sales), "sorted_by": sort, "filters_used": used,
+        "lowest_price_aed": summary["lowest"], "median_price_aed": summary["median"], "highest_price_aed": summary["highest"],
+        "first_sale_date": summary["first_sale"], "last_sale_date": summary["last_sale"],
+        "sales": sales,
+        "note": "Recorded Dubai Land Department sales. These are real transactions, not asking prices. "
+                "Partial transfers priced under AED 150 per sq ft are already left out. A studio is 0 bedrooms: never present a studio price as a 1-bedroom price. "
+                "If matching_sales is 0, say what was searched (filters_used) and nothing was found.",
+    })
+
+
+def top_developers(raw) -> ToolResult:
+    """Developers ranked by the value of their recorded sales."""
+    a = _lenient(_obj(raw))
+    where, params, used = _sales_where({**a, "last_days": None, "month": None, "date_from": None, "date_to": None,
+                                        **({"last_days": int(_num(a, "months", 1, 120) * 30.4)} if _num(a, "months", 1, 120) else {"last_days": 365})})
+    limit = int(round(_num(a, "limit", 1, 10) or 5))
+    rows = fetch(
+        "select developer_group as developer, count(*)::int as sales, sum(sale_price)::float8 as total_value, "
+        "(percentile_cont(0.5) within group (order by sale_price))::float8 as median_price "
+        f"from propai_sales where {where} and coalesce(btrim(developer_group), '') <> '' "
+        f"group by developer_group order by sum(sale_price) desc limit {limit}", tuple(params))
+    return ToolResult({
+        "ranked_by": "total value of recorded sales", "filters_used": used,
+        "developers": [{"rank": i + 1, "developer": r["developer"], "sales": r["sales"],
+                        "total_sales_value_aed": round(r["total_value"]), "median_price_aed": round(r["median_price"])}
+                       for i, r in enumerate(rows)],
+        "note": "Sums of Dubai Land Department sale prices (off-plan and ready) grouped by developer group. "
+                "Sales with no developer on record are left out, so totals can be lower than the whole market.",
+    })
+
+
+def data_context() -> str:
+    """Today's date and how far the recorded data reaches, so 'today', 'this month' and 'latest' mean something."""
+    import time
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    now = time.time()
+    cached = _CONTEXT.get("value")
+    if cached and now - _CONTEXT["at"] < 600:
+        return cached
+    today = datetime.now(ZoneInfo("Asia/Dubai")).date()
+    try:
+        row = fetch("select (select max(instance_date) from propai_sales where instance_date <= current_date)::text as sale, "
+                    "(select max(contract_start_date) from propai_rents where contract_start_date <= current_date)::text as rent")[0]
+    except Exception:
+        row = {}
+    text = (f"Today is {today:%A %d %B %Y} (Dubai time). "
+            f"Recorded Dubai Land Department sales reach {row.get('sale') or 'an unknown date'} and rent contracts "
+            f"{row.get('rent') or 'an unknown date'}; nothing newer is in the data. Use today's date for 'today', "
+            "'this month', 'last 30 days' and 'last 12 months'. When asked for the latest sale date, quote the sales date.")
+    _CONTEXT.update(value=text, at=now)
+    return text
+
+
+_CONTEXT: dict = {"at": 0.0}
 
 
 # ---------------------------------------------------------------- user profile
@@ -1222,6 +1510,8 @@ TOOL_FUNCTIONS = {
     "search_brochures": search_brochures,
     "search_brokers": search_brokers,
     "area_sales": area_sales,
+    "sales_search": sales_search,
+    "top_developers": top_developers,
     "update_profile": update_profile,
 }
 
