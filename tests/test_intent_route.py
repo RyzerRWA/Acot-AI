@@ -706,10 +706,11 @@ def test_trend_answer_leads_with_history_not_a_future_price():
     assert "2,100,000" not in text
 
 
-def test_trend_answer_without_sales_uses_projects():
+def test_trend_answer_without_sales_says_no_data():
+    # No recorded trend: say so plainly instead of pointing at cards (users read that as a dodge).
     text = format_trend_answer("Dubai Marina", None, [{"id": "P9", "name": "Tower"}])
     _no_ids(text)
-    assert "cards below" in text.lower()
+    assert "don't have enough recorded sales" in text
     assert "2,000,000" not in text
 
 

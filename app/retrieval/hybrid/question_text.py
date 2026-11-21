@@ -115,6 +115,14 @@ _DOMAIN_WORDS = (
     "expensive", "priciest", "minimum", "maximum",
 )
 
+# Real words that are never "corrected", but are not correction targets either (a target pulls
+# look-alikes: "central" became "rental"). "rents" and "parents" were being rewritten to "agents".
+_KEEP_WORDS = {
+    "rent", "rents", "rental", "rentals", "renting", "tenant", "tenants", "lease", "leases",
+    "yield", "yields", "sale", "sales", "sold", "parents", "family", "families", "schools", "central",
+    "date", "dates", "rate", "rates", "area", "areas", "data",
+}
+
 _GENERIC_WORDS = {
     "show", "me", "the", "a", "an", "all", "some", "any", "every",
     "of", "in", "at", "on", "and", "or", "for", "with", "to", "from",
@@ -200,7 +208,7 @@ def _correct_domain_word(token: str) -> str:
     if stripped and stripped != token:
         core, suffix = stripped, token[len(stripped):]
     lowered = core.lower()
-    if lowered in _DOMAIN_WORDS or len(lowered) < 5:
+    if lowered in _DOMAIN_WORDS or lowered in _KEEP_WORDS or lowered in _GENERIC_WORDS or len(lowered) < 5:
         return token
     if any(ch.isdigit() for ch in lowered):
         return token

@@ -761,6 +761,13 @@ _DEVELOPER_RANK_ASK = re.compile(
     r"\b(?:sales?|value|volume|revenue)\b",
     re.I,
 )
+# Strict wording for the early route: a ranking of developers by sales value, citywide. The wider pattern above stays
+# as the late safety net.
+_DEVELOPER_VALUE_RANK = re.compile(
+    r"\b(?:top|leading|biggest|largest)\s+(?:\d{1,2}\s+)?developers?\b|"
+    r"\bdevelopers?\b[\s\S]{0,60}\b(?:highest|most|largest|biggest|top)\b[\s\S]{0,40}\b(?:sales?|value|volume|revenue|sold)\b",
+    re.I,
+)
 _READY_ONLY_ASK = re.compile(
     r"\b(?:ready(?:\s+only)?|only\s+ready|completed\s+only|only\s+completed)\b",
     re.I,
@@ -1860,6 +1867,14 @@ async def _dialogue_followup_turn(question, conversation_memory, components=None
     resolve_ms = _elapsed_ms(resolve_started)
     if not resolution or resolution.get("kind") != "continue":
         return None
+    if (
+        resolution.get("mode") == "rerun"
+        and not resolution.get("more")
+        and not resolution.get("patch")
+        and str(resolution.get("action") or prior_action) == prior_action
+    ):
+        # Same task, nothing changed: running it again only repeats the last answer.
+        return None
     new_state = apply_followup(state, resolution)
     if not new_state:
         return None
@@ -1945,6 +1960,13 @@ async def _understood_turn(question, conversation_memory, components=None):
     if shortlist_early is not None:
         return shortlist_early
 
+    # Two areas ("Compare JVC and Dubai Marina", "Business Bay or Downtown?") on the same market numbers.
+    from app.answers.area_comparison import parse_area_comparison
+
+    area_pair = parse_area_comparison(question)
+    if area_pair:
+        return await asyncio.to_thread(_area_pair_turn, question, *area_pair)
+
     # Named project compares must fall through to hybrid retrieval — never
     # clarify for area/beds/budget ("Compare Serenz and Aura Heights").
     try:
@@ -1972,6 +1994,54 @@ async def _understood_turn(question, conversation_memory, components=None):
         timing.setdefault("resolve_source", resolution.get("source"))
         turn["timing_ms"] = timing
         return turn
+
+    if components is not None:
+        # Later fallbacks read this: a guidance/general question must reach the agent, not a project list.
+        components["_resolved_action"] = resolution.get("action")
+    if resolution.get("action") == "handovers":
+        return _stamp_resolve(
+            await asyncio.to_thread(_handover_turn, question, resolution, conversation_memory)
+        )
+    if resolution.get("action") == "guidance":
+        # Rules, fees, visas, restaurants, metro: not in our records, so the web answers (with sources).
+        # No web (search off or failed): the agent's general guidance answers as before.
+        web = await asyncio.to_thread(_web_answer_turn, question, resolution)
+        if web is not None:
+            return _stamp_resolve(web)
+    direct = {
+        "predict": _predict_turn,
+        "rent_stat": _rent_stat_turn, "area_market": _area_market_turn,
+        "area_rank": _area_rank_turn, "top_projects": _top_projects_turn,
+    }.get(resolution.get("action"))
+    if direct is not None:
+        turn = await asyncio.to_thread(direct, question, resolution)
+        if turn is not None:
+            return _stamp_resolve(turn)
+    if resolution.get("action") == "sales_count" and str(resolution.get("place") or "dubai").strip().lower() == "dubai" \
+            and (resolution.get("month") or resolution.get("year")):
+        # "How many sold in Dubai in October?" is a citywide count, not a reason to ask for an area.
+        from datetime import date
+        from app.retrieval.propai_catalog import count_sales
+
+        month, year = resolution.get("month"), resolution.get("year") or date.today().year
+        counted = await asyncio.to_thread(count_sales, None, resolution.get("beds"), year, month)
+        when = date(year, month, 1).strftime("%B %Y") if month else str(year)
+        return _stamp_resolve(_fast_answer(
+            question,
+            f"There were **{counted['count']:,}** recorded {_beds_label(resolution.get('beds'))}property sales in "
+            f"Dubai in {when} (all property types, Dubai Land Department records).",
+        ))
+    if resolution.get("action") == "project_detail" and resolution.get("project"):
+        turn = await asyncio.to_thread(
+            _project_detail_turn, question, conversation_memory, resolution["project"]
+        )
+        if turn is not None:
+            return _stamp_resolve(turn)
+
+    if resolution.get("action") == "data_freshness":
+        fresh = await asyncio.to_thread(_data_freshness_turn, question, True)
+        if fresh is not None:
+            return _stamp_resolve(fresh)
 
     # Aggregates (cheapest / highest / average sale) go to the exact SQL handler.
     if resolution.get("action") == "sales_stat":
@@ -2031,7 +2101,7 @@ async def _understood_turn(question, conversation_memory, components=None):
     action = resolution.get("action")
     # Leave these to existing specialized turns / agent.
     if action in {
-        None, "general", "small_talk", "predict",
+        None, "general", "small_talk", "predict", "guidance",
     }:
         return None
 
@@ -2058,12 +2128,31 @@ async def _understood_turn(question, conversation_memory, components=None):
             await asyncio.to_thread(_developer_rank_turn, question)
         )
 
-    if action == "project_count":
+    place = str(resolution.get("place") or "").strip().lower()
+    # Every project count (per area, per developer, off-plan / ready) uses the same counter, so wordings agree.
+    if action == "project_count" and (
+        place not in {"", "dubai"} or resolution.get("developer") or resolution.get("kind") in {"off_plan", "ready"}
+    ):
+        from app.retrieval.propai_catalog import count_projects
+
+        status = resolution.get("kind")
+        n = await asyncio.to_thread(count_projects, resolution.get("place"), resolution.get("developer"), status)
+        label = {"off_plan": "off-plan ", "ready": "ready (completed) "}.get(status, "")
+        by = f" by {resolution['developer']}" if resolution.get("developer") else ""
+        _set_dialogue_state(conversation_memory, {**updates, "action": "project_count"}, replace=True)
+        return _stamp_resolve(_fast_answer(
+            question,
+            f"There are **{n:,}** {label}residential projects{by}{_where(resolution.get('place'))} in our "
+            "Dubai Land Department project records. Say **show me** if you want the list.",
+        ))
+    if action == "project_count" and place in {"", "dubai"}:
         return _stamp_resolve(
             await asyncio.to_thread(
-                _project_count_turn, question, conversation_memory
+                _project_count_turn, question, conversation_memory, True
             )
         )
+    # A count in one community ("how many projects in Dubai Hills") runs the search
+    # executor below, which answers "I found N projects in X" for every wording.
 
     if action == "recommend":
         from app.answers.intent_turns import recommend_data_turn
@@ -2077,7 +2166,7 @@ async def _understood_turn(question, conversation_memory, components=None):
         )
         return _stamp_resolve(turn)
 
-    if action in {"search", "sales_list", "sales_count"}:
+    if action in {"search", "project_count", "sales_list", "sales_count"}:
         # After a project shortlist, "recent transaction details" must use the
         # on-screen cards — not area-wide sales from an inherited place.
         if action == "sales_list":
@@ -2310,7 +2399,8 @@ def _cheapest_sale_turn(question, slots=None, conversation_memory=None):
     bed_bit = f"{_bed_label(bed)} " if bed is not None else ""
     window = f" in the last {months} months" if months else ""
     area_bit = f" ({place})" if project and place else ""
-    word = {"cheapest": "lowest", "highest": "highest", "average": "average"}[kind]
+    # "average" asks are answered with the median, so say median.
+    word = {"cheapest": "lowest", "highest": "highest", "average": "median"}[kind]
     # Explain-first: restate exactly what was searched before the number.
     understood = (
         f"Understood: the {word} recorded {bed_bit}sale price in {subject}{window}."
@@ -3216,12 +3306,15 @@ _COMMUNITY_NARROWED = re.compile(
 )
 
 
-def _project_detail_turn(question, conversation_memory=None):
-    """Full detail for a named / on-screen project from Prop-AI. No model call."""
+def _project_detail_turn(question, conversation_memory=None, name=None):
+    """Full detail for a named / on-screen project from Prop-AI. No model call.
+
+    `name`: the project the turn resolver understood; otherwise it is read from the question.
+    """
     from app.answers.intent_route import project_detail_subject
     from app.retrieval.propai_catalog import agent_projects
 
-    name = project_detail_subject(question, conversation_memory)
+    name = name or project_detail_subject(question, conversation_memory)
     if not name:
         return None
     shown = None
@@ -3388,23 +3481,56 @@ _DATA_FRESHNESS = re.compile(
 )
 
 
-def _data_freshness_turn(question):
-    """Calendar today + max Prop-AI sale date. Never invent a scrape snapshot as today."""
-    if not _DATA_FRESHNESS.search(question or ""):
+_DATE_ONLY_ASK = re.compile(
+    r"\btoday'?s?\s+date\b|\bdate\s+today\b|\bwhat(?:'s|\s+is)\s+(?:the\s+)?(?:date|day)\b|"
+    r"\bwhat\s+day\s+is\s+(?:it|today)\b|\bcurrent\s+date\b",
+    re.I,
+)
+_DATA_WORDS = re.compile(
+    r"\b(?:data|sales?|sold|rents?|rental|records?|transactions?|latest|recent|updated?|info(?:rmation)?)\b", re.I
+)
+
+
+def _data_freshness_turn(question, understood=False):
+    """Calendar today + latest recorded sale and rent dates. Never invent a scrape snapshot as today.
+
+    `understood`: the turn resolver already decided this is a freshness ask, so skip the wording check.
+    """
+    # Runs before follow-up handling, so date asks never re-run an on-screen search.
+    if not understood and not (_DATA_FRESHNESS.search(question or "") or _DATE_ONLY_ASK.search(question or "")):
         return None
     from datetime import date
     from app.retrieval.propai_catalog import fetch
 
     today = date.today()
+    if _DATE_ONLY_ASK.search(question or "") and not _DATA_WORDS.search(question or ""):
+        # "What is today's date?" gets the date, not a data report.
+        answer = f"Today is **{today.strftime('%A, %d %B %Y')}**."
+        summary = _empty_structured_summary()
+        summary["data_freshness"] = {"today": today.isoformat()}
+        return {
+            "question": question, "standalone_question": question, "question_type": "general",
+            "structured_summary": summary, "documents": [], "investment_analysis": None,
+            "retrieval_result": {"question_type": "general",
+                                 "structured_data": {"community": [], "projects": [], "sub_communities": []},
+                                 "documents": []},
+            "use_fast": True, "fast_answer": answer, "context": None, "small_talk": None,
+        }
     try:
         row = fetch(
-            "select max(instance_date)::date as latest "
-            "from propai_sales where deleted_at is null"
+            "select (select max(instance_date) from propai_sales"
+            "         where deleted_at is null and instance_date <= current_date)::date as latest, "
+            "       (select max(contract_start_date) from propai_rents"
+            "         where deleted_at is null and contract_start_date <= current_date)::date as rent"
         )
-        latest = row[0].get("latest") if row else None
+        # fetch() returns ISO text; turn it back into dates so they read "18 Nov 2026".
+        latest, rent = (
+            date.fromisoformat(str(row[0][key])[:10]) if row and row[0].get(key) else None
+            for key in ("latest", "rent")
+        )
     except Exception as exc:
         print(f"data freshness lookup failed: {exc}")
-        latest = None
+        latest = rent = None
     if hasattr(latest, "isoformat"):
         latest_text = latest.strftime("%d %b %Y")
         latest_iso = latest.isoformat()
@@ -3415,12 +3541,19 @@ def _data_freshness_turn(question):
         latest_text = None
         latest_iso = None
     today_text = today.strftime("%d %b %Y")
+    rent_text = None
+    if rent:
+        rent_text = rent.strftime("%d %b %Y") if hasattr(rent, "strftime") else str(rent)[:10]
     if latest_text:
+        lines = [f"- **Sales:** Dubai Land Department sale transactions, up to **{latest_text}**"]
+        if rent_text:
+            lines.append(f"- **Rents:** registered rent contracts (Ejari), up to **{rent_text}**")
+        lines.append("- **Projects:** the Dubai Land Department project register (developer, status, completion)")
+        lines.append("- **Agents:** Dubai Land Department broker licence records")
         answer = (
-            f"Today is {today_text}. "
-            f"In our recorded Dubai sales data, the latest sale date is {latest_text}. "
-            "I only quote sale dates that appear in that sales table — "
-            "I do not invent newer dates."
+            f"My data comes from official Dubai Land Department records (today is {today_text}):\n\n"
+            + "\n".join(lines)
+            + "\n\nEvery price and count I give comes from these records, so nothing after these dates is included."
         )
     else:
         answer = (
@@ -3451,13 +3584,437 @@ def _data_freshness_turn(question):
     }
 
 
-def _project_count_turn(question, conversation_memory=None):
+def _fast_answer(question, answer, projects=None, question_type="general"):
+    """Response shape for an answer built straight from the data (no model call)."""
+    summary = _empty_structured_summary()
+    summary["projects"] = list(projects or [])
+    return {
+        "question": question, "standalone_question": question, "question_type": question_type,
+        "structured_summary": summary, "documents": [], "investment_analysis": None,
+        "retrieval_result": {"question_type": question_type,
+                             "structured_data": {"community": [], "projects": list(projects or []),
+                                                 "sub_communities": []},
+                             "documents": []},
+        "use_fast": True, "fast_answer": answer, "context": None, "small_talk": None,
+    }
+
+
+def _aed(value) -> str:
+    return f"AED {int(round(float(value))):,}"
+
+
+def _where(place) -> str:
+    return f" in {place}" if place and str(place).strip().lower() != "dubai" else " in Dubai"
+
+
+def _beds_label(beds) -> str:
+    if beds is None:
+        return ""
+    return "studio " if int(beds) == 0 else f"{int(beds)}-bedroom "
+
+
+def _rent_stat_turn(question, resolution):
+    """Median / lowest / highest yearly rent for a place, from registered rent contracts."""
+    from app.retrieval.propai_catalog import rent_stats
+
+    place, beds, stat = resolution.get("place"), resolution.get("beds"), resolution.get("stat") or "average"
+    if not place or str(place).strip().lower() == "dubai":
+        return None  # "cheapest rents in Dubai" is an area ranking, handled by area_rank
+    try:
+        row = rent_stats([place], beds, beds)
+    except Exception as exc:
+        print(f"rent lookup failed: {exc}")
+        row = None
+    what = f"{_beds_label(beds)}rent{_where(place)}"
+    if not row:
+        return _fast_answer(question, f"I couldn't find registered rent contracts for a {what}.")
+    low, high = row.get("typical_range_annual_aed") or [None, None]
+    n = row.get("listings")
+    # The single lowest / highest contract is usually a data error, so quote the cheaper / upper quarter.
+    if stat == "cheapest" and low:
+        lead = f"At the cheaper end, a yearly {what} costs about **{_aed(low)}** or less (lowest quarter of contracts)."
+    elif stat == "highest" and high:
+        lead = f"At the top end, a yearly {what} costs about **{_aed(high)}** or more (top quarter of contracts)."
+    else:
+        lead = f"The typical yearly {what} is **{_aed(row['median_annual_rent_aed'])}** (median)."
+    detail = f"Most contracts fall between **{_aed(low)}** and **{_aed(high)}** a year" if low and high else ""
+    answer = (
+        f"{lead}\n\n"
+        + (f"- {detail}\n" if detail else "")
+        + f"- Based on **{n:,}** registered rent contracts since Sep 2025 (Dubai Land Department / Ejari)"
+    )
+    return _fast_answer(question, answer)
+
+
+def _market_numbers(place):
+    """One area's figures: our recorded sales (price/sq ft, change, activity) plus Prop-AI's matched rental
+    yield and 3-year price growth. Prop-AI wins for yield; our gross yield is the fallback."""
+    from app.answers.area_comparison import market_signals, official_area
+    from app.retrieval.propai_live import area_returns
+
+    official = official_area(place)
+    signals = dict(market_signals(official) or {}) if official else {}
+    live = area_returns(official) if official else None
+    if live and live.get("rental_yield_pct") is not None:
+        signals["gross_yield_pct"] = live["rental_yield_pct"]
+    if live:
+        signals["growth_3y_pct"] = live.get("growth_3y_pct")
+        signals["growth_years"] = live.get("growth_years")
+    if (signals.get("sales_12m") or 0) < _MIN_SALES:
+        # A median from a handful of sales swings wildly (Al Qusais: "+47%" from one sale).
+        for key in ("price_psf", "price_psf_change_pct", "sales_change_pct", "growth_3y_pct", "gross_yield_pct"):
+            signals[key] = None
+    yld, growth = signals.get("gross_yield_pct"), signals.get("growth_3y_pct")
+    signals["roi_pct"] = round(yld + growth, 1) if yld is not None and growth is not None else None
+    return signals
+
+
+_MIN_SALES = 30  # fewer recorded sales in 12 months than this: too few to quote a price or trend
+
+
+def _pct(value) -> str:
+    return f"{'+' if value > 0 else ''}{value}%"
+
+
+_ROI_NOTE = ("ROI here = rental yield + yearly price growth, for apartments, before service charges, fees, "
+             "vacancy and mortgage costs. Past growth does not guarantee future returns.")
+
+
+def _area_market_turn(question, resolution):
+    """Rental yield, ROI, price per sq ft, price trend or an investment summary for one area."""
+    from app.answers.area_comparison import areas_in
+
+    named = areas_in(question)
+    if len(named) >= 2:
+        return _area_pair_turn(question, named[0], named[1])
+    place = resolution.get("place")
+    if not place or str(place).strip().lower() == "dubai":
+        return None
+    signals = _market_numbers(place)
+    kind = resolution.get("kind") or "invest"
+    if kind == "profile":
+        profile = _area_profile_turn(question, place, signals)
+        if profile is not None:
+            return profile
+        kind = "invest"  # web search unavailable: the investment view from our records still answers
+    if not signals.get("sales_12m") and signals.get("gross_yield_pct") is None:
+        return _fast_answer(question, f"I don't have enough recorded sales{_where(place)} to measure that.")
+    psf, change = signals.get("price_psf"), signals.get("price_psf_change_pct")
+    yld, roi, growth = signals.get("gross_yield_pct"), signals.get("roi_pct"), signals.get("growth_3y_pct")
+    sales, sales_change = signals.get("sales_12m"), signals.get("sales_change_pct")
+    years = signals.get("growth_years")
+    span = f" ({years[0]} → {years[1]})" if years else ""
+    trend = (f"**up {change}%**" if change and change > 0 else f"**down {abs(change)}%**" if change and change < 0
+             else "**flat**") if change is not None else None
+    where = _where(place)
+
+    if kind == "roi":
+        if roi is None:
+            return _fast_answer(question, f"I can't estimate an ROI{where}: I need both rental yield and price "
+                                          "history, and one of them is missing.")
+        answer = (
+            f"The estimated return on an apartment{where} is about **{roi}% a year**:\n\n"
+            f"- **Rental income:** {yld}% rental yield\n"
+            f"- **Capital growth:** {_pct(growth)} a year in price per sq ft{span}\n"
+            + (f"- **Last 12 months:** price {_pct(change)}\n" if change is not None else "")
+            + f"\n{_ROI_NOTE}"
+        )
+        return _fast_answer(question, answer)
+
+    lines = []
+    if kind == "yield":
+        if yld is None:
+            return _fast_answer(question, f"I can't measure a rental yield{where}: not enough rents and sales on record.")
+        lead = f"The rental yield{where} is about **{yld}%** a year (apartments): the rent you earn as a share of the price."
+        if roi is not None:
+            lines.append(f"- **Total return (ROI):** about {roi}% a year once price growth ({_pct(growth)} a year) is added")
+    elif kind == "psf":
+        lead = f"Homes{where} sell for a median **AED {psf:,} per sq ft** (last 12 months)."
+    elif kind == "trend":
+        lead = (f"Prices{where} are {trend} over the last 12 months (median price per sq ft, now AED {psf:,})."
+                if trend else f"I can't measure a price trend{where} yet.")
+        if growth is not None:
+            lines.append(f"- **Over 3 years:** {_pct(growth)} a year{span}")
+    else:
+        lead = f"Here is how **{place}** looks as an investment (apartments, recorded sales and rents):"
+        if roi is not None:
+            lines.append(f"- **Estimated ROI:** about {roi}% a year (rental yield + price growth)")
+    if kind != "psf" and psf:
+        lines.append(f"- **Price:** AED {psf:,} per sq ft (median, last 12 months)")
+    if kind not in ("trend",) and trend:
+        lines.append(f"- **Price change:** {trend} vs the previous 12 months")
+    if kind not in ("yield",) and yld is not None:
+        lines.append(f"- **Rental yield:** about {yld}%")
+    if sales:
+        move = f" ({_pct(sales_change)} vs the year before)" if sales_change is not None else ""
+        lines.append(f"- **Sales activity:** {sales:,} recorded sales in 12 months{move}")
+    note = f"\n\n{_ROI_NOTE}" if kind == "invest" and roi is not None else ""
+    return _fast_answer(question, lead + ("\n\n" + "\n".join(lines) if lines else "") + note)
+
+
+_PROFILE_FOCUS = (  # (words in the question, words in the bullet that answers it)
+    (r"metro|transport|commut|traffic|getting around|bus", r"metro|transport|getting around"),
+    (r"school|nurser|educat", r"school"),
+    (r"downside|cons\b|disadvantage|drawback|problem", r"downside|drawback"),
+    (r"amenit|mall|shop|restaurant|park|beach", r"amenit|mall|shop"),
+    (r"who (is it|it'?s) for|suit|famil|couple", r"suit|famil"),
+)
+
+
+def _area_profile_turn(question, place, signals):
+    """"Tell me about JVC" / "what is it like to live in": a web-sourced community profile plus 2-3 key
+    figures from our records, with sources. None when the web search is unavailable."""
+    from app.answers.area_comparison import official_area
+    from app.retrieval.web_context import area_profile
+
+    profile = area_profile(place, key=official_area(place) or place)
+    if not profile:
+        return None
+    psf, change, yld = signals.get("price_psf"), signals.get("price_psf_change_pct"), signals.get("gross_yield_pct")
+    figures = []
+    if psf:
+        figures.append(f"- **Price:** AED {psf:,} per sq ft (median, last 12 months"
+                       + (f", {_pct(change)} on the year)" if change is not None else ")"))
+    if yld is not None:
+        figures.append(f"- **Rental yield:** about {yld}% a year (apartments)")
+    if signals.get("sales_12m"):
+        figures.append(f"- **Sales activity:** {signals['sales_12m']:,} recorded sales in 12 months")
+    bullets = profile["text"].split("\n")
+    asked = [rx for words, rx in _PROFILE_FOCUS if re.search(words, question, re.I)]
+    # "Is there a metro in JVC?": the bullet that answers it goes first; the rest of the profile follows.
+    bullets.sort(key=lambda line: not any(re.search(rx, line, re.I) for rx in asked))
+    answer = f"**{place}** at a glance:\n\n" + "\n".join(bullets)
+    if figures:
+        answer += "\n\n**Key figures** (Dubai Land Department records):\n" + "\n".join(figures)
+    return _fast_answer(question, answer + _sources_line(profile))
+
+
+def _sources_line(found) -> str:
+    sources = found.get("sources") or []
+    return ("\n\nSources: " + ", ".join(f"[{title}]({url})" for title, url in sources)) if sources else ""
+
+
+def _web_answer_turn(question, resolution):
+    """A question our records cannot answer ("best restaurant near JVC?", golden visa rules), from the web."""
+    from app.retrieval.web_context import web_answer
+
+    found = web_answer(question, resolution.get("place"))
+    return _fast_answer(question, found["text"] + _sources_line(found)) if found else None
+
+
+def _area_pair_turn(question, first, second):
+    """Two areas side by side on the same market numbers ("Business Bay or Downtown for investment?")."""
+    from app.answers.area_comparison import market_signals, official_area
+
+    first, second = (n.title() if n.isupper() else n for n in (first, second))
+    picks = {name: _market_numbers(name) for name in (first, second)}
+
+    def row(label, key, fmt):
+        values = [picks[name].get(key) for name in (first, second)]
+        return f"- **{label}:** " + " vs ".join(
+            f"{name} {fmt(v) if v is not None else 'n/a'}" for name, v in zip((first, second), values)
+        )
+
+    lines = [
+        row("Price per sq ft", "price_psf", lambda v: f"AED {v:,}"),
+        row("Price change (12 months)", "price_psf_change_pct", lambda v: f"{'+' if v > 0 else ''}{v}%"),
+        row("Rental yield", "gross_yield_pct", lambda v: f"{v}%"),
+        row("Estimated ROI (yield + price growth)", "roi_pct", lambda v: f"{v}% a year"),
+        row("Sales in 12 months", "sales_12m", lambda v: f"{v:,}"),
+    ]
+    yields = {n: picks[n].get("gross_yield_pct") for n in (first, second)}
+    growth = {n: picks[n].get("price_psf_change_pct") for n in (first, second)}
+    verdict = []
+    if all(v is not None for v in yields.values()) and yields[first] != yields[second]:
+        verdict.append(f"**{max(yields, key=yields.get)}** earns more rent for the price")
+    if all(v is not None for v in growth.values()) and growth[first] != growth[second]:
+        verdict.append(f"**{max(growth, key=growth.get)}** has risen more in price over the last year")
+    rois = {n: picks[n].get("roi_pct") for n in (first, second)}
+    if all(v is not None for v in rois.values()) and rois[first] != rois[second]:
+        verdict.append(f"**{max(rois, key=rois.get)}** has the higher estimated total return")
+    answer = (
+        f"**{first} vs {second}**, from the last 12 months of recorded sales and rents:\n\n" + "\n".join(lines)
+        + ("\n\n" + "; ".join(verdict) + "." if verdict else "")
+        + "\n\n" + _ROI_NOTE
+    )
+    return _fast_answer(question, answer)
+
+
+def _predict_turn(question, resolution):
+    """Price outlook for one area: the recorded trend and a projection from past growth, never a made-up price.
+    Says plainly when there is not enough data."""
+    place = resolution.get("place")
+    if not place or str(place).strip().lower() == "dubai":
+        return _fast_answer(question, "Which area should I look at? A price outlook needs one community, "
+                                      "for example JVC, Business Bay or Dubai Creek Harbour.")
+    signals = _market_numbers(place)
+    psf, change = signals.get("price_psf"), signals.get("price_psf_change_pct")
+    growth, years = signals.get("growth_3y_pct"), signals.get("growth_years")
+    if psf is None and growth is None:
+        return _fast_answer(question, f"We don't have enough recorded sales{_where(place)} to show a price trend, "
+                                      "so I can't make a prediction there.")
+    lines = []
+    if change is not None:
+        lines.append(f"- **Last 12 months:** {_pct(change)} (median AED {psf:,} per sq ft)")
+    if growth is not None:
+        lines.append(f"- **Last 3 years:** {_pct(growth)} a year ({years[0]} → {years[1]})")
+    if signals.get("sales_12m"):
+        move = signals.get("sales_change_pct")
+        lines.append(f"- **Sales activity:** {signals['sales_12m']:,} sales in 12 months"
+                     + (f" ({_pct(move)} vs the year before)" if move is not None else ""))
+    if growth is not None:
+        outlook = (f"If the 3-year pace continued, prices{_where(place)} would be about **{_pct(growth)}** in a "
+                   "year. That is a projection from past growth, not a forecast: rates, new supply and the "
+                   "wider market can change it.")
+    else:
+        outlook = "There is not enough price history for a projection, only the last 12 months above."
+    answer = (f"No one can predict prices exactly, but here is the recorded trend for apartments{_where(place)}:\n\n"
+              + "\n".join(lines) + "\n\n" + outlook)
+    return _fast_answer(question, answer, question_type="prediction")
+
+
+_AREA_RANK_TEXT = {
+    "cheapest_rent": ("lowest", "rent", "median yearly rent"),
+    "priciest_rent": ("highest", "rent", "median yearly rent"),
+    "cheapest_buy": ("lowest", "buy", "median apartment price"),
+    "priciest_buy": ("highest", "buy", "median apartment price"),
+    "best_yield": ("best", "yield", "gross rental yield"),
+}
+
+
+def _area_rank_turn(question, resolution):
+    """Dubai areas ranked by rent, price or gross yield (apartments, last 12 months)."""
+    from app.retrieval.propai_catalog import area_ranking
+
+    kind = resolution.get("kind") if resolution.get("kind") in _AREA_RANK_TEXT else None
+    if kind is None:
+        return None
+    beds = resolution.get("beds")
+    rows = area_ranking(kind, beds=beds, limit=8)
+    word, _, measure = _AREA_RANK_TEXT[kind]
+    homes = f"{_beds_label(beds)}apartments" if beds is not None else "apartments"
+    if not rows:
+        return _fast_answer(question, "I don't have enough recorded data to rank areas for that.")
+    def line(i, r):
+        if kind == "best_yield":
+            return (f"{i}. **{r['place']}** — about **{r['yield_pct']}%** "
+                    f"(rent {_aed(r['rent'])}/yr, price {_aed(r['price'])})")
+        if "rent" in kind:
+            return f"{i}. **{r['place']}** — **{_aed(r['rent'])}** a year ({r['rents']:,} contracts)"
+        return f"{i}. **{r['place']}** — **{_aed(r['price'])}** ({r['sales']:,} sales)"
+    title = {"best_yield": f"Dubai areas with the **best gross rental yield** for {homes}",
+             }.get(kind, f"Dubai areas with the **{word} {measure}** for {homes}")
+    note = ("\n\nYield = median yearly rent / median ready-home price, before service charges and vacancy. "
+            if kind == "best_yield" else "\n\n")
+    answer = (title + " (last 12 months):\n\n" + "\n".join(line(i, r) for i, r in enumerate(rows, 1))
+              + note + "Areas need enough contracts and sales to be ranked, so one odd building can't top the list.")
+    return _fast_answer(question, answer)
+
+
+def _top_projects_turn(question, resolution):
+    """Projects ranked by number of recorded sales."""
+    from datetime import date
+    from app.retrieval.propai_catalog import top_projects_by_sales
+
+    year, place = resolution.get("year"), resolution.get("place")
+    rows = top_projects_by_sales(place=place, year=year, limit=10)
+    period = (f"in {year}" + (f" (to {date.today().strftime('%d %b')})" if year == date.today().year else "")
+              if year else "in the last 12 months")
+    if not rows:
+        return _fast_answer(question, f"I found no recorded sales{_where(place)} {period}.")
+    lines = [
+        f"{i}. **{r['name']}** — {r['sales']:,} sales · median {_aed(r['median_price'])}"
+        + (f" · {r['community']}" if r.get("community") else "")
+        for i, r in enumerate(rows, 1)
+    ]
+    answer = (f"The **best-selling projects**{_where(place)} {period}, by number of recorded sales:\n\n"
+              + "\n".join(lines) + "\n\nSource: Dubai Land Department sale records (off-plan and ready).")
+    return _fast_answer(question, answer, question_type="search")
+
+
+def _handover_turn(question, resolution, conversation_memory=None):
+    """Most recently handed-over (or next to hand over) projects, straight from DLD project records."""
+    from datetime import date
+    from app.retrieval.propai_catalog import handover_projects
+
+    year = resolution.get("year")
+    when = "upcoming" if resolution.get("kind") == "upcoming" else "recent"
+    if year:
+        when = "upcoming" if int(year) >= date.today().year else "recent"
+    place = resolution.get("place")
+    where = f" in {place}" if place and str(place).strip().lower() != "dubai" else " in Dubai"
+    try:
+        projects = handover_projects(when, place, limit=10, year=year)
+    except Exception as exc:
+        print(f"handover lookup failed: {exc}")
+        projects = []
+
+    def month(row):
+        value = row.get("handover_on")
+        return date.fromisoformat(str(value)[:10]).strftime("%b %Y") if value else "date not recorded"
+
+    def line(i, row):
+        bits = [row.get("community"), row.get("developer_name")]
+        detail = " · ".join(b for b in bits if b)
+        if when == "upcoming":
+            built = row.get("percent_completed")
+            tail = f"planned **{month(row)}**" + (f" · {built:.0f}% built" if built is not None else "")
+        else:
+            tail = f"completed **{month(row)}**"
+        return f"{i}. **{row.get('name')}** — {detail} · {tail}"
+
+    if not projects:
+        answer = (f"I couldn't find any recorded {'planned' if when == 'upcoming' else 'completed'} handovers"
+                  f"{where}{f' in {year}' if year else ''}.")
+    elif year:
+        verb = "planned to hand over" if when == "upcoming" else "completed"
+        answer = (
+            f"Projects{where} {verb} in **{year}** (Dubai Land Department records):\n\n"
+            + "\n".join(line(i, row) for i, row in enumerate(projects, 1))
+            + ("\n\nPlanned dates often slip, so check the % built." if when == "upcoming" else "")
+        )
+    elif when == "upcoming":
+        answer = (
+            f"These projects{where} have the **nearest planned handover** (Dubai Land Department project records):\n\n"
+            + "\n".join(line(i, row) for i, row in enumerate(projects, 1))
+            + "\n\nPlanned dates often slip, so check the % built: a project at 10% is unlikely to hand over this month."
+        )
+    else:
+        answer = (
+            f"These are the **most recently handed-over** projects{where} (Dubai Land Department completion records):\n\n"
+            + "\n".join(line(i, row) for i, row in enumerate(projects, 1))
+            + f"\n\nThe newest completion on record is **{month(projects[0])}**. "
+            "DLD records completions after handover, so a very recent one may not appear yet."
+        )
+    summary = _empty_structured_summary()
+    summary["projects"] = projects
+    return {
+        "question": question,
+        "standalone_question": question,
+        "question_type": "search",
+        "structured_summary": summary,
+        "documents": [],
+        "investment_analysis": None,
+        "retrieval_result": {
+            "question_type": "search",
+            "structured_data": {"community": [], "projects": projects, "sub_communities": []},
+            "documents": [],
+        },
+        "use_fast": True,
+        "fast_answer": answer,
+        "context": None,
+        "small_talk": None,
+    }
+
+
+def _project_count_turn(question, conversation_memory=None, understood=False):
     """How many residential projects are in Dubai — a grounded count.
 
     Saves dialogue_state so a follow-up "show me" can list projects (same idea
-    as sales_count → show me → sales_list).
+    as sales_count → show me → sales_list). `understood`: the turn resolver already
+    decided this is a count, so the wording check is skipped.
     """
-    if not _PROJECT_COUNT_ASK.search(question or ""):
+    if not understood and not _PROJECT_COUNT_ASK.search(question or ""):
         return None
     if _SALE_COUNT_ASK.search(question or ""):
         return None
@@ -4544,6 +5101,12 @@ _GUIDANCE_DATA_ASK = re.compile(
 )
 
 
+def _agent_owns_turn(components) -> bool:
+    """The understanding step called this a guidance or off-topic question: the agent answers it,
+    never the default project-list browse."""
+    return isinstance(components, dict) and components.get("_resolved_action") in {"guidance", "general"}
+
+
 def _is_dubai_guidance_question(question: str) -> bool:
     """True for process/knowledge asks (RERA, escrow, how to buy) — not data browse."""
     text = question or ""
@@ -4693,7 +5256,7 @@ async def _try_agent_turn(question, components, timing_ms, ask_started):
     conversation_memory = components.get("conversation_memory")
     # Simple Prop-AI browse is SQL, not the listings agent. The agent was
     # retrying search_projects until the round limit and burning tokens.
-    if _propai_sql_browse(question, conversation_memory):
+    if not _agent_owns_turn(components) and _propai_sql_browse(question, conversation_memory):
         return None
     agent = components["listing_agent"]
     history = components.setdefault("agent_history", [])
@@ -4887,6 +5450,7 @@ async def _try_agent_turn(question, components, timing_ms, ask_started):
 async def _prepare_acot_turn(question, components):
     """Prepare a turn; a broker's CRM/claim part carried from a mixed question rides along with the market answer."""
     components.pop("_carry_companion", None)
+    components.pop("_resolved_action", None)  # set per turn by the understanding step
     prepared = await _prepare_acot_turn_inner(question, components)
     carry = components.pop("_carry_companion", None)
     if carry and not prepared.get("broker_companion"):
@@ -5037,6 +5601,19 @@ async def _prepare_acot_turn_inner(
         freshness["conversation_memory"] = conversation_memory
         return freshness
 
+    # "Top 5 developers by sales value": a ranking, answered from the sales table. Before the interpreter step, which
+    # read it as "the highest single sale". Only citywide; a named community goes the normal way.
+    if _DEVELOPER_VALUE_RANK.search(question or ""):
+        _place = extract_place(question)
+        if not _place or str(_place).strip().lower() == "dubai":
+            developer_early = await asyncio.to_thread(_developer_rank_turn, question)
+            if developer_early is not None:
+                developer_early["timing_ms"] = timing_ms
+                developer_early["ask_started"] = ask_started
+                developer_early["rag_chain"] = rag_chain
+                developer_early["conversation_memory"] = conversation_memory
+                return developer_early
+
     # On-screen compare / best-of-shown before sticky followup/understood —
     # otherwise LLM resolve re-runs the prior afford with Business Bay + budget.
     compare_shown_early = await asyncio.to_thread(
@@ -5134,7 +5711,7 @@ async def _prepare_acot_turn_inner(
 
     # Clear Prop-AI place browses: SQL + template only (skip rewrite/plan/RAG).
     # Run before agent-first so min-price / ready filters stay on SQL.
-    if _propai_sql_browse(question, conversation_memory):
+    if not _agent_owns_turn(components) and _propai_sql_browse(question, conversation_memory):
         sql_browse = await asyncio.to_thread(
             _sql_project_browse_turn, question, conversation_memory
         )
@@ -5146,7 +5723,9 @@ async def _prepare_acot_turn_inner(
             return sql_browse
 
     # Agent-first only when SQL browse should not handle this turn.
-    if _agent_enabled(components) and not _propai_sql_browse(question, conversation_memory):
+    if _agent_enabled(components) and (
+        _agent_owns_turn(components) or not _propai_sql_browse(question, conversation_memory)
+    ):
         agent_first = await _try_agent_turn(
             question, components, timing_ms, ask_started
         )
@@ -5653,6 +6232,10 @@ def _ensure_prepared_turn(prepared):
     return prepared
 
 
+_NO_ANSWER = ("I couldn't complete that answer right now because the AI service is busy. "
+              "Please try again in a moment.")
+
+
 def _finalize_acot_turn(prepared, answer, answer_started):
     prepared = _ensure_prepared_turn(prepared)
     timing_ms = dict(prepared.get("timing_ms") or {})
@@ -5715,6 +6298,7 @@ async def ask_acot(
             context=prepared["context"],
             question_type=prepared["question_type"]
         )
+    answer = answer if (answer or "").strip() else _NO_ANSWER
     if prepared.get("companion_suffix"):
         answer = f"{answer}\n\n{prepared['companion_suffix']}"
 
@@ -6194,7 +6778,7 @@ async def stream_acot(
             for event in spoken_so_far():
                 yield event
         if prepared["use_fast"]:
-            answer = prepared["fast_answer"] or ""
+            answer = prepared["fast_answer"] or _NO_ANSWER
             for piece in _iter_typewriter_pieces(answer):
                 yield (
                     "delta",
@@ -6225,9 +6809,9 @@ async def stream_acot(
             answer = "".join(parts).strip()
 
             if not answer:
-                raise RuntimeError(
-                    "LLM returned an empty answer."
-                )
+                # The model failed (rate limit, outage): say so instead of an empty bubble.
+                answer = _NO_ANSWER
+                yield ("delta", {"type": "delta", "text": answer})
 
         if prepared.get("companion_suffix"):
             tail = f"\n\n{prepared['companion_suffix']}"

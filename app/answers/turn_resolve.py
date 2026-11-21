@@ -9,6 +9,7 @@ Fast SQL / tools still execute; this module only decides what to run.
 from __future__ import annotations
 
 import json
+from datetime import date
 import re
 from typing import Any, Callable
 
@@ -24,6 +25,14 @@ from app.answers.intent_route import (
 from app.memory.dialogue_state import normalize_dialogue_state
 
 _ACTIONS = frozenset({
+    "data_freshness",
+    "handovers",
+    "rent_stat",
+    "area_market",
+    "area_rank",
+    "top_projects",
+    "project_detail",
+    "guidance",
     "search",
     "project_count",
     "sales_list",
@@ -141,6 +150,11 @@ _SEARCH_SIGNAL = re.compile(
     re.I,
 )
 _AGENTS_SIGNAL = re.compile(r"\b(?:agents?|brokers?)\b", re.I)
+_RENT_WORD = re.compile(r"\b(?:rent|rents|rental\s+(?:price|cost|rate)s?|to\s+rent|lease|yearly\s+rent)\b", re.I)
+_HANDOVER_WORD = re.compile(r"\b(?:handovers?|handed\s+over|hand(?:ing)?\s+over|delivered|completed|completions?)\b", re.I)
+_RECENT_WORD = re.compile(r"\b(?:recent(?:ly)?|latest|lately|newly|just|last)\b", re.I)
+_UPCOMING_WORD = re.compile(r"\b(?:upcoming|next|soon(?:est)?|nearest|coming|future)\b", re.I)
+_POINTS_AT_SHOWN = re.compile(r"\b(?:these|those|them|their|each|this\s+project|that\s+project)\b", re.I)
 _MONTHS = {
     "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
     "july": 7, "august": 8, "september": 9, "october": 10, "november": 11,
@@ -160,6 +174,14 @@ def _parse_month_year(text: str) -> tuple[int | None, int | None]:
     year_match = re.search(r"\b(20\d{2})\b", text or "")
     if year_match:
         year = int(year_match.group(1))
+    if month is None and year is None:
+        relative = re.search(r"\b(last|previous|this|current)\s+month\b", lower)
+        if relative:
+            today = date.today()
+            back = 1 if relative.group(1) in ("last", "previous") else 0
+            index = today.year * 12 + today.month - 1 - back
+            year, month = divmod(index, 12)
+            month += 1
     return month, year
 
 
@@ -317,6 +339,9 @@ def _clean_resolution(data: dict[str, Any], question: str) -> dict[str, Any]:
     project = data.get("project")
     if project is not None:
         project = str(project).strip() or None
+    developer = data.get("developer")
+    if developer is not None:
+        developer = str(developer).strip() or None
     months = data.get("months")
     try:
         months = max(1, min(int(months), 60)) if months is not None else None
@@ -348,6 +373,7 @@ def _clean_resolution(data: dict[str, Any], question: str) -> dict[str, Any]:
             "route": data.get("route"),
             "stat": stat,
             "project": project,
+            "developer": developer,
             "months": months,
         },
         question,
@@ -457,14 +483,46 @@ def offline_resolve_turn(
             text,
         )
 
+    # "Average rent for a 1-bed in JVC": rent, never a sale statistic. Near-certain, so it also holds when
+    # the model is unavailable (rate limits) and only these rules answer.
+    if _RENT_WORD.search(text) and place and str(place).strip().lower() != "dubai" and not _AGENTS_SIGNAL.search(text):
+        lowered = text.lower()
+        rent_stat = ("cheapest" if re.search(r"\b(?:cheap|cheapest|lowest|minimum)\b", lowered)
+                     else "highest" if re.search(r"\b(?:highest|most expensive|maximum|priciest)\b", lowered)
+                     else "average")
+        parsed_beds = parse_bedrooms(text)
+        return _clean_resolution(
+            {"action": "rent_stat", "place": place, "beds": parsed_beds[0] if parsed_beds else None,
+             "stat": rent_stat, "confidence": 0.92, "source": "offline"},
+            text,
+        )
+
+    # "Which projects were handed over recently?" / "upcoming handovers in JVC": a ranking, not an attribute
+    # of the cards on screen ("their handover dates" still is one).
+    if _HANDOVER_WORD.search(text) and not _POINTS_AT_SHOWN.search(text):
+        when = "upcoming" if _UPCOMING_WORD.search(text) else "recent" if _RECENT_WORD.search(text) else None
+        if when:
+            return _clean_resolution(
+                {"action": "handovers", "kind": when, "place": place, "confidence": 0.92, "source": "offline"},
+                text,
+            )
+
     # "Who is the developer of each of these projects?" / "developer details in JVC"
     # with cards on screen — never clarify or re-browse the community.
     if _is_shown_attribute_ask(text, conversation_memory):
+        # Near-certain only when the ask points at the shown set ("these", "their", "each") or names
+        # a project attribute. A bare "date" ("till what date is your info updated?") is left to the LLM.
+        pointed = re.search(
+            r"\b(?:these|those|them|they|their|each|every|all\s+of|handover|developers?|builders?|"
+            r"completion|payment\s+plans?|service\s+charges?|bedrooms?|sizes?|prices?|brochures?)\b",
+            text,
+            re.I,
+        )
         return _clean_resolution(
             {
                 "action": "attribute",
                 "place": place,
-                "confidence": 0.92,
+                "confidence": 0.92 if pointed else 0.85,
                 "source": "offline",
             },
             text,
@@ -613,7 +671,11 @@ async def resolve_turn(
                 "attribute",
                 "agents",
             }
-            and float(offline_fast.get("confidence") or 0) >= 0.8
+            # Keyword rules only win when near-certain (explicit stat words, greetings).
+            # At 0.8 they answered "how much do homes sell for in X" with a project list
+            # and "sales volume" with a sales list, so rewordings got different answers.
+            # The meaning-based LLM step below handles everything else; offline stays the fallback.
+            and (llm_generate is None or float(offline_fast.get("confidence") or 0) >= 0.9)
         ):
             return offline_fast
 
@@ -637,10 +699,14 @@ async def resolve_turn(
         ):
             return None
 
+    llm_general = None
     if llm_generate is not None:
         prompt = f"""You are ACOT's turn understanding layer for Dubai real estate.
 Do NOT answer the user. Resolve the message into JSON only.
 Understand MEANING + prior dialogue state. Do not rely on exact keywords.
+
+Today is {date.today().isoformat()}. Resolve relative dates against it ("last month" = the previous
+calendar month, so set month and year).
 
 Prior dialogue state (may be empty):
 {json.dumps(state, default=str)}
@@ -649,7 +715,7 @@ User message:
 {text}
 
 Return ONLY JSON with keys:
-- action: one of search, project_count, sales_list, sales_count, sales_stat, developer_rank, attribute, recommend, agents, predict, general, clarify, small_talk
+- action: one of data_freshness, handovers, rent_stat, area_market, area_rank, top_projects, project_detail, guidance, search, project_count, sales_list, sales_count, sales_stat, developer_rank, attribute, recommend, agents, predict, general, clarify, small_talk
 - goal: family|budget|afford|invest|ready|compare|open_buy or null
 - place: Dubai community/area name or null (use canonical names like "Jumeirah Village Circle" for JVC when clear)
 - beds: integer or null (studio=0)
@@ -658,8 +724,10 @@ Return ONLY JSON with keys:
 - year: e.g. 2026 or null
 - ready_only: boolean
 - prefer_cheaper: boolean
-- kind: optional recommend kind (filtered|afford|family_areas|open_best|cheapest|shortlist|split|ready_offplan|yield_areas) or null
-- stat: only for sales_stat: cheapest | highest | average, else null
+- kind: handovers: recent | upcoming. area_market: yield | roi | psf | trend | invest | profile. area_rank: cheapest_rent | priciest_rent |
+  cheapest_buy | priciest_buy | best_yield. project_count: off_plan | ready when asked. Otherwise optional recommend kind (filtered|afford|family_areas|open_best|cheapest|shortlist|split|ready_offplan|yield_areas) or null
+- stat: for sales_stat or rent_stat: cheapest | highest | average, else null
+- developer: a developer the user named (e.g. "Danube", "Emaar"), else null
 - project: a specific project/building name the user named (e.g. "Hanover Square"), else null
 - months: lookback window in months when the user gave one ("last 12 months" = 12, "last year" = 12), else null
 - confidence: number from 0 to 1 (how sure you are of action+slots)
@@ -667,7 +735,37 @@ Return ONLY JSON with keys:
 
 Rules (meaning + state — never require exact wording):
 - Same meaning, any wording / typos → same action.
-- how many projects → project_count
+- What homes cost / sell for / go for / the going rate / typical price in a place, with no ask to
+  list or show options ("how much does a flat cost in X", "what do apartments in X go for") → sales_stat, stat average
+- how recent / up to date / latest the data is, any wording or grammar ("which data do you have latest?"),
+  or today's date / what day it is → data_freshness. Handover dates, developers or prices of projects are
+  attribute (or search), never data_freshness.
+- RENT (rent, rental price, lease, yearly rent) for a place → rent_stat with stat (average unless cheapest/highest) and beds.
+  Never sales_stat for rent.
+- Which AREA is cheapest / most expensive to rent or buy, or gives the best rental yield → area_rank with kind, beds if given
+- For ONE named area → area_market with kind:
+  yield = rental yield only (rent as a share of price);
+  roi = ROI / return on investment / total return / how much I make (rent + price growth) — NOT the same as yield;
+  psf = price per sq ft; trend = prices going up or down; invest = "is X a good investment";
+  profile = "tell me about X", "what is X like", living in X, overview, or schools / metro / amenities /
+  lifestyle / pros and cons of ONE named area
+- Top / best-selling / most popular projects by sales → top_projects (year and place when given)
+- Price, handover, developer, size or details of ONE named project ("price of Sobha Central") → project_detail, project=name
+- How many projects a developer has → project_count with developer; "off-plan" / "ready" → kind off_plan / ready
+- Handovers in a named year ("handing over in 2027", "completed in 2025") → handovers with year (kind upcoming for a
+  future year, recent for a past one)
+- Buying process, fees, visas, mortgages, who can buy, laws, general Dubai property knowledge → guidance
+- Local life we hold no data for: restaurants, cafes, gyms, hospitals, supermarkets, things to do, or metro /
+  schools near projects or a place → guidance (place when named). It is answered from the web, never refused
+- Predict / forecast / future price / "will prices go up" → predict (place from the message or the prior state)
+- A place the user names that you do not recognise: set place to exactly what they typed, never swap in
+  a place from the prior state
+- What data or sources you use / where your data comes from → data_freshness
+- Anything not about Dubai real estate or living in Dubai (weather, sport, news, coding) → general
+- Which projects were handed over / completed / delivered recently or most recently → handovers, kind recent
+- Which projects hand over next / soon / upcoming handovers → handovers, kind upcoming (place if one is named)
+- how many projects / developments → project_count
+- sales volume / number of transactions → sales_count
 - how many sold / sale count → sales_count with place/beds/month/year when given
 - list/show recent sales → sales_list (need a place; clarify if none)
 - Asking for the cheapest / lowest / highest / average / "least I'd pay" / "which one is cheapest"
@@ -714,6 +812,7 @@ Rules (meaning + state — never require exact wording):
                 if resolved["action"] != "general":
                     return resolved
                 # general → allow offline only as a last resort below
+                llm_general = resolved
         except Exception:
             pass
 
@@ -725,7 +824,9 @@ Rules (meaning + state — never require exact wording):
     if offline:
         offline["confidence"] = score_confidence(offline, text)
         offline["source"] = "offline"
-    return offline
+    # The LLM saw no property task and no rule matched: say so, so callers send it to the agent
+    # instead of the default project list (metro questions were answered with 10 random projects).
+    return offline or llm_general
 
 
 def state_updates_from_resolution(resolution: dict[str, Any] | None) -> dict[str, Any]:

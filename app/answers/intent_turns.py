@@ -1287,13 +1287,16 @@ def _filtered_turn(question: str, route: dict, conversation_memory=None) -> dict
     answer = format_ranked_picks(
         ranked,
         intro=intro,
-        relaxed=relaxed,
+        relaxed=None if over_budget else relaxed,
         question=question,
         place=place,
         beds=route.get("bedrooms"),
         budget_aed=route.get("budget_aed"),
         goal=goal_for_route(route) or route.get("goal"),
     )
+    if over_budget and relaxed:
+        # Nothing matched the budget: say that first, not after a page of picks.
+        answer = f"**{relaxed}**\n\n{answer}"
     ordered = []
     by_name = {str(row.get("name") or "").lower(): row for row in rows}
     for item in ranked.get("ranked") or []:

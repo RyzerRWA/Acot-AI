@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from app.listings.agent import AgentResult, ListingAgent, strip_links
 from app.listings.router import is_rent_browse, is_rent_question
-from app.listings.tools import ToolInputError, parse_filters, run_tool
+from app.listings.tools import ToolInputError, _lenient, _sales_where, parse_filters, run_tool
 
 
 class FilterTests(unittest.TestCase):
@@ -702,6 +702,25 @@ class SessionStoreTests(unittest.TestCase):
         with mock.patch.object(self.store, "execute", side_effect=RuntimeError("db down")):
             self.store.save("s3", [], {})                     # must not raise
             self.assertEqual(self.store.load("s3"), ([], {}))
+
+class SalesToolTests(unittest.TestCase):
+    def test_empty_values_mean_not_given_but_studio_stays(self):
+        a = _lenient({"bedrooms": -1, "handover_year": 0, "max_price_aed": 0, "limit": 0, "min_price_aed": 5_000_000})
+        self.assertEqual(a, {"min_price_aed": 5_000_000})
+        self.assertEqual(_lenient({"bedrooms": 0}), {"bedrooms": 0})  # 0 bedrooms is a studio
+
+    def test_sales_filters(self):
+        where, params, used = _sales_where({"place": "Dubai", "bedrooms": 1, "status": "ready", "month": "2026-11"})
+        self.assertNotIn("place", used)  # "Dubai" is the whole city, not a place filter
+        self.assertEqual(used["status"], "ready")
+        self.assertIn("development_status = 'Existing'", where)
+        self.assertIn(1, params)
+        for bad in ({"month": "Nov 2026"}, {"date_from": "yesterday"}, {"property_type": "castle"}, {"min_price_aed": 9, "max_price_aed": 1}):
+            with self.assertRaises(ToolInputError, msg=str(bad)):
+                _sales_where(bad)
+        with self.assertRaises(ToolInputError):
+            run_tool("sales_search", {"sort": "random"})
+
 
 
 if __name__ == "__main__":
