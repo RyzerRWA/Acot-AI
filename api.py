@@ -632,6 +632,7 @@ async def ask_stream_endpoint(request: AskRequest):
             })
             return
 
+        chat_tokens = 0
         try:
             use_request_collector(request.session_id)
             reset_tokens()
@@ -643,8 +644,6 @@ async def ask_stream_endpoint(request: AskRequest):
             # Per question: the session lives on, but the context can be removed in the app.
             components["page"] = request.page
             components["audience"] = request.audience
-
-            chat_tokens = 0
 
             async for event_name, data in stream_acot(
                 question,

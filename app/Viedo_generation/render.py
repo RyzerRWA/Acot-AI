@@ -19,8 +19,10 @@ from typing import Any
 
 import httpx
 
-WIDTH = 1280
-HEIGHT = 720
+# Default: vertical 9:16 (phone / Reels / Stories). Override with VIDEO_WIDTH / VIDEO_HEIGHT.
+# Landscape 16:9 example: VIDEO_WIDTH=1280 VIDEO_HEIGHT=720
+WIDTH = int(os.getenv("VIDEO_WIDTH") or 1080)
+HEIGHT = int(os.getenv("VIDEO_HEIGHT") or 1920)
 DEFAULT_OUT_DIR = Path(os.getenv("VIDEO_OUTPUT_DIR") or r"C:\acot_video_output")
 
 
@@ -225,43 +227,57 @@ def _draw_slide(out_path: Path, photo_path: Path | None, slide: dict[str, Any]) 
         except Exception:
             pass
 
-    # Dark gradient bar at the bottom for captions.
+    # Darker lower band for captions (taller on 9:16).
     overlay = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
-    for y in range(HEIGHT // 2, HEIGHT):
-        alpha = int(40 + 180 * ((y - HEIGHT // 2) / (HEIGHT / 2)))
-        draw.line([(0, y), (WIDTH, y)], fill=(20, 14, 12, min(220, alpha)))
+    fade_start = int(HEIGHT * 0.48)
+    for y in range(fade_start, HEIGHT):
+        t = (y - fade_start) / max(1, HEIGHT - fade_start)
+        alpha = int(30 + 200 * t)
+        draw.line([(0, y), (WIDTH, y)], fill=(20, 14, 12, min(230, alpha)))
     canvas = Image.alpha_composite(canvas.convert("RGBA"), overlay).convert("RGB")
     draw = ImageDraw.Draw(canvas)
 
-    title_font = _font(40, bold=True)
-    line_font = _font(28, bold=False)
-    small_font = _font(22, bold=False)
+    # Scale type to frame height so 9:16 and 16:9 both read well.
+    scale = HEIGHT / 1920
+    title_font = _font(max(36, int(52 * scale)), bold=True)
+    line_font = _font(max(26, int(34 * scale)), bold=False)
+    small_font = _font(max(22, int(28 * scale)), bold=False)
+    title_step = max(40, int(58 * scale))
+    line_step = max(30, int(40 * scale))
+    small_step = max(28, int(36 * scale))
+    margin = max(36, int(56 * scale))
+    bottom_pad = max(48, int(72 * scale))
 
     title = str(slide.get("title") or "")
     subtitle = str(slide.get("subtitle") or "")
     lines = [str(x) for x in (slide.get("lines") or []) if x]
+    # Soft wrap long caption lines to the frame width.
+    max_chars = max(22, WIDTH // max(14, int(18 * scale)))
+    body_lines: list[str] = []
+    for line in lines:
+        if line == title:
+            continue
+        body_lines.extend(_wrap_text(line, max_chars))
+    show_subtitle = bool(subtitle) and subtitle not in lines and subtitle != title
 
-    y = HEIGHT - 56 - 36 * max(0, len(lines) - 1)
-    if subtitle and subtitle not in lines:
-        y -= 34
+    block_h = 0
     if title:
-        y -= 48
-
-    y = max(40, y)
-    margin = 48
+        block_h += title_step
+    if show_subtitle:
+        block_h += line_step
+    block_h += small_step * len(body_lines)
+    y = max(int(HEIGHT * 0.55), HEIGHT - bottom_pad - block_h)
 
     if title:
         _text(draw, title, margin, y, title_font, fill=(255, 255, 255))
-        y += 48
-    if subtitle and subtitle not in lines:
+        y += title_step
+    if show_subtitle:
         _text(draw, subtitle, margin, y, line_font, fill=(240, 220, 210))
-        y += 36
-    for line in lines[1:] if lines and lines[0] == title else lines:
-        if line == title:
-            continue
+        y += line_step
+    for line in body_lines:
         _text(draw, line, margin, y, small_font, fill=(235, 230, 225))
-        y += 32
+        y += small_step
 
     # Kind pill
     kind = str(slide.get("kind") or "")
@@ -270,10 +286,32 @@ def _draw_slide(out_path: Path, photo_path: Path | None, slide: dict[str, Any]) 
         pill = f"  {label}  "
         bbox = draw.textbbox((0, 0), pill, font=small_font)
         pw, ph = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        draw.rounded_rectangle((margin, 28, margin + pw + 8, 28 + ph + 10), radius=14, fill=(133, 92, 72))
-        draw.text((margin + 4, 32), pill, font=small_font, fill=(255, 255, 255))
+        top = max(36, int(48 * scale))
+        draw.rounded_rectangle(
+            (margin, top, margin + pw + 8, top + ph + 10),
+            radius=14,
+            fill=(133, 92, 72),
+        )
+        draw.text((margin + 4, top + 4), pill, font=small_font, fill=(255, 255, 255))
 
     canvas.save(out_path, format="JPEG", quality=90)
+
+
+def _wrap_text(text: str, max_chars: int) -> list[str]:
+    words = text.split()
+    if not words:
+        return []
+    rows: list[str] = []
+    current = words[0]
+    for word in words[1:]:
+        trial = f"{current} {word}"
+        if len(trial) <= max_chars:
+            current = trial
+        else:
+            rows.append(current)
+            current = word
+    rows.append(current)
+    return rows
 
 
 def _cover(image: Any, width: int, height: int) -> Any:

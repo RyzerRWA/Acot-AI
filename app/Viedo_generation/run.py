@@ -5,6 +5,8 @@ Usage (from Acot-AI- folder):
   python -m app.Viedo_generation.run USER_ID
   python -m app.Viedo_generation.run USER_ID --bedrooms 2 --job-id my_video
   python -m app.Viedo_generation.run USER_ID --with-voice
+  python -m app.Viedo_generation.run USER_ID --with-voice --voice female
+  python -m app.Viedo_generation.run USER_ID --with-voice --voice male
 
 Output default: C:\\acot_video_output\\{job_id}.mp4
 Without --with-voice (or if TTS credentials are missing) the video is silent.
@@ -44,7 +46,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--with-voice",
         action="store_true",
-        help="Try Google TTS narration (needs GOOGLE_APPLICATION_CREDENTIALS).",
+        help="Try Google TTS narration (GOOGLE_CLOUD_API_KEY or service-account JSON).",
+    )
+    parser.add_argument(
+        "--voice",
+        default=None,
+        help="Narration voice: male | female | or a Neural2 name (e.g. en-US-Neural2-F).",
     )
     parser.add_argument(
         "--output",
@@ -89,15 +96,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.with_voice:
         print("4/4 TTS + render...")
         try:
-            from app.Viedo_generation.tts import TtsError, speak_to_file
+            from app.Viedo_generation.tts import resolve_voice, speak_to_file
 
+            voice_name = resolve_voice(args.voice)
+            print(f"   tts voice: {voice_name}")
             out_dir = Path(args.output).parent if args.output else Path(r"C:\acot_video_output")
             out_dir.mkdir(parents=True, exist_ok=True)
             audio_path = speak_to_file(
                 script.get("full_text") or "",
                 out_dir / f"{args.job_id}.mp3",
+                voice=voice_name,
             )
-            print(f"   voice: {audio_path}")
+            print(f"   audio: {audio_path}")
         except Exception as exc:
             # TtsError or missing creds — still produce a silent video.
             name = type(exc).__name__
