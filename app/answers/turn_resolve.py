@@ -755,8 +755,10 @@ Rules (meaning + state — never require exact wording):
 - Handovers in a named year ("handing over in 2027", "completed in 2025") → handovers with year (kind upcoming for a
   future year, recent for a past one)
 - Buying process, fees, visas, mortgages, who can buy, laws, general Dubai property knowledge → guidance
-- Local life we hold no data for: restaurants, cafes, gyms, hospitals, supermarkets, things to do, or metro /
-  schools near projects or a place → guidance (place when named). It is answered from the web, never refused
+- Local life we hold no data for — any place or service in or near an area (hotels, malls, restaurants, cafes,
+  gyms, hospitals, clinics, supermarkets, beaches, parks, mosques, things to do), "nearest / closest / biggest /
+  best X", or metro / schools near projects or a place → guidance (place when named). It is answered from the
+  web, never refused
 - Predict / forecast / future price / "will prices go up" → predict (place from the message or the prior state)
 - A place the user names that you do not recognise: set place to exactly what they typed, never swap in
   a place from the prior state
