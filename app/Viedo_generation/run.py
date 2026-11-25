@@ -9,7 +9,7 @@ Usage (from Acot-AI- folder):
   python -m app.Viedo_generation.run USER_ID --with-voice --voice male
 
 Output default: C:\\acot_video_output\\{job_id}.mp4
-Without --with-voice (or if TTS credentials are missing) the video is silent.
+Without --with-voice the video is silent. Requested narration must succeed.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ def main(argv: list[str] | None = None) -> int:
         "--limit",
         type=int,
         default=4,
-        help="Max projects to enrich into the pack (default 4; script uses up to 3).",
+        help="Max projects to enrich into the pack (default 4; script uses up to 4).",
     )
     parser.add_argument(
         "--job-id",
@@ -96,24 +96,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.with_voice:
         print("4/4 TTS + render...")
         try:
-            from app.Viedo_generation.tts import resolve_voice, speak_to_file
+            from app.Viedo_generation.tts import resolve_voice
+            from app.Viedo_generation.narration import narrate_script
 
             voice_name = resolve_voice(args.voice)
             print(f"   tts voice: {voice_name}")
             out_dir = Path(args.output).parent if args.output else Path(r"C:\acot_video_output")
             out_dir.mkdir(parents=True, exist_ok=True)
-            audio_path = speak_to_file(
-                script.get("full_text") or "",
-                out_dir / f"{args.job_id}.mp3",
-                voice=voice_name,
-            )
+            audio_path = out_dir / f"{args.job_id}.wav"
+            script = narrate_script(script, audio_path, voice=voice_name)
+            print(f"   synchronized duration: {script['estimated_seconds']:.2f}s")
             print(f"   audio: {audio_path}")
         except Exception as exc:
-            # TtsError or missing creds — still produce a silent video.
             name = type(exc).__name__
-            print(f"   TTS skipped ({name}: {exc})")
-            audio_path = None
-            print("   rendering silent mp4...")
+            print(f"   Narration failed ({name}: {exc})")
+            return 1
     else:
         print("4/4 render (silent)...")
 
@@ -124,6 +121,7 @@ def main(argv: list[str] | None = None) -> int:
         audio_path=audio_path,
         output_path=args.output,
         job_id=args.job_id,
+        presenter=args.voice,
     )
     t2 = time.time()
 

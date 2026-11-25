@@ -82,11 +82,13 @@ def build_pack(
         # Incomplete or stale projects never go into the video.
         if not _is_complete(row):
             continue
+        row["explicit_project"] = bool(candidate.get("explicit_project"))
         enriched.append(row)
 
     # Prefer high sales, then rents, then how often the buyer saw it, then photo count.
     enriched.sort(
         key=lambda p: (
+            p["explicit_project"],
             p["sales_12m"],
             p["rent_contracts_12m"],
             p["appeared"],
@@ -139,7 +141,7 @@ def _shortlist(candidates: list[dict[str, Any]], cap: int) -> list[dict[str, Any
         has_photos = 1 if len(p.get("photos") or []) >= MIN_PHOTOS else 0
         appeared = int(p.get("appeared") or 0)
         last_seen = str(p.get("last_seen") or "")
-        return (has_key, has_photos, appeared, last_seen)
+        return (bool(p.get("explicit_project")), has_key, has_photos, appeared, last_seen)
 
     ranked = sorted(candidates, key=rank, reverse=True)
     return ranked[:cap]
@@ -193,6 +195,11 @@ def _enrich(candidate: dict[str, Any], bedrooms: int | None) -> dict[str, Any] |
     if catalog is None:
         return None
     catalog["appeared"] = int(candidate.get("appeared") or 1)
+    # Keep searched bedroom range for on-screen captions / narration.
+    if candidate.get("bedrooms_min") is not None:
+        catalog["bedrooms_min"] = candidate.get("bedrooms_min")
+    if candidate.get("bedrooms_max") is not None:
+        catalog["bedrooms_max"] = candidate.get("bedrooms_max")
     return catalog
 
 

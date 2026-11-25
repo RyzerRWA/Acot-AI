@@ -1,8 +1,27 @@
-python -m app.Viedo_generation.run fd9420b8-819e-4ace-817d-01e8c04ce9d1 --job-id preview
+# Chat AI (port 8080)
+uvicorn api:app --host 0.0.0.0 --port 8080
 
+# Video generation API (port 8090) — separate process
+uvicorn video_api:app --host 0.0.0.0 --port 8090
+
+# CLI one-shot render
+python -m app.Viedo_generation.run fd9420b8-819e-4ace-817d-01e8c04ce9d1 --job-id preview
 
 # Male
 python -m app.Viedo_generation.run USER_ID --with-voice --voice male
 
 # Female
 python -m app.Viedo_generation.run USER_ID --with-voice --voice female
+
+
+
+fd9420b8-819e-4ace-817d-01e8c04ce9d1
+08ea8b50-213d-4164-a2eb-d52a1e7370cb
+205749ea-214c-401c-a3c5-e5aadfe6b526
+a3404c83-4c9e-4836-982f-ca9cc4584e48
+570e16eb-d5cc-477e-ab84-9fd3b0689a7e
+dc83183a-9cfd-4d3e-a7af-7acca7c9429d
+fe4cc117-92c4-4637-9bfd-21b57d7031a6
+ae4a4a74-a802-429e-8097-bcafdbad16ff
+13f2e3e9-7982-43a1-a22c-ba66d73debb5
+845aceae-a414-4df1-96ae-e56b302f6e8e
