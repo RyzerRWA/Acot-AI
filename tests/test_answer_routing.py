@@ -180,7 +180,7 @@ def test_propai_browse_says_recent_sale_not_starting_price():
     summary["catalog_place"] = "Dubai Land Residence Complex"
     answer = _build_fast_structured_answer(question, summary)
     assert "I found 128 projects in Dubai Land Residence Complex" in answer
-    assert "Recent sale AED 750,146" in answer
+    assert "Median recorded sale AED 750,146" in answer
     assert "Starting price" not in answer
     assert "Handover May 2030" in answer or "2030" in answer
     assert "Let me know if you need more details on any of these projects!" in answer
@@ -268,7 +268,7 @@ def test_ready_browse_omits_ancient_handover_years():
     answer = _build_fast_structured_answer(question, summary)
     assert "Understood:" not in answer
     assert answer.startswith("Here are 1 ready 1-bedroom option")
-    assert "Recent sale AED 635,000" in answer
+    assert "Median recorded sale AED 635,000" in answer
     assert "2026-10-15" in answer
     assert "Handover December 2015" not in answer
     assert "Handover November 2010" not in answer

@@ -60,7 +60,7 @@ def test_ground_syncs_last_sold_on_with_last_sale():
     card = _format_project_card(row)
     assert card["last_sold_on"] == "2026-10-05"
     assert card["price_kind"] == "recent_sale"
-    assert "recent sale" in (card["price_label"] or "").lower()
+    assert "median recorded sale" in (card["price_label"] or "").lower()
 
 
 def test_answer_omits_sale_wording_without_price():
@@ -114,7 +114,7 @@ def test_answer_and_card_share_recent_sale_price():
         ]
     }
     answer = _build_fast_structured_answer("Show me Marina Tower", summary)
-    assert "Recent sale AED 1,500,000" in answer
+    assert "Median recorded sale AED 1,500,000" in answer
 
     response = build_frontend_response(
         question="Show me Marina Tower",
@@ -128,7 +128,7 @@ def test_answer_and_card_share_recent_sale_price():
     assert card["price"] == 1_500_000
     assert card["price_kind"] == "recent_sale"
     assert card["last_sold_on"] == "2026-09-12"
-    assert "recent sale" in (card["price_label"] or "").lower()
+    assert "median recorded sale" in (card["price_label"] or "").lower()
 
 
 def test_filter_no_match_keeps_cards_empty_and_is_honest():

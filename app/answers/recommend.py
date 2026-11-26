@@ -1342,7 +1342,7 @@ def format_compare_table(projects: list[dict], result: dict) -> str:
             return "—"
         kind = str(item.get("price_kind") or "")
         if kind == "recent_sale":
-            label = "recent sale"
+            label = "median recent sale"
         elif kind in {"yearly rent", "rent"}:
             label = "yearly rent"
         else:
@@ -1450,7 +1450,7 @@ def _project_points(row: dict | None) -> list[str]:
     if price:
         kind = str(row.get("price_kind") or "")
         points.append(
-            f"recent sale around {price}" if kind == "recent_sale" else f"from {price}"
+            f"median recent sale {price}" if kind == "recent_sale" else f"from {price}"
         )
     sales = _num(row.get("sales_count"), row.get("recent_sales_count"))
     if sales:
