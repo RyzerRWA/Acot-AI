@@ -47,16 +47,38 @@ class VideoSyncTests(unittest.TestCase):
             with wave.open(str(audio), "rb") as stream:
                 self.assertEqual(stream.getnframes(), 45 * 24000)
 
+    def test_one_picked_property_makes_a_single_property_video(self):
+        photos = [f"photo{i}" for i in range(6)]
+        script = build_script({"ok": True, "projects": [{"name": "Creek Residences", "community": "Creek", "photos": photos}]})
+        self.assertTrue(script["ok"])
+        self.assertEqual([s["kind"] for s in script["slides"]], ["intro", "project", "outro"])
+        self.assertEqual(renderer._slide_durations(script["slides"], 33), [5, 24, 4])
+        self.assertEqual(script["slides"][0]["title"], "Creek Residences")
+        self.assertIn("This is Creek Residences, in Creek.", script["slides"][1]["narration"])
+        self.assertNotIn("either", script["full_text"])
+        # Intro, middle and close each show different real photos.
+        self.assertEqual([s["photo_urls"] for s in script["slides"]], [["photo0"], photos[1:5], ["photo5"]])
+
     def test_facts_are_paired_with_their_narration(self):
         project = {"name": "Example", "community": "Community", "developer": "Developer", "bedrooms_min": 2, "photos": ["photo"], "recent_sale": {"price": 1200000, "bedrooms": 2, "date": "2026-10-01"}, "rent": {"annual": 80000, "bedrooms": 2, "date": "2026-10-02"}, "handover": "ready"}
         script = build_script({"ok": True, "projects": [project, {**project, "name": "Second"}]})
         cues = script["slides"][1]["cues"]
         self.assertEqual(len(cues), 4)
-        self.assertIn("A recent sale was", cues[1]["narration"])
+        self.assertIn("sold for about 1.2 million dirhams", cues[1]["narration"])
         self.assertTrue(cues[1]["lines"][0].startswith("Sale "))
-        self.assertIn("A recent rental was", cues[2]["narration"])
+        self.assertIn("80,000 dirhams a year", cues[2]["narration"])
         self.assertTrue(cues[2]["lines"][0].startswith("Rent "))
         self.assertEqual(" ".join(cue["narration"] for cue in cues), script["slides"][1]["narration"])
+
+    def test_hindi_narration_keeps_the_same_facts(self):
+        project = {"name": "Example", "community": "Community", "photos": ["p"] * 5,
+                   "recent_sale": {"price": 1200000, "bedrooms": 2, "date": "2026-10-01"},
+                   "rent": {"annual": 80000, "bedrooms": 0, "date": "2026-10-02"}, "handover": "Dec 2027"}
+        script = build_script({"ok": True, "projects": [project]}, language="hi")
+        text = script["full_text"]
+        for fact in ("Example", "1.2 मिलियन दिरहम", "80 हज़ार दिरहम", "स्टूडियो", "दिसंबर 2027", "नमस्ते"):
+            self.assertIn(fact, text)
+        self.assertEqual([s["label"] for s in script["slides"][1]["stats"]], ["RECENT SALE", "RECENT RENT", "HANDOVER"])
 
     def test_invalid_timings_fail_instead_of_drifting(self):
         with self.assertRaises(renderer.RenderError):
@@ -98,11 +120,16 @@ class VideoSyncTests(unittest.TestCase):
             with patch.object(renderer, "_download_image", return_value=fixture), patch("app.Viedo_generation.motion.draw_overlay", side_effect=overlay):
                 renderer.render({"ok": True}, timed, audio_path=audio, output_path=out)
             ffmpeg = renderer._ffmpeg_bin()
-            for timestamp, dominant_channel in ((5.92, 0), (6.04, 2), (9.92, 2), (10.04, 1), (13.92, 1)):
+            # Slides dissolve over 0.8 s starting at the narration boundary (10 s).
+            for timestamp, dominant_channel in ((5.92, 0), (6.04, 2), (9.92, 2), (10.88, 1), (13.92, 1)):
                 result = subprocess.run([ffmpeg, "-v", "error", "-ss", str(timestamp), "-i", str(out), "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"], capture_output=True, check=True)
                 frame = Image.frombytes("RGB", (360, 640), result.stdout)
                 rgb = frame.getpixel((180, 570))
                 self.assertEqual(rgb.index(max(rgb)), dominant_channel, (timestamp, rgb))
+            # Mid-dissolve: the outgoing blue caption and incoming green caption are both visible (no hard cut).
+            result = subprocess.run([ffmpeg, "-v", "error", "-ss", "10.4", "-i", str(out), "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"], capture_output=True, check=True)
+            _, green, blue = Image.frombytes("RGB", (360, 640), result.stdout).getpixel((180, 570))
+            self.assertGreater(min(green, blue), 50, (green, blue))
             self.assertAlmostEqual(renderer._total_seconds({}, out), 14, delta=0.04)
 
 

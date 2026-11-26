@@ -94,6 +94,17 @@ def _gender_voice(gender_key: str) -> str:
     return (os.getenv("GOOGLE_TTS_VOICE_MALE") or DEFAULT_VOICE_MALE).strip()
 
 
+# Friendly Chirp3-HD voices for the property video. Google describes Sulafat as warm and Puck as upbeat.
+FRIENDLY_VOICES = {"female": "Sulafat", "male": "Puck"}
+VIDEO_LANGUAGES = {"en": "en-IN", "hi": "hi-IN"}
+
+
+def friendly_voice(gender: str | None, language: str | None) -> str:
+    """The agent picks English or Hindi and a female or male voice; e.g. hi-IN-Chirp3-HD-Sulafat."""
+    name = FRIENDLY_VOICES.get((gender or "").lower(), FRIENDLY_VOICES["female"])
+    return f"{VIDEO_LANGUAGES.get((language or '').lower(), 'en-IN')}-Chirp3-HD-{name}"
+
+
 def list_voices() -> dict[str, str]:
     """Built-in gender presets (after env overrides)."""
     return {

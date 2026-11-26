@@ -108,6 +108,62 @@ def generate_entrance_clip(
     return job_id
 
 
+SHOT_PROMPT = (
+    "One slow, steady cinematic camera move through this exact scene. Preserve the "
+    "building, layout, materials, furniture and view exactly as shown. Add nothing new. "
+    "No people, text or graphic overlays."
+)
+
+
+def luma_enabled() -> bool:
+    off = (os.getenv("VIDEO_LUMA_ENABLED") or "true").strip().lower() in {"0", "false", "no", "off"}
+    return not off and bool((os.getenv("LUMA_AGENTS_API_KEY") or "").strip())
+
+
+def animate_photos(urls: list[str], cache_dir: Path) -> dict[str, Path | None]:
+    """Turn real photos into 5s Luma shots, in parallel, cached per photo URL.
+
+    A photo that fails (or is over the cap, or not HTTPS) maps to None so the caller
+    falls back to the still-photo motion. Never raises.
+    """
+    import hashlib
+    import logging
+    from concurrent.futures import ThreadPoolExecutor
+
+    unique = list(dict.fromkeys(u for u in urls if isinstance(u, str)))
+    result: dict[str, Path | None] = dict.fromkeys(unique)
+    if not luma_enabled():
+        return result
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    # Cost balance: a few hero shots move with Luma; the rest use free photo motion. Cached shots are free.
+    cap = max(0, int(os.getenv("VIDEO_LUMA_MAX_SHOTS") or 3))
+    key = os.getenv("LUMA_AGENTS_API_KEY", "")
+    from app.Viedo_generation.render import HEIGHT, WIDTH
+    aspect = "16:9" if WIDTH >= HEIGHT else "9:16"
+    todo = []
+    for url in unique:
+        path = cache_dir / f"{hashlib.sha256(f'{url}|{SHOT_PROMPT}|{aspect}'.encode()).hexdigest()[:24]}.mp4"
+        if path.is_file():
+            result[url] = path
+        elif _https(url) and len(todo) < cap:
+            todo.append((url, path))
+
+    def one(item: tuple[str, Path]) -> tuple[str, Path | None]:
+        url, path = item
+        try:
+            with httpx.Client(timeout=30) as client:
+                generate_entrance_clip(client, key, url, None, path, prompt=SHOT_PROMPT, aspect_ratio=aspect)
+            return url, path
+        except (LumaError, httpx.HTTPError, OSError) as exc:
+            logging.getLogger(__name__).warning("Luma shot failed, using still photo: %s", exc)
+            return url, None
+
+    # ponytail: threads block on Luma polling; fine for one render at a time.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        result.update(pool.map(one, todo))
+    return result
+
+
 def main() -> None:
     load_dotenv()
     parser = argparse.ArgumentParser(description=__doc__)

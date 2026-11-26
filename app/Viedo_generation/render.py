@@ -20,13 +20,14 @@ from typing import Any
 
 import httpx
 
-# Default: vertical 9:16 (phone / Reels / Stories). Override with VIDEO_WIDTH / VIDEO_HEIGHT.
-# Landscape 16:9 example: VIDEO_WIDTH=1280 VIDEO_HEIGHT=720
-WIDTH = int(os.getenv("VIDEO_WIDTH") or 1080)
-HEIGHT = int(os.getenv("VIDEO_HEIGHT") or 1920)
-DEFAULT_OUT_DIR = Path(os.getenv("VIDEO_OUTPUT_DIR") or r"C:\acot_video_output")
+# Default: landscape 16:9, full-frame shots. Override with VIDEO_WIDTH / VIDEO_HEIGHT
+# (a portrait size such as 1080x1920 switches back to the photo-over-panel layout).
+WIDTH = int(os.getenv("VIDEO_WIDTH") or 1920)
+HEIGHT = int(os.getenv("VIDEO_HEIGHT") or 1080)
+from app.Viedo_generation.storage import DEFAULT_OUT_DIR
 DEFAULT_LOGO_PATH = Path(__file__).resolve().parent / "assets" / "acot-logo.png"
 LOGO_PATH = Path(os.getenv("VIDEO_LOGO_PATH") or DEFAULT_LOGO_PATH)
+LOGO_OPACITY = 0.7
 
 
 class RenderError(RuntimeError):
@@ -81,31 +82,29 @@ def render(
 
         clips = render_slides(slides, pack, work, slide_durations, ffmpeg, presenter=presenter)
 
-        # Every clip already has an exact frame count and identical encoding.
-        list_file = work / "frames.txt"
-        with list_file.open("w", encoding="utf-8") as fh:
-            for path in clips:
-                # FFmpeg concat needs forward slashes on Windows too.
-                safe = path.resolve().as_posix().replace("'", r"'\''")
-                fh.write(f"file '{safe}'\n")
+        # Dissolve from slide to slide. Each clip but the last carries SLIDE_FADE_FRAMES of tail,
+        # so the offsets land on the narration boundaries and the total length is unchanged.
+        from app.Viedo_generation.motion import FPS as MOTION_FPS, SLIDE_FADE_FRAMES
 
-        # Stream-copy the 25fps clips; avoid another lossy encode at this stage.
         silent = work / "silent.mp4"
-        cmd = [
-            ffmpeg,
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(list_file),
-            "-c:v",
-            "copy",
-            "-movflags",
-            "+faststart",
-            str(silent),
-        ]
+        cmd = [ffmpeg, "-y"]
+        for path in clips:
+            cmd.extend(["-i", str(path)])
+        filters, previous, elapsed = [], "0:v", 0
+        for i, seconds in enumerate(slide_durations[:-1], 1):
+            elapsed += max(1, round(seconds * MOTION_FPS))
+            filters.append(
+                f"[{previous}][{i}:v]xfade=transition=fade:duration={SLIDE_FADE_FRAMES / MOTION_FPS:.4f}"
+                f":offset={elapsed / MOTION_FPS:.4f}[x{i}]"
+            )
+            previous = f"x{i}"
+        if filters:
+            cmd.extend(["-filter_complex", ";".join(filters), "-map", f"[{previous}]"])
+        cmd.extend([
+            "-an", "-r", str(MOTION_FPS), "-c:v", "libx264", "-preset", "medium", "-crf", "19",
+            "-maxrate", "8000k", "-bufsize", "16000k", "-profile:v", "high", "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart", str(silent),
+        ])
         _run(cmd, "FFmpeg slide stitch failed")
 
         if audio:
@@ -350,15 +349,17 @@ def _add_logo(canvas: Any) -> Any:
 
     try:
         logo = Image.open(LOGO_PATH).convert("RGBA")
-        target_width = max(120, int(WIDTH * 0.18))
+        # Small and quiet: never upscale the 142px source (that made it blurry), and keep it translucent.
+        target_width = min(logo.width, max(64, round(min(WIDTH, HEIGHT) * 0.105)))
         target_height = max(1, round(target_width * logo.height / logo.width))
         logo = logo.resize((target_width, target_height), Image.Resampling.LANCZOS)
+        logo.putalpha(logo.getchannel("A").point(lambda a: round(a * LOGO_OPACITY)))
 
-        margin = max(28, round(min(WIDTH, HEIGHT) * 0.04))
+        margin = max(24, round(min(WIDTH, HEIGHT) * 0.045))
         overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
         shadow = Image.new("RGBA", logo.size)
-        shadow.putalpha(logo.getchannel("A").filter(ImageFilter.GaussianBlur(2)))
-        overlay.alpha_composite(shadow, (margin + 1, margin + 2))
+        shadow.putalpha(logo.getchannel("A").point(lambda a: a // 3).filter(ImageFilter.GaussianBlur(3)))
+        overlay.alpha_composite(shadow, (margin, margin + 1))
         overlay.alpha_composite(logo, (margin, margin))
         return Image.alpha_composite(canvas.convert("RGBA"), overlay).convert(canvas.mode)
     except Exception:
@@ -401,24 +402,21 @@ def _cover(image: Any, width: int, height: int) -> Any:
 def _font(size: int, bold: bool = False) -> Any:
     from PIL import ImageFont
 
-    candidates = []
     windir = os.environ.get("WINDIR", r"C:\Windows")
+    # (path, face index). VIDEO_FONT / VIDEO_FONT_BOLD point at a brand font on the VM.
     if bold:
-        candidates += [
-            fr"{windir}\Fonts\segoeuib.ttf",
-            fr"{windir}\Fonts\arialbd.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        ]
+        candidates = [(os.getenv("VIDEO_FONT_BOLD"), 0), (fr"{windir}\Fonts\segoeuisb.ttf", 0),
+                      (fr"{windir}\Fonts\segoeuib.ttf", 0), ("/System/Library/Fonts/Avenir Next.ttc", 2),
+                      ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 0)]
     else:
-        candidates += [
-            fr"{windir}\Fonts\segoeui.ttf",
-            fr"{windir}\Fonts\arial.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        ]
-    for path in candidates:
-        if Path(path).is_file():
-            return ImageFont.truetype(path, size=size)
-    return ImageFont.load_default()
+        candidates = [(os.getenv("VIDEO_FONT"), 0), (fr"{windir}\Fonts\segoeui.ttf", 0),
+                      ("/System/Library/Fonts/Avenir Next.ttc", 5),
+                      ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 0)]
+    for path, index in candidates:
+        if path and Path(path).is_file():
+            return ImageFont.truetype(path, size=size, index=index)
+    # Never fall back to the tiny bitmap font silently.
+    return ImageFont.load_default(size=size)
 
 
 def _text(draw: Any, text: str, x: int, y: int, font: Any, fill: tuple[int, int, int]) -> None:

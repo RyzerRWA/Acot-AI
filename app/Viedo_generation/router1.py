@@ -23,7 +23,8 @@ INTERNAL_KEY = (os.getenv("VIDEO_INTERNAL_KEY") or "").strip()
 
 class CreateJobBody(BaseModel):
     user_id: str = Field(..., min_length=1)
-    voice: Literal["male", "female"] | str | None = "male"
+    voice: Literal["male", "female"] | None = "female"
+    language: Literal["en", "hi"] = "en"
     with_voice: bool = True
     bedrooms: int | None = None
     limit: int = 2
@@ -99,10 +100,13 @@ def get_file(
     if not re.fullmatch(r"[a-zA-Z0-9_-]+\.mp4", filename):
         raise HTTPException(status_code=400, detail="Invalid file name.")
     job_id = filename[:-4]
-    if x_video_scope is not None or jobs.get_job(job_id) is not None:
-        job = get_job(job_id, x_video_key, x_video_scope)
-        if job["status"] != "ready":
+    if x_video_scope is not None:
+        # Agent preview: the job must belong to this agent's lead.
+        if get_job(job_id, x_video_key, x_video_scope)["status"] != "ready":
             raise HTTPException(status_code=404, detail="File not found.")
+    # No scope: Nest's signed buyer link, already checked by Nest. The internal key still applies.
+    elif (job := jobs.get_job(job_id)) is not None and job["status"] != "ready":
+        raise HTTPException(status_code=404, detail="File not found.")
     path = storage.mp4_path(job_id)
     if not path.is_file():
         raise HTTPException(status_code=404, detail="File not found.")

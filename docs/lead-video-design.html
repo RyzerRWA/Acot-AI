@@ -1,0 +1,258 @@
+<title>ACOT Lead Video</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one reading column with a sticky section index on wide screens; ACOT chat browns as the palette. */
+:root {
+  --bg: #FBF8F5;
+  --surface: #FFFFFF;
+  --tint: #F3EAE4;
+  --line: #E3D7CD;
+  --fg: #2A211C;
+  --muted: #6E625A;
+  --accent: #855C48;
+  --ok: #3E7A52;
+  --todo: #B0662F;
+  --font-body: "Poppins", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #1A1512; --surface: #231C18; --tint: #2E2520; --line: #3D322B;
+    --fg: #F1E8E1; --muted: #B3A497; --accent: #D29D82; --ok: #7CC293; --todo: #E3A26E;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #1A1512; --surface: #231C18; --tint: #2E2520; --line: #3D322B;
+  --fg: #F1E8E1; --muted: #B3A497; --accent: #D29D82; --ok: #7CC293; --todo: #E3A26E;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--bg); color: var(--fg);
+  font-family: var(--font-body); font-size: 15px; line-height: 1.65;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 40px 80px;
+}
+.wrap { max-width: 1080px; margin: 0 auto; display: grid; grid-template-columns: 200px minmax(0, 1fr); gap: 48px; }
+nav { position: sticky; top: calc(env(safe-area-inset-top, 0px) + 24px); align-self: start; font-size: 13px; }
+nav a { display: block; color: var(--muted); text-decoration: none; padding: 4px 0; }
+nav a:hover, nav a:focus-visible { color: var(--accent); }
+nav .label { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; }
+main { min-width: 0; max-width: 720px; }
+header { margin-bottom: 40px; }
+.eyebrow { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); font-weight: 600; }
+h1 { font-size: 34px; line-height: 1.2; font-weight: 700; margin: 8px 0 12px; text-wrap: balance; }
+h2 { font-size: 22px; font-weight: 600; margin: 56px 0 12px; text-wrap: balance; scroll-margin-top: 24px; }
+h3 { font-size: 16px; font-weight: 600; margin: 28px 0 8px; }
+p { margin: 0 0 14px; }
+.lede { font-size: 17px; color: var(--muted); }
+.meta { font-size: 13px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 6px 18px; }
+code { font-family: var(--font-mono); font-size: .86em; background: var(--tint); padding: 1px 5px; border-radius: 4px; overflow-wrap: anywhere; }
+ul, ol { padding-left: 20px; margin: 0 0 14px; }
+li { margin-bottom: 6px; }
+.scroll { overflow-x: auto; margin: 0 0 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: 12px; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); font-weight: 600; background: var(--tint); }
+tr:last-child td { border-bottom: 0; }
+.pill { display: inline-block; font-size: 11px; font-weight: 600; letter-spacing: .04em; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+.pill.ok { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
+.pill.todo { color: var(--todo); background: color-mix(in srgb, var(--todo) 14%, transparent); }
+.pill.opt { color: var(--muted); background: var(--tint); }
+.decision { border-left: 3px solid var(--accent); background: var(--surface); padding: 14px 18px; border-radius: 0 10px 10px 0; margin: 0 0 16px; }
+.decision b { color: var(--accent); }
+pre.flow { font-family: var(--font-mono); font-size: 13px; line-height: 1.6; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 16px; overflow-x: auto; margin: 0 0 16px; }
+
+/* Buyer chat mock */
+.mock { display: grid; grid-template-columns: minmax(0, 300px) minmax(0, 1fr); gap: 28px; align-items: start; margin: 8px 0 20px; }
+.phone { background: var(--surface); border: 1px solid var(--line); border-radius: 22px; padding: 14px; }
+.bubble { background: var(--tint); border-radius: 14px 14px 14px 4px; padding: 10px; font-size: 13px; }
+.player { aspect-ratio: 9 / 13; max-width: 100%; border-radius: 10px; background: linear-gradient(160deg, #6b4a3a, #2a211c); position: relative; display: grid; place-items: center; color: #fff; margin-bottom: 8px; }
+.player .play { width: 48px; height: 48px; border-radius: 50%; background: rgba(255,255,255,.22); display: grid; place-items: center; font-size: 18px; }
+.player .cap { position: absolute; left: 10px; right: 10px; bottom: 10px; font-size: 12px; background: rgba(0,0,0,.45); padding: 6px 8px; border-radius: 6px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+.chip { font-size: 12px; border: 1px solid var(--line); background: var(--surface); border-radius: 999px; padding: 3px 10px; color: var(--fg); }
+.chip i { font-style: normal; color: var(--muted); font-family: var(--font-mono); font-size: 11px; margin-left: 4px; }
+.actions { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.btn { font-size: 13px; text-align: center; padding: 7px; border-radius: 8px; border: 1px solid var(--accent); color: var(--accent); background: transparent; }
+.btn.primary { background: var(--accent); color: var(--surface); }
+.mock-notes ol { font-size: 14px; }
+
+@media (max-width: 820px) {
+  .wrap { grid-template-columns: minmax(0, 1fr); gap: 0; }
+  nav { display: none; }
+  .mock { grid-template-columns: minmax(0, 1fr); }
+  .phone { max-width: 320px; }
+  h1 { font-size: 28px; }
+}
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+html { scroll-behavior: smooth; }
+</style>
+
+
+<div class="wrap">
+  <nav aria-label="Sections">
+    <div class="label">On this page</div>
+    <a href="#idea">The idea</a>
+    <a href="#flow">One-click flow</a>
+    <a href="#buyer">Buyer view</a>
+    <a href="#data">Where data comes from</a>
+    <a href="#luma">How Luma is used</a>
+    <a href="#video">The video</a>
+    <a href="#today">What exists</a>
+    <a href="#api">API</a>
+    <a href="#build">Build order</a>
+    <a href="#open">Open decisions</a>
+  </nav>
+
+  <main>
+    <header>
+      <div class="eyebrow">Design · Agent lead chat</div>
+      <h1>One click, one property, one video</h1>
+      <p class="lede">The agent picks a property the buyer is interested in and clicks Generate. ACOT collects the photos and facts itself, Luma turns the real photos into moving shots, and the finished video goes into the chat.</p>
+      <div class="meta"><span>Updated 26 Nov 2026</span><span>Repos: Acot-AI-, ACOT-BACKEND, acout-frontend</span><span>Status: building</span></div>
+    </header>
+
+    <section>
+      <h2 id="idea">The idea</h2>
+      <p>Agents today keep brochures, amenity sheets and photos in their own drive and send them file by file. The buyer has to open each one. Instead, the agent clicks once and the buyer gets one short vertical video in the chat.</p>
+      <div class="decision"><b>Decided:</b> the agent uploads nothing and fills nothing in. All data is collected automatically. Luma is the video engine.</div>
+    </section>
+
+    <section>
+      <h2 id="flow">One-click flow</h2>
+<pre class="flow">Agent chat → + → Create property video
+  Pick one of the buyer's searched properties → Generate
+  1. Collect     ACOT catalog: project, photos, latest sale and rent, handover
+                 later: developer's official page for extra photos and amenities
+  2. Script      fixed template from those facts; Google voice
+  3. Luma        each real photo → a 5 s moving shot (in parallel, cached)
+  4. Assemble    FFmpeg: Luma shots + voice + captions + logo → 9:16 MP4
+  5. Share       agent previews → Send to buyer → plays in the chat</pre>
+      <p>If Luma fails or is switched off for a shot, that shot falls back to the existing slow-zoom photo, so the video still finishes. A property with too little data shows "Not enough data for this property yet" instead of a weak video.</p>
+    </section>
+
+    <section>
+      <h2 id="buyer">What the buyer sees</h2>
+      <div class="mock">
+        <div class="phone" aria-label="Example of the video message in the buyer chat">
+          <div class="bubble">
+            <div class="player">
+              <div class="play" aria-hidden="true">▶</div>
+              <div class="cap">Example: Creek Residences · 0:38</div>
+            </div>
+            <div>Here's a short video of Creek Residences.</div>
+          </div>
+        </div>
+        <div class="mock-notes">
+          <h3>How it works</h3>
+          <ol>
+            <li>The message body is text with a video link, like property cards and meetings already are. No chat schema change.</li>
+            <li>The link is signed by the backend, so the buyer can play it without the agent's login, and nobody can guess other video links.</li>
+            <li>Voice is baked into the MP4, so preview, download and chat all play the same file.</li>
+          </ol>
+          <h3>Later</h3>
+          <p>Chapter shortcuts (Photos, Market, Handover) and buttons (Book a viewing, Ask a question) under the player.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2 id="data">Where the data comes from</h2>
+      <div class="scroll"><table>
+        <thead><tr><th>Source</th><th>Gives</th><th>State</th></tr></thead>
+        <tbody>
+          <tr><td>ACOT catalog (<code>propai_*</code>)</td><td>Name, community, developer, photos, latest sale and rent, handover</td><td><span class="pill ok">Used now</span></td></tr>
+          <tr><td>Buyer's searches (<code>acot.messages</code>)</td><td>The list of properties the agent picks from</td><td><span class="pill ok">Used now</span></td></tr>
+          <tr><td>Developer's official site and brochure</td><td>Extra photos, amenities</td><td><span class="pill todo">Next</span></td></tr>
+          <tr><td>Web search</td><td>Fill gaps; every fact keeps its source link</td><td><span class="pill todo">Next</span></td></tr>
+          <tr><td>Bayut, Property Finder</td><td>Not scraped: their terms forbid it and the photos are licensed</td><td><span class="pill opt">Excluded</span></td></tr>
+        </tbody>
+      </table></div>
+      <p>Facts shown or spoken in the video always come from data, never from the video model.</p>
+    </section>
+
+    <section>
+      <h2 id="luma">How Luma is used</h2>
+      <ul>
+        <li><b>Image to video only.</b> Each shot starts from a real photo, with a prompt to keep the building, layout and materials unchanged and add no people or text. Luma never invents a scene from text, so the video can't show a pool or view the property doesn't have.</li>
+        <li><b>Parallel.</b> Up to 4 shots are requested at once, so the wait is about one Luma generation, not one per photo.</li>
+        <li><b>Cached per photo.</b> A finished shot is kept on disk, keyed by the photo. The next agent who generates the same property pays nothing for Luma and waits only for voice and assembly.</li>
+        <li><b>Capped.</b> At most 8 Luma shots per video (setting <code>VIDEO_LUMA_MAX_SHOTS</code>).</li>
+        <li><b>Switch.</b> On when <code>LUMA_AGENTS_API_KEY</code> is set; <code>VIDEO_LUMA_ENABLED=false</code> turns it off.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2 id="video">The video</h2>
+      <div class="scroll"><table>
+        <thead><tr><th>Part</th><th>Length</th><th>Content</th></tr></thead>
+        <tbody>
+          <tr><td>Intro</td><td>about 5 s</td><td>First photo, property and community name</td></tr>
+          <tr><td>Property</td><td>about 24 s</td><td>3 to 4 Luma shots; developer, bedrooms, recent sale, recent rent, handover</td></tr>
+          <tr><td>Close</td><td>about 4 s</td><td>"Ask your ACOT agent about a viewing"</td></tr>
+        </tbody>
+      </table></div>
+      <p>1080×1920 vertical, ACOT logo, animated presenter, captions timed from the real audio. The earlier two-property comparison still works when two properties are picked.</p>
+    </section>
+
+    <section>
+      <h2 id="today">What exists</h2>
+      <div class="scroll"><table>
+        <thead><tr><th>Part</th><th>File</th><th>State</th></tr></thead>
+        <tbody>
+          <tr><td>Searches, facts, script, voice</td><td><code>history.py</code>, <code>pack.py</code>, <code>script.py</code>, <code>tts.py</code>, <code>narration.py</code></td><td><span class="pill ok">Built</span>; single-property support added</td></tr>
+          <tr><td>Photo motion and assembly</td><td><code>motion.py</code>, <code>render.py</code></td><td><span class="pill ok">Built</span>; now takes Luma shots</td></tr>
+          <tr><td>Luma shots</td><td><code>luma.py</code></td><td><span class="pill ok">Built</span>; parallel and cached</td></tr>
+          <tr><td>Nest proxy</td><td><code>agent-lead-video.*</code></td><td><span class="pill ok">Built</span>; adds send and the signed buyer link</td></tr>
+          <tr><td>Agent UI and chat player</td><td><code>ChatPlusMenu.tsx</code>, <code>ChatMessageBody.tsx</code></td><td><span class="pill ok">Added</span></td></tr>
+          <tr><td>Jobs</td><td><code>jobs.py</code></td><td><span class="pill todo">In memory</span>; finished files survive a restart</td></tr>
+          <tr><td>Storage</td><td><code>storage.py</code></td><td><span class="pill todo">Local disk on the VM</span></td></tr>
+        </tbody>
+      </table></div>
+    </section>
+
+    <section>
+      <h2 id="api">API</h2>
+      <p>Agent routes sit under the existing <code>AgentOtpGuard</code> at <code>/agent/leads/:leadId/video</code>.</p>
+      <div class="scroll"><table>
+        <thead><tr><th>Method</th><th>Path</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr><td>GET</td><td><code>/prompt</code></td><td>The buyer's searched properties to pick from</td></tr>
+          <tr><td>POST</td><td><code>/jobs</code></td><td>Create a job from <code>project_key</code> (one click) or <code>prompt_text</code></td></tr>
+          <tr><td>GET</td><td><code>/jobs/:jobId</code></td><td>Status</td></tr>
+          <tr><td>GET</td><td><code>/jobs/:jobId/file</code></td><td>Agent preview and download</td></tr>
+          <tr><td>POST</td><td><code>/jobs/:jobId/send</code></td><td>Post the video into the lead chat</td></tr>
+          <tr><td>GET</td><td><code>/videos/:jobId?t=…</code></td><td>Public, signed playback link for the buyer</td></tr>
+        </tbody>
+      </table></div>
+    </section>
+
+    <section>
+      <h2 id="build">Build order</h2>
+      <ol>
+        <li><b>Now:</b> one-click single-property video from ACOT data, Luma shots with fallback, chat player, send to buyer.</li>
+        <li><b>Next:</b> collector for developer sites and web search, with sources kept.</li>
+        <li><b>Then:</b> jobs in the database, videos in a cloud bucket, a ready-made video reused per property.</li>
+        <li><b>Later:</b> chapter shortcuts and action buttons under the player.</li>
+      </ol>
+    </section>
+
+    <section>
+      <h2 id="open">Open decisions</h2>
+      <div class="scroll"><table>
+        <thead><tr><th>Question</th><th>Suggested answer</th></tr></thead>
+        <tbody>
+          <tr><td>Luma cost per video</td><td>Check against the Luma plan; about 4 to 8 shots per video, cached per photo</td></tr>
+          <tr><td>Which sites may be collected from</td><td>ACOT data and developers' official pages only</td></tr>
+          <tr><td>Property Finder photos already in the catalog</td><td>Prefer ACOT bucket photos until licensing is settled</td></tr>
+          <tr><td>Buyer link lifetime</td><td>Signed link with no expiry for now; add expiry when videos move to a bucket</td></tr>
+          <tr><td>Property leads (direct chats)</td><td>Engine leads first; direct chats next</td></tr>
+        </tbody>
+      </table></div>
+    </section>
+  </main>
+</div>

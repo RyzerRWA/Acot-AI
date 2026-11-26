@@ -88,7 +88,7 @@ def _pipeline(job_id: str) -> dict[str, Any]:
     from app.Viedo_generation.pack import build_pack
     from app.Viedo_generation.render import render
     from app.Viedo_generation.script import build_script
-    from app.Viedo_generation.tts import resolve_voice
+    from app.Viedo_generation.tts import friendly_voice
     from app.Viedo_generation.narration import narrate_script
 
     job = get_job(job_id) or {}
@@ -102,20 +102,23 @@ def _pipeline(job_id: str) -> dict[str, Any]:
     bedrooms = req.get("bedrooms")
     limit = int(req.get("limit") or 2)
     candidates = resolve_catalog_selection(req.get("prompt_text"), req.get("project_keys"), req.get("communities"))
-    pack_kwargs: dict[str, Any] = {"limit": limit}
+    # One picked property (the one-click flow) makes a single-property video.
+    single = len(req.get("project_keys") or []) == 1 and not req.get("prompt_text")
+    pack_kwargs: dict[str, Any] = {"limit": limit, "min_projects": 1 if single else 2, "web": single}
     if bedrooms is not None:
         pack_kwargs["bedrooms"] = int(bedrooms)
     pack = build_pack(candidates, **pack_kwargs)
     if not pack.get("ok"):
         raise PromptError(pack.get("reason") or "No complete project data.")
 
-    script = build_script(pack)
+    language = "hi" if req.get("language") == "hi" else "en"
+    script = build_script(pack, language=language)
     if not script.get("ok"):
         raise RuntimeError(script.get("reason") or "Script failed.")
 
     audio_path = None
     if with_voice:
-        voice = resolve_voice(voice)
+        voice = friendly_voice(voice, language)
         audio_path = storage.mp3_path(job_id).with_suffix(".wav")
         script = narrate_script(script, audio_path, voice=voice)
 
