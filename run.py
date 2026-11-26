@@ -768,6 +768,15 @@ _DEVELOPER_VALUE_RANK = re.compile(
     r"\bdevelopers?\b[\s\S]{0,60}\b(?:highest|most|largest|biggest|top)\b[\s\S]{0,40}\b(?:sales?|value|volume|revenue|sold)\b",
     re.I,
 )
+# "Best investment properties under AED 2M with high rental yield": projects ranked by gross yield.
+_YIELD_RANK_ASK = re.compile(r"\b(?:yield(?:s|ing)?|roi|rental\s+returns?|return\s+on\s+investment)\b", re.I)
+_YIELD_RANK_NOUN = re.compile(r"\b(?:propert(?:y|ies)|projects?|apartments?|flats?|buildings?|towers?|units?)\b", re.I)
+_YIELD_RANK_WORDS = re.compile(r"\b(?:best|top|highest|high|good|great|strong|better|most)\b", re.I)
+# "Show me in a bar chart": draw the numbers of the projects the last answer showed.
+_CHART_ASK = re.compile(
+    r"\b(?:bar\s*-?\s*(?:chart|chat|graph)|chart|graph|plot|diagram|visuali[sz]e|visuali[sz]ation|visual\s+representation)\b",
+    re.I,
+)
 _READY_ONLY_ASK = re.compile(
     r"\b(?:ready(?:\s+only)?|only\s+ready|completed\s+only|only\s+completed)\b",
     re.I,
@@ -3786,12 +3795,9 @@ def _area_profile_turn(question, place, signals):
     answer = f"**{place}** at a glance:\n\n" + "\n".join(bullets)
     if figures:
         answer += "\n\n**Key figures** (Dubai Land Department records):\n" + "\n".join(figures)
-    return _fast_answer(question, answer + _sources_line(profile))
-
-
-def _sources_line(found) -> str:
-    sources = found.get("sources") or []
-    return ("\n\nSources: " + ", ".join(f"[{title}]({url})" for title, url in sources)) if sources else ""
+    # ponytail: sources are kept in the web cache but not shown (the chat UI printed raw markdown links);
+    # add them back as source chips if the frontend ever renders them.
+    return _fast_answer(question, answer)
 
 
 def _web_answer_turn(question, resolution):
@@ -3799,7 +3805,7 @@ def _web_answer_turn(question, resolution):
     from app.retrieval.web_context import web_answer
 
     found = web_answer(question, resolution.get("place"))
-    return _fast_answer(question, found["text"] + _sources_line(found)) if found else None
+    return _fast_answer(question, found["text"]) if found else None
 
 
 def _area_pair_turn(question, first, second):
@@ -4119,6 +4125,126 @@ def _developer_rank_turn(question):
         "context": None,
         "small_talk": None,
     }
+
+
+def _chart_turn(question, conversation_memory):
+    """A bar chart of the projects on screen: recent sale price by default, or sales count or yield when asked.
+    The chart data goes out as data.chart and the app draws it; the answer text is one or two lines."""
+    text = question or ""
+    if not _CHART_ASK.search(text):
+        return None
+    kind, rows = _shown_compare_rows(text, conversation_memory)
+    if kind != "project" or len(rows) < 2:
+        # Just listed recent sales for a place: chart those sales (price of each) instead.
+        prior = _prior_sale_query(conversation_memory) or {}
+        if prior.get("place"):
+            from app.retrieval.propai_catalog import latest_sales
+            try:
+                sales = (latest_sales(place=prior["place"], limit=10, offset=0, bedrooms=prior.get("bedrooms")) or {}).get("sales") or []
+            except Exception as exc:
+                print(f"sales chart unavailable: {exc}")
+                sales = []
+            bars = [{"label": f"{str(sale.get('project') or 'Sale').title()} ({str(sale.get('sold_on') or sale.get('date') or '')[:10]})",
+                     "value": float(sale["price"]), "note": None}
+                    for sale in sales if sale.get("price")]
+            if len(bars) >= 2:
+                bars.sort(key=lambda b: -b["value"])
+                place = str(prior["place"])
+                result = _fast_answer(
+                    question,
+                    f"Here are the {len(bars)} most recent sales in {place} as a bar chart, highest price first. "
+                    f"**{bars[0]['label']}** is highest at AED {int(bars[0]['value']):,}.\n\n"
+                    "Want to see more transactions, or only one bedroom count?",
+                    question_type="general",
+                )
+                result["structured_summary"]["chart"] = {"title": f"Recent sales in {place}", "unit": "aed", "bars": bars,
+                                                         "caption": "Each bar is one recorded sale, with its date."}
+                return result
+        return _fast_answer(question, "Ask me something first, for example recent sales in Dubai Marina, "
+                                      "and then I can draw it as a bar chart.")
+
+    def number(row, *keys):
+        for key in keys:
+            value = row.get(key)
+            if isinstance(value, (int, float)) and value > 0:
+                return float(value)
+        return None
+
+    if re.search(r"\b(?:yields?|returns?|roi)\b", text, re.I):
+        metric, title, unit, keys = "yield", "Gross rental yield", "percent", ("gross_yield_pct",)
+    elif re.search(r"\b(?:sales?|sold|volume|activity|busiest|most)\b", text, re.I):
+        metric, title, unit, keys = "sales", "Sales recorded in the last 12 months", "count", ("sales_count", "sales")
+    else:
+        metric, title, unit, keys = "price", "Recent sale price", "aed", ("price",)
+    bars = [{"label": str(row.get("name")), "value": number(row, *keys),
+             "note": (f"Recorded {str(row.get('last_sold_on') or row.get('last_sale'))[:10]}"
+                      if metric == "price" and (row.get("last_sold_on") or row.get("last_sale")) else None)}
+            for row in rows]
+    charted = sorted((b for b in bars if b["value"] is not None), key=lambda b: -b["value"])[:12]
+    left_out = len(bars) - len(charted)
+    if len(charted) < 2:
+        return _fast_answer(question, f"Most of these projects have no {title.lower()} on record, so there is not enough to chart. "
+                                      "Try recent sale prices instead.")
+    unit_text = {"aed": lambda v: f"AED {int(v):,}", "count": lambda v: f"{int(v):,} sales", "percent": lambda v: f"{v:.1f}%"}[unit]
+    answer = (f"Here are the {len(charted)} projects as a bar chart, highest first. **{charted[0]['label']}** is highest at "
+              f"{unit_text(charted[0]['value'])} and **{charted[-1]['label']}** lowest at {unit_text(charted[-1]['value'])}."
+              + (f" {left_out} more have no figure on record, so they are not drawn." if left_out else "")
+              + ("\n\nWant it by recent sale price instead, or compare two of these side by side?" if metric == "sales"
+                 else "\n\nWant it by sales count instead, or compare two of these side by side?"))
+    result = _fast_answer(question, answer, question_type="general")
+    result["structured_summary"]["chart"] = {"title": title, "unit": unit, "bars": charted,
+                                             "caption": "Median of each project's recorded sales in the last 12 months." if metric == "price" else None}
+    return result
+
+
+def _yield_projects_turn(question, conversation_memory=None):
+    """Projects ranked by gross rental yield, from recorded sales and rent contracts. Only for a ranking ask
+    ("best ... high rental yield"); the yield of one named place goes the existing area route."""
+    text = question or ""
+    if not (_YIELD_RANK_ASK.search(text) and _YIELD_RANK_NOUN.search(text) and _YIELD_RANK_WORDS.search(text)):
+        return None
+    if re.search(r"\b(?:compare|versus|vs)\b", text, re.I):
+        return None
+    from app.retrieval.propai_catalog import resolve_dubai_place, top_yield_projects
+
+    place = extract_place(text)
+    if place and str(place).strip().lower() == "dubai":
+        place = None
+    try:
+        resolved = (resolve_dubai_place(place) or place) if place else None
+    except Exception:
+        resolved = place
+    beds = parse_bedrooms(text)
+    budget = parse_budget_aed(text)
+    low = high = None
+    if budget is not None:
+        if _PRICE_FLOOR_ASK.search(text) and not _PRICE_CEILING_ASK.search(text):
+            low = budget
+        else:
+            high = budget
+    try:
+        rows, total = top_yield_projects(max_price=high, min_price=low, place=resolved,
+                                         bedrooms=beds[0] if beds else None, limit=6)
+    except Exception as exc:
+        print(f"yield ranking unavailable: {exc}")
+        return None
+    bits = (f" {_bed_label(beds[0])}" if beds else "") + _where(resolved)
+    if high is not None:
+        bits += f" under AED {int(high):,}"
+    if low is not None:
+        bits += f" above AED {int(low):,}"
+    if not rows:
+        answer = (f"I found no projects{bits} with enough recorded sales and rent contracts to measure a rental yield. "
+                  "Try a wider budget or another community.")
+    else:
+        answer = (
+            f"I found **{total:,}** projects{bits} with enough recorded sales and rents to measure a gross yield. "
+            f"Here are the top {len(rows)}, highest yield first.\n\n"
+            "Gross yield is the median yearly rent of recent contracts divided by the median recent sale price. It is a guide "
+            "for comparing projects, before service charges, vacancy and fees, and it mixes unit types. "
+            "Want me to compare these, or narrow it to a community or bedroom count?"
+        )
+    return _fast_answer(question, answer, projects=rows, question_type="search")
 
 
 def _sql_project_browse_turn(question, conversation_memory=None):
@@ -5456,6 +5582,14 @@ async def _prepare_acot_turn(question, components):
     if carry and not prepared.get("broker_companion"):
         prepared["broker_companion"] = carry
         prepared["companion_suffix"] = f"**For you:** {carry['answer']}" if carry.get("answer") else ""
+    # A vacancy or viewing ask gets an honest line, whichever path answered it (ACOT QA R02).
+    from app.answers.advice_turn import availability_note, document_note
+
+    notes = [] if prepared.get("advice_kind") else [
+        availability_note(question), document_note(question, prepared.get("documents")),
+    ]
+    if any(notes):
+        prepared["companion_suffix"] = "\n\n".join(p for p in (prepared.get("companion_suffix"), *notes) if p)
     return _ensure_prepared_turn(prepared)
 
 
@@ -5566,6 +5700,24 @@ async def _prepare_acot_turn_inner(
         if broker_part.get("alsoMarket") and not broker_part.get("market"):
             components["_carry_companion"] = broker_part
 
+    # Calculations on the buyer's own numbers, laws, privacy/trust worries, "check your math" and "what have I
+    # told you" are questions to answer, not searches: before every search path (ACOT QA R03/R04/R08-R10/R25).
+    from app.answers.advice_turn import advice_answer, advice_kind
+
+    kind = advice_kind(question)
+    if kind:
+        answer_text = await advice_answer(
+            question, conversation_memory, _llm_generate_from(conversation_memory, components)
+        )
+        if answer_text:
+            timing_ms["rewrite"] = 0
+            advice = _fast_answer(question, answer_text)
+            advice.update({
+                "timing_ms": timing_ms, "ask_started": ask_started, "rag_chain": rag_chain,
+                "conversation_memory": conversation_memory, "advice_kind": kind,
+            })
+            return advice
+
     # After clarify: rewrite to a clean browse so SQL can answer (low tokens).
     prior = prior_anchor_question(conversation_memory, question)
     if not prior:
@@ -5613,6 +5765,26 @@ async def _prepare_acot_turn_inner(
                 developer_early["rag_chain"] = rag_chain
                 developer_early["conversation_memory"] = conversation_memory
                 return developer_early
+
+    # "Show me that in a bar chart": draw what is on screen, before the interpreter step repeats the old answer.
+    if _CHART_ASK.search(question or ""):
+        chart_early = await asyncio.to_thread(_chart_turn, question, conversation_memory)
+        if chart_early is not None:
+            chart_early["timing_ms"] = timing_ms
+            chart_early["ask_started"] = ask_started
+            chart_early["rag_chain"] = rag_chain
+            chart_early["conversation_memory"] = conversation_memory
+            return chart_early
+
+    # Projects ranked by rental yield: before the interpreter step, which sent it to "ACOT does not have rental yield".
+    if _YIELD_RANK_ASK.search(question or ""):
+        yield_early = await asyncio.to_thread(_yield_projects_turn, question, conversation_memory)
+        if yield_early is not None:
+            yield_early["timing_ms"] = timing_ms
+            yield_early["ask_started"] = ask_started
+            yield_early["rag_chain"] = rag_chain
+            yield_early["conversation_memory"] = conversation_memory
+            return yield_early
 
     # On-screen compare / best-of-shown before sticky followup/understood —
     # otherwise LLM resolve re-runs the prior afford with Business Bay + budget.
@@ -6262,6 +6434,11 @@ def _finalize_acot_turn(prepared, answer, answer_started):
         investment_analysis=prepared.get("investment_analysis"),
     )
     response.setdefault("meta", {})["timing_ms"] = timing_ms
+    try:
+        from app.listings.tools import latest_sale_date
+        response["meta"]["data_through"] = latest_sale_date()
+    except Exception:
+        pass
     if prepared.get("agent"):
         response["meta"]["agent"] = prepared["agent"]
     # Suggested next questions — same chips stream clients get via `followups`.
@@ -6509,6 +6686,10 @@ def _followup_questions(prepared):
 
             return _unused_followups(prepared, BROKER_STARTER_CHIPS)
         return _unused_followups(prepared, _STARTER_CHIPS)
+
+    # An answered calculation, law or privacy question: no agent or listing chips the buyer did not ask for.
+    if prepared.get("advice_kind"):
+        return []
 
     summary = prepared.get("structured_summary") or {}
     if summary.get("place_choice"):

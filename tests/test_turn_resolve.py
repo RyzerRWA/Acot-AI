@@ -278,7 +278,7 @@ def test_area_profile_mixes_web_text_with_our_figures(monkeypatch):
         "text": "- **Transport:** No metro station.", "sources": [["Area Guide", "https://example.com/jvc"]]})
     text = run._area_market_turn("tell me about jvc", {"place": "JVC", "kind": "profile"})["fast_answer"]
     assert "No metro station" in text and "AED 1,492 per sq ft" in text and "6.7%" in text
-    assert "[Area Guide](https://example.com/jvc)" in text
+    assert "example.com" not in text  # sources are not printed (the UI showed raw markdown links)
 
     monkeypatch.setattr(web, "area_profile", lambda place, key=None: None)
     text = run._area_market_turn("tell me about jvc", {"place": "JVC", "kind": "profile"})["fast_answer"]
@@ -298,6 +298,8 @@ def test_web_profile_parse_moves_citations_to_sources():
     assert out["text"] == "- **Transport:** No metro."
     assert out["sources"] == [["JVC Guide", "https://www.propertyfinder.ae/en/area/jvc"]]
     assert _parse(NS(output_text="UNKNOWN", output=[])) is None
+    plain = _parse(NS(output_text="Try [Pitfire Pizza](https://x.com/p) at Circle Mall.", output=[]))
+    assert plain["text"] == "Try Pitfire Pizza at Circle Mall."
 
 
 def test_area_profile_puts_the_asked_facet_first(monkeypatch):
@@ -328,7 +330,7 @@ def test_guidance_is_answered_from_the_web(monkeypatch):
 
     monkeypatch.setattr(web, "web_answer", fake)
     out = run._web_answer_turn("best restaurant near JVC?", {"action": "guidance", "place": "JVC"})["fast_answer"]
-    assert "Circle Mall" in out and "[Guide](https://example.com)" in out and seen["place"] == "JVC"
+    assert "Circle Mall" in out and "example.com" not in out and seen["place"] == "JVC"
     monkeypatch.setattr(web, "web_answer", lambda question, place=None: None)
     assert run._web_answer_turn("golden visa rules", {"action": "guidance"}) is None  # agent fallback
 

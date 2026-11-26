@@ -76,6 +76,7 @@ def _parse(response) -> dict | None:
                     sources.setdefault(_clean_url(note.url), _source_title(note.title, note.url))
     # Inline "([site](url))" links clutter each bullet; the sources are listed once under the answer.
     text = _INLINE_CITE.sub("", text).strip()
+    text = re.sub(r"\[([^\]]+)\]\(https?://[^)\s]+\)", r"\1", text)  # any other link: keep its words only
     return {"text": text, "sources": [[title, url] for url, title in sources.items()][:4]}
 
 

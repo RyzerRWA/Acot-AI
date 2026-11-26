@@ -670,7 +670,7 @@ def _project_for_model(row: dict) -> dict:
         "has_brochure": bool(row.get("brochure_url")),
         "price_kind": row.get("price_kind") or "starting",
         # The key above says "starting" for both kinds; this is the wording to put before the price.
-        "price_label": "recent sale price" if row.get("price_kind") == "recent_sale" else "from",
+        "price_label": "median recent sale price" if row.get("price_kind") == "recent_sale" else "from",
     }
 
 
@@ -1398,6 +1398,20 @@ def data_context() -> str:
 
 
 _CONTEXT: dict = {"at": 0.0}
+_LATEST: dict = {"at": 0.0, "value": None}
+
+
+def latest_sale_date() -> str | None:
+    """The date of the newest recorded sale (cached 10 minutes), shown under answers as how current the data is."""
+    import time
+    if _LATEST["value"] and time.time() - _LATEST["at"] < 600:
+        return _LATEST["value"]
+    try:
+        value = fetch("select max(instance_date)::text as d from propai_sales where instance_date <= current_date")[0]["d"]
+    except Exception:
+        return _LATEST["value"]
+    _LATEST.update(at=time.time(), value=value)
+    return value
 
 
 # ---------------------------------------------------------------- user profile
