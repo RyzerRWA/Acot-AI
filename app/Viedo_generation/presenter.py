@@ -31,14 +31,16 @@ def presenter_enabled() -> bool:
 
 
 def resolve_gender(voice: str | None) -> str:
-    """Map male/female or the configured Neural2 voice to a presenter asset set."""
+    """Map male/female or the configured voice to a presenter asset set."""
+    from app.Viedo_generation.tts import list_voices
+
     raw = (
         voice
         or os.getenv("GOOGLE_TTS_GENDER")
         or os.getenv("VIDEO_PRESENTER_GENDER")
         or "male"
     ).strip().lower()
-    if raw == "female" or raw.endswith("-f"):
+    if raw in {"female", list_voices()["female"].lower()} or raw.endswith("-f"):
         return "female"
     if raw == "male" or raw.endswith("-d"):
         return "male"

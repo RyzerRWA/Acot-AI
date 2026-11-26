@@ -13,8 +13,7 @@ from typing import Any
 from app.database.postgres import fetch
 
 MIN_PHOTOS = 4
-DEFAULT_LIMIT = 4  # projects in a 60s video
-MAX_LIMIT = 5
+DEFAULT_LIMIT = 2
 MAX_PHOTOS_PER_PROJECT = 6
 # Sale / rent older than this are treated as stale and rejected.
 RECENT_MONTHS = 12
@@ -44,7 +43,7 @@ def build_pack(
       bedrooms: 1–4, or None for any
       communities: keep only these community names (case-insensitive); None = all
       project_keys: if set, keep only these catalog keys / names
-      limit: how many projects to keep (3–5)
+      limit: legacy input, capped at two projects
 
     Shape:
       {
@@ -69,7 +68,6 @@ def build_pack(
         ],
       }
     """
-    limit = max(2, min(MAX_LIMIT, int(limit or DEFAULT_LIMIT)))
     candidates = _candidates(history_or_projects)
     candidates = _apply_filters(candidates, bedrooms, communities, project_keys)
     shortlist = _shortlist(candidates, ENRICH_CAP)
@@ -96,7 +94,7 @@ def build_pack(
         ),
         reverse=True,
     )
-    chosen = enriched[:limit]
+    chosen = enriched[:DEFAULT_LIMIT]
 
     if len(chosen) < 2:
         return {
@@ -256,9 +254,11 @@ def _from_catalog(key: str, bedrooms: int | None) -> dict[str, Any] | None:
           p.key,
           p.name,
           p.area as community,
+          p.master_project as "masterCommunity",
           p.developer,
           p.status_group as status,
           p.location_key as "locationKey",
+          p.project_number as "projectNumber",
           p.completion_date::text as "completionDate",
           p.offplan_completion_year as "completionYear",
           p.estimated_completion as "estimatedCompletion",
@@ -282,7 +282,7 @@ def _from_catalog(key: str, bedrooms: int | None) -> dict[str, Any] | None:
         return None
 
     name = (project.get("name") or "").strip()
-    community = (project.get("community") or "").strip()
+    community = (project.get("masterCommunity") or project.get("community") or "").strip()
     developer = (project.get("developer") or "").strip()
     handover = _handover_label(project)
     if not name or not community or not developer or not handover:
@@ -313,8 +313,8 @@ def _from_catalog(key: str, bedrooms: int | None) -> dict[str, Any] | None:
         sales_12m = _count_sales_12m(location_key)
         rent_12m = _count_rents_12m(location_key)
 
-    recent_sale = _latest_sale(location_key, bedrooms)
-    rent = _latest_rent(location_key, bedrooms)
+    recent_sale = _latest_sale(location_key, bedrooms, project.get("projectNumber"))
+    rent = _latest_rent(location_key, bedrooms, project.get("projectNumber"))
     if recent_sale is None or rent is None:
         return None
 
@@ -327,6 +327,7 @@ def _from_catalog(key: str, bedrooms: int | None) -> dict[str, Any] | None:
         "recent_sale": recent_sale,
         "rent": rent,
         "handover": handover,
+        "completion_date": project.get("completionDate"),
         "status": project.get("status"),
         "sales_12m": sales_12m,
         "rent_contracts_12m": rent_12m,
@@ -413,54 +414,32 @@ def _count_rents_12m(location_key: str) -> int:
     return int(rows[0]["n"]) if rows else 0
 
 
-def _latest_sale(location_key: str, bedrooms: int | None) -> dict[str, Any] | None:
+def _latest_sale(
+    location_key: str, bedrooms: int | None, project_number: str | None = None,
+) -> dict[str, Any] | None:
     """Latest sale inside the recent window only. Older sales are ignored."""
     recent = f"interval '{RECENT_MONTHS} months'"
-    if bedrooms is None:
-        rows = fetch(
+    rows = fetch(
             f"""
             select instance_date::text as date,
                    sale_price::float8 as price,
                    bedrooms::float8 as bedrooms,
                    price_per_sqft::float8 as "pricePerSqft"
             from public.propai_sales
-            where location_key_project = %s
+            where (location_key_project = %s or (location_key_project is null and project_number = %s))
               and deleted_at is null
               and sale_price > 0
-              and coalesce(outlier_flag, '') <> 'True'
+              and lower(coalesce(outlier_flag, '')) not in ('true', '1')
+              and (%s::float8 is null or bedrooms = %s)
               and instance_date >= current_date - {recent}
               and instance_date <= current_date
-            order by instance_date desc nulls last
+            order by instance_date desc, updated_at desc nulls last, source, transaction_id
             limit 1
             """,
-            (location_key,),
-        )
-    else:
-        rows = fetch(
-            f"""
-            select instance_date::text as date,
-                   sale_price::float8 as price,
-                   bedrooms::float8 as bedrooms,
-                   price_per_sqft::float8 as "pricePerSqft"
-            from public.propai_sales
-            where location_key_project = %s
-              and deleted_at is null
-              and sale_price > 0
-              and coalesce(outlier_flag, '') <> 'True'
-              and bedrooms = %s
-              and instance_date >= current_date - {recent}
-              and instance_date <= current_date
-            order by instance_date desc nulls last
-            limit 1
-            """,
-            (location_key, float(bedrooms)),
-        )
-        if not rows:
-            # No exact bedroom match: fall back to any recent sale in the window.
-            return _latest_sale(location_key, None)
-
+            (location_key, project_number, bedrooms, bedrooms),
+    )
     if not rows:
-        return None
+        return _latest_sale(location_key, None, project_number) if bedrooms is not None else None
     r = rows[0]
     return {
         "price": r.get("price"),
@@ -470,55 +449,45 @@ def _latest_sale(location_key: str, bedrooms: int | None) -> dict[str, Any] | No
     }
 
 
-def _latest_rent(location_key: str, bedrooms: int | None) -> dict[str, Any] | None:
-    """Latest rent contract inside the recent window only. Older rents are ignored."""
+def _latest_rent(
+    location_key: str, bedrooms: int | None, project_number: str | None = None,
+) -> dict[str, Any] | None:
+    """Latest registered rent for a contract already in effect."""
     recent = f"interval '{RECENT_MONTHS} months'"
-    if bedrooms is None:
-        rows = fetch(
+    rows = fetch(
             f"""
-            select contract_start_date::text as date,
+            select coalesce(contract_registration_date, contract_start_date)::text as date,
+                   contract_start_date::text as start_date,
+                   contract_registration_date::text as registration_date,
+                   contract_months::float8,
                    annual_amount::float8 as annual,
                    bedrooms::float8 as bedrooms,
                    rent_per_sqft::float8 as "rentPerSqft"
             from public.propai_rents
-            where location_key_project = %s
+            where (location_key_project = %s or (location_key_project is null and project_number = %s))
               and deleted_at is null
               and annual_amount > 0
-              and contract_start_date >= current_date - {recent}
-              and contract_start_date <= current_date + 60
-            order by contract_start_date desc nulls last
+              and lower(coalesce(outlier_flag, '')) not in ('true', '1')
+              and lower(coalesce(status, '')) not in ('cancelled', 'canceled', 'rejected', 'void', 'deleted')
+              and (%s::float8 is null or bedrooms = %s)
+              and coalesce(contract_registration_date, contract_start_date) >= current_date - {recent}
+              and coalesce(contract_registration_date, contract_start_date) <= current_date
+              and contract_start_date <= current_date
+            order by coalesce(contract_registration_date, contract_start_date) desc,
+                     contract_start_date desc, updated_at desc nulls last, pai_contract_id, unit_seq
             limit 1
             """,
-            (location_key,),
-        )
-    else:
-        rows = fetch(
-            f"""
-            select contract_start_date::text as date,
-                   annual_amount::float8 as annual,
-                   bedrooms::float8 as bedrooms,
-                   rent_per_sqft::float8 as "rentPerSqft"
-            from public.propai_rents
-            where location_key_project = %s
-              and deleted_at is null
-              and annual_amount > 0
-              and bedrooms = %s
-              and contract_start_date >= current_date - {recent}
-              and contract_start_date <= current_date + 60
-            order by contract_start_date desc nulls last
-            limit 1
-            """,
-            (location_key, float(bedrooms)),
-        )
-        if not rows:
-            return _latest_rent(location_key, None)
-
+            (location_key, project_number, bedrooms, bedrooms),
+    )
     if not rows:
-        return None
+        return _latest_rent(location_key, None, project_number) if bedrooms is not None else None
     r = rows[0]
     return {
         "annual": r.get("annual"),
         "date": r.get("date"),
+        "start_date": r.get("start_date"),
+        "registration_date": r.get("registration_date"),
+        "contract_months": r.get("contract_months"),
         "bedrooms": r.get("bedrooms"),
         "rent_per_sqft": r.get("rentPerSqft"),
     }

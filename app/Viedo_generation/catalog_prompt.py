@@ -9,6 +9,17 @@ class PromptError(ValueError):
     pass
 
 
+def resolve_catalog_selection(
+    prompt: str | None,
+    project_keys: list[str] | None = None,
+    communities: list[str] | None = None,
+) -> list[dict]:
+    """Use submitted names or keys as the selection and resolve all data in the catalog."""
+    if prompt is None:
+        prompt = ", ".join([*(project_keys or []), *(communities or [])])
+    return catalog_candidates(prompt)
+
+
 def catalog_candidates(prompt: str) -> list[dict]:
     terms = {}
     for part in re.split(r"[,;\n]+", prompt):

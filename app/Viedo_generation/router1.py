@@ -26,7 +26,7 @@ class CreateJobBody(BaseModel):
     voice: Literal["male", "female"] | str | None = "male"
     with_voice: bool = True
     bedrooms: int | None = None
-    limit: int = 4
+    limit: int = 2
     project_keys: list[str] | None = None
     communities: list[str] | None = None
     prompt_text: str | None = Field(default=None, max_length=1000)

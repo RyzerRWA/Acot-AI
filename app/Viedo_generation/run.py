@@ -1,12 +1,9 @@
 """
-One-shot local runner: history → pack → script → (optional TTS) → MP4.
+One-shot local runner: catalog → pack → script → (optional TTS) → MP4.
 
 Usage (from Acot-AI- folder):
-  python -m app.Viedo_generation.run USER_ID
-  python -m app.Viedo_generation.run USER_ID --bedrooms 2 --job-id my_video
-  python -m app.Viedo_generation.run USER_ID --with-voice
-  python -m app.Viedo_generation.run USER_ID --with-voice --voice female
-  python -m app.Viedo_generation.run USER_ID --with-voice --voice male
+  python -m app.Viedo_generation.run USER_ID --projects "Ciel, Mudon Al Ranim 3"
+  python -m app.Viedo_generation.run USER_ID --projects "Dubai Marina" --with-voice --voice female
 
 Output default: C:\\acot_video_output\\{job_id}.mp4
 Without --with-voice the video is silent. Requested narration must succeed.
@@ -24,8 +21,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Generate an ACOT property explainer MP4.")
     parser.add_argument(
         "user_id",
-        help="Buyer / lead user UUID (searched projects come from their chat history).",
+        help="Buyer or lead identifier for the generation request.",
     )
+    parser.add_argument("--projects", required=True, help="Comma-separated catalog project or community names.")
     parser.add_argument(
         "--bedrooms",
         type=int,
@@ -35,8 +33,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--limit",
         type=int,
-        default=4,
-        help="Max projects to enrich into the pack (default 4; script uses up to 4).",
+        default=2,
+        help="Legacy option. Videos compare two projects.",
     )
     parser.add_argument(
         "--job-id",
@@ -65,21 +63,25 @@ def main(argv: list[str] | None = None) -> int:
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
 
-    from app.Viedo_generation.history import searched_projects
+    from app.Viedo_generation.catalog_prompt import PromptError, resolve_catalog_selection
     from app.Viedo_generation.pack import build_pack
     from app.Viedo_generation.render import render
     from app.Viedo_generation.script import build_script
 
     t0 = time.time()
     print(f"user={args.user_id}")
-    print("1/4 history...")
-    history = searched_projects(args.user_id)
+    print("1/4 catalog selection...")
+    try:
+        candidates = resolve_catalog_selection(args.projects)
+    except PromptError as exc:
+        print(str(exc))
+        return 1
 
     print("2/4 pack...")
     pack_kwargs: dict = {"limit": args.limit}
     if args.bedrooms is not None:
         pack_kwargs["bedrooms"] = args.bedrooms
-    pack = build_pack(history, **pack_kwargs)
+    pack = build_pack(candidates, **pack_kwargs)
     if not pack.get("ok"):
         print(f"pack failed: {pack.get('reason')}")
         return 1

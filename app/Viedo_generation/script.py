@@ -9,11 +9,10 @@ from __future__ import annotations
 
 from typing import Any
 
-# Rough speaking pace for Google Neural2 TTS (words per second).
-WORDS_PER_SECOND = 2.4
-TARGET_SECONDS = 75
-# Up to 4 projects with bedroom + sale + rent detail.
-MAX_SCRIPT_PROJECTS = 4
+from app.Viedo_generation.narration import FPS
+
+SLIDE_SECONDS = (5, 18, 18, 4)
+MAX_SCRIPT_PROJECTS = 2
 
 
 def build_script(pack: dict[str, Any]) -> dict[str, Any]:
@@ -69,7 +68,7 @@ def build_script(pack: dict[str, Any]) -> dict[str, Any]:
     communities = _unique_communities(projects)
     slides: list[dict[str, Any]] = []
 
-    intro_narration = _intro_narration(communities, bed_labels, len(projects))
+    intro_narration = "Come, let's take a quick look at these two properties."
     intro_lines = [
         _join_names(communities),
         _bedroom_focus_line(bed_labels) or "Selected from recent search activity",
@@ -103,7 +102,7 @@ def build_script(pack: dict[str, Any]) -> dict[str, Any]:
             }
         )
 
-    outro_narration = _outro_narration(projects, communities, bed_labels)
+    outro_narration = "Like either property? Ask your ACOT agent about a viewing."
     slides.append(
         {
             "kind": "outro",
@@ -120,40 +119,21 @@ def build_script(pack: dict[str, Any]) -> dict[str, Any]:
         }
     )
 
-    for slide in slides:
+    for slide, seconds in zip(slides, SLIDE_SECONDS, strict=True):
+        slide["target_frames"] = seconds * FPS
         slide.setdefault("cues", [{"narration": slide["narration"], "lines": slide["lines"]}])
     full_text = " ".join(s["narration"].strip() for s in slides if s.get("narration"))
     full_text = " ".join(full_text.split())
     words = len(full_text.split())
-    estimated = round(words / WORDS_PER_SECOND, 1)
 
     return {
         "ok": True,
         "reason": None,
         "full_text": full_text,
         "word_count": words,
-        "estimated_seconds": estimated,
+        "estimated_seconds": sum(SLIDE_SECONDS),
         "slides": slides,
     }
-
-
-def _intro_narration(
-    communities: list[str],
-    bed_labels: list[str],
-    project_count: int,
-) -> str:
-    place = _join_names(communities) or "Dubai"
-    bed_bit = ""
-    if bed_labels:
-        bed_bit = f", covering {_join_names(bed_labels)},"
-    return (
-        f"Here is a property tour of {project_count} projects in {place}{bed_bit} "
-        f"with bedroom details plus the latest sale and rent from current market records."
-    )
-
-
-def _project_narration(project: dict[str, Any], index: int, total: int) -> str:
-    return " ".join(cue["narration"] for cue in _project_cues(project, index, total))
 
 
 def _project_cues(project: dict[str, Any], index: int, total: int) -> list[dict[str, Any]]:
@@ -169,25 +149,25 @@ def _project_cues(project: dict[str, Any], index: int, total: int) -> list[dict[
     if index == 1:
         opener = f"First, {name} in {community}."
     elif index == total:
-        opener = f"Finally, {name} in {community}."
+        opener = f"Next, {name} in {community}."
     if range_bit:
         opener = f"{opener} {range_bit}"
-    if project.get("developer"):
-        opener = f"{opener} Developed by {project['developer']}."
 
     sale_bed = _bed_label(sale.get("bedrooms"))
     rent_bed = _bed_label(rent.get("bedrooms"))
     sale_bit = (
-        f" Recent sale: {_money(sale.get('price'))}"
+        f" A recent sale was {_money_spoken(sale.get('price'))}"
         f"{f' for a {sale_bed}' if sale_bed else ''}"
-        f"{_on_date(sale.get('date'))}."
+        "."
     )
     rent_bit = (
-        f" Recent rent: {_money(rent.get('annual'))} a year"
+        f" A recent rental was {_money_spoken(rent.get('annual'))} a year"
         f"{f' for a {rent_bed}' if rent_bed else ''}"
-        f"{_on_date(rent.get('date'))}."
+        "."
     )
     hand_bit = _handover_spoken(handover)
+    if project.get("completion_date") and handover == "ready":
+        hand_bit = f" Catalog completion was {_date_spoken(project['completion_date'])}."
     captions = _project_caption_lines(project)
     cues = [
         {"narration": opener, "lines": [line for line in captions if line.startswith(("Developer:", "Bedrooms:"))]},
@@ -195,22 +175,8 @@ def _project_cues(project: dict[str, Any], index: int, total: int) -> list[dict[
         {"narration": rent_bit.strip(), "lines": [line for line in captions if line.startswith("Rent ")]},
     ]
     if hand_bit:
-        cues.append({"narration": hand_bit.strip(), "lines": [line for line in captions if line.startswith(("Ready", "Handover"))]})
+        cues.append({"narration": hand_bit.strip(), "lines": [line for line in captions if line.startswith(("Ready", "Handover", "Catalog completion"))]})
     return cues
-
-
-def _outro_narration(
-    projects: list[dict[str, Any]],
-    communities: list[str],
-    bed_labels: list[str],
-) -> str:
-    place = _join_names(communities) or "these areas"
-    bed_bit = f" across {_join_names(bed_labels)}" if bed_labels else ""
-    return (
-        f"Altogether, these {len(projects)} projects in {place}{bed_bit} "
-        f"show recent sale and rent activity with bedroom detail and a clear "
-        f"handover or ready status — a solid base to compare and choose what to view next."
-    )
 
 
 def _project_caption_lines(project: dict[str, Any]) -> list[str]:
@@ -236,12 +202,14 @@ def _project_caption_lines(project: dict[str, Any]) -> list[str]:
     if rent.get("annual") is not None:
         rent_bed = _bed_label_short(rent.get("bedrooms"))
         bed_part = f" · {rent_bed}" if rent_bed else ""
-        lines.append(
-            f"Rent {_money(rent.get('annual'))}/yr{bed_part}{_on_date_short(rent.get('date'))}"
-        )
+        registration = rent.get("registration_date")
+        date_part = f" · registered {_date_spoken(registration)}" if registration else _on_date_short(rent.get("date"))
+        lines.append(f"Rent {_money(rent.get('annual'))}/yr{bed_part}{date_part}")
     if project.get("handover"):
         hand = project["handover"]
         lines.append("Ready to move in" if hand == "ready" else f"Handover {hand}")
+        if project.get("completion_date"):
+            lines.append(f"Catalog completion: {_date_spoken(project['completion_date'])}")
     return [line for line in lines if line]
 
 
@@ -298,7 +266,7 @@ def _project_bed_range_spoken(project: dict[str, Any]) -> str:
         return ""
     # "Bedrooms: 2-bed–3-bed" → spoken
     detail = caption.replace("Bedrooms: ", "")
-    return f"Bedroom options include {detail}."
+    return f"Bedrooms: {detail}."
 
 
 def _handover_spoken(handover: Any) -> str:
@@ -340,11 +308,6 @@ def _bed_label_short(value: Any) -> str | None:
     return f"{n}-bed"
 
 
-def _on_date(value: Any) -> str:
-    label = _date_spoken(value)
-    return f" ({label})" if label else ""
-
-
 def _on_date_short(value: Any) -> str:
     label = _date_spoken(value)
     return f" · {label}" if label else ""
@@ -374,6 +337,11 @@ def _money(value: Any) -> str:
         text = f"{m:.1f}".rstrip("0").rstrip(".")
         return f"AED {text} million"
     return f"AED {int(round(n)):,}"
+
+
+def _money_spoken(value: Any) -> str:
+    label = _money(value)
+    return f"{label[4:]} dirhams" if label.startswith("AED ") else label
 
 
 def _unique_communities(projects: list[dict[str, Any]]) -> list[str]:

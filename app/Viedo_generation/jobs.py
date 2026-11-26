@@ -84,8 +84,7 @@ def _run_job(job_id: str) -> None:
 
 
 def _pipeline(job_id: str) -> dict[str, Any]:
-    from app.Viedo_generation.history import searched_projects
-    from app.Viedo_generation.catalog_prompt import catalog_candidates
+    from app.Viedo_generation.catalog_prompt import resolve_catalog_selection
     from app.Viedo_generation.pack import build_pack
     from app.Viedo_generation.render import render
     from app.Viedo_generation.script import build_script
@@ -101,20 +100,11 @@ def _pipeline(job_id: str) -> dict[str, Any]:
     with_voice = bool(req.get("with_voice", True))
     voice = req.get("voice")
     bedrooms = req.get("bedrooms")
-    limit = int(req.get("limit") or 4)
-    project_keys = req.get("project_keys")
-    communities = req.get("communities")
-
-    prompt = req.get("prompt_text")
-    candidates = catalog_candidates(prompt) if prompt is not None else searched_projects(user_id)
+    limit = int(req.get("limit") or 2)
+    candidates = resolve_catalog_selection(req.get("prompt_text"), req.get("project_keys"), req.get("communities"))
     pack_kwargs: dict[str, Any] = {"limit": limit}
     if bedrooms is not None:
         pack_kwargs["bedrooms"] = int(bedrooms)
-    if project_keys:
-        pack_kwargs["project_keys"] = list(project_keys)
-    if communities:
-        pack_kwargs["communities"] = list(communities)
-
     pack = build_pack(candidates, **pack_kwargs)
     if not pack.get("ok"):
         raise PromptError(pack.get("reason") or "No complete project data.")

@@ -214,6 +214,10 @@ def _slide_durations(
         if abs(sum(durations) - total_seconds) > 0.04:
             raise RenderError("Narration audio does not match the video timings. Generate narration again.")
         return durations
+    if all(isinstance(slide.get("target_frames"), int) and slide["target_frames"] > 0 for slide in slides):
+        durations = [slide["target_frames"] / 25 for slide in slides]
+        if abs(sum(durations) - total_seconds) <= 0.04:
+            return durations
     # Weight by spoken words so project boundaries follow the narration more closely.
     # This is an estimate; Google TTS does not supply per-slide timestamps here.
     weights: list[float] = []
@@ -338,8 +342,8 @@ def _draw_slide(out_path: Path, photo_path: Path | None, slide: dict[str, Any]) 
 
 
 def _add_logo(canvas: Any) -> Any:
-    """Place the ACOT logo in a readable badge at the top-left of every frame."""
-    from PIL import Image, ImageDraw
+    """Place the transparent ACOT logo at the top-left of every frame."""
+    from PIL import Image, ImageFilter
 
     if not LOGO_PATH.is_file():
         return canvas
@@ -350,31 +354,12 @@ def _add_logo(canvas: Any) -> Any:
         target_height = max(1, round(target_width * logo.height / logo.width))
         logo = logo.resize((target_width, target_height), Image.Resampling.LANCZOS)
 
-        pad_x = max(14, round(target_width * 0.10))
-        pad_y = max(10, round(target_height * 0.18))
         margin = max(28, round(min(WIDTH, HEIGHT) * 0.04))
-        badge_width = target_width + (pad_x * 2)
-        badge_height = target_height + (pad_y * 2)
-        radius = max(14, round(badge_height * 0.18))
-
         overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-        draw = ImageDraw.Draw(overlay)
-        draw.rounded_rectangle(
-            (
-                margin + 5,
-                margin + 7,
-                margin + badge_width + 5,
-                margin + badge_height + 7,
-            ),
-            radius=radius,
-            fill=(0, 0, 0, 70),
-        )
-        draw.rounded_rectangle(
-            (margin, margin, margin + badge_width, margin + badge_height),
-            radius=radius,
-            fill=(255, 255, 255, 225),
-        )
-        overlay.alpha_composite(logo, (margin + pad_x, margin + pad_y))
+        shadow = Image.new("RGBA", logo.size)
+        shadow.putalpha(logo.getchannel("A").filter(ImageFilter.GaussianBlur(2)))
+        overlay.alpha_composite(shadow, (margin + 1, margin + 2))
+        overlay.alpha_composite(logo, (margin, margin))
         return Image.alpha_composite(canvas.convert("RGBA"), overlay).convert(canvas.mode)
     except Exception:
         return canvas

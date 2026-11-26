@@ -11,9 +11,9 @@ Auth (pick one, in order):
 
 Env:
   GOOGLE_TTS_GENDER   male | female  (default male)
-  GOOGLE_TTS_VOICE    exact Neural2 name (overrides gender)
+  GOOGLE_TTS_VOICE    exact Google voice name (overrides gender)
   GOOGLE_TTS_VOICE_MALE / GOOGLE_TTS_VOICE_FEMALE  optional overrides
-  GOOGLE_TTS_LANGUAGE default en-US
+  GOOGLE_TTS_LANGUAGE default en-IN
 """
 
 from __future__ import annotations
@@ -27,11 +27,11 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
-# Neural2 is clear and reasonably priced for short narrations.
-DEFAULT_VOICE_MALE = "en-US-Neural2-D"
-DEFAULT_VOICE_FEMALE = "en-US-Neural2-F"
+# Indian English voices for the ACOT property narration.
+DEFAULT_VOICE_MALE = "en-IN-Chirp3-HD-Achird"
+DEFAULT_VOICE_FEMALE = "en-IN-Chirp3-HD-Aoede"
 DEFAULT_VOICE = DEFAULT_VOICE_MALE
-DEFAULT_LANGUAGE = "en-US"
+DEFAULT_LANGUAGE = "en-IN"
 DEFAULT_GENDER = "male"
 # Google TTS hard limit is 5000 bytes of input text per request.
 MAX_CHARS = 4500
@@ -62,7 +62,7 @@ def resolve_voice(
       2. `gender` argument (male/female)
       3. GOOGLE_TTS_VOICE env (full name)
       4. GOOGLE_TTS_GENDER env (male/female)
-      5. Default male Neural2-D
+      5. Default male Indian English voice
     """
     raw = (voice or "").strip()
     if raw:

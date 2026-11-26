@@ -40,7 +40,7 @@ def narrate_script(script: dict[str, Any], path: str | Path, *, voice: str | Non
         source = Path(directory) / "cue.mp3"
         for slide in timed["slides"]:
             cues = slide.get("cues") or [{"narration": slide.get("narration"), "lines": slide.get("lines", [])}]
-            slide_frames = 0
+            sections = []
             for cue in cues:
                 text = str(cue.get("narration") or "").strip()
                 if not text:
@@ -52,10 +52,43 @@ def narrate_script(script: dict[str, Any], path: str | Path, *, voice: str | Non
                 )
                 if decoded.returncode or not decoded.stdout or len(decoded.stdout) % 2:
                     raise TtsError("Could not decode a narration section for synchronization.")
-                pcm = decoded.stdout
+                sections.append(decoded.stdout)
+            target = slide.get("target_frames")
+            minimum = 3 * FPS if target else MIN_CUE_FRAMES
+            lengths = [
+                max(minimum, math.ceil((len(pcm) // 2 + PAUSE_SAMPLES) / SAMPLES_PER_FRAME))
+                for pcm in sections
+            ]
+            if target:
+                # Distribute time across cues in proportion to measured speech.
+                # Cumulative rounding guarantees the requested slide length.
+                total = sum(lengths)
+                boundary = elapsed = 0
+                for index, frames in enumerate(lengths):
+                    elapsed += frames
+                    end = round(elapsed * target / total)
+                    lengths[index] = end - boundary
+                    boundary = end
+            slide_frames = 0
+            for cue, pcm, frames in zip(cues, sections, lengths, strict=True):
+                capacity = frames * SAMPLES_PER_FRAME
+                if len(pcm) // 2 + PAUSE_SAMPLES > capacity:
+                    # Preserve pitch if a long project or price exceeds its slot.
+                    room = capacity - PAUSE_SAMPLES
+                    rate = len(pcm) / (2 * room) * 1.06 if room > 0 else math.inf
+                    if rate > 2:
+                        raise TtsError("A narration section is too long for the video.")
+                    adjusted = subprocess.run(
+                        [ffmpeg, "-v", "error", "-f", "s16le", "-ar", str(SAMPLE_RATE),
+                         "-ac", "1", "-i", "pipe:0", "-af", f"atempo={rate:.6f}",
+                         "-f", "s16le", "pipe:1"],
+                        input=pcm, capture_output=True,
+                    )
+                    if adjusted.returncode or not adjusted.stdout or len(adjusted.stdout) // 2 > capacity:
+                        raise TtsError("Could not fit narration into its video timing.")
+                    pcm = adjusted.stdout
                 samples = len(pcm) // 2
-                frames = max(MIN_CUE_FRAMES, math.ceil((samples + PAUSE_SAMPLES) / SAMPLES_PER_FRAME))
-                padding = frames * SAMPLES_PER_FRAME - samples
+                padding = capacity - samples
                 chunks.append(pcm + b"\0\0" * padding)
                 cue.update(start_frame=slide_frames, end_frame=slide_frames + frames, speech_samples=samples)
                 slide_frames += frames

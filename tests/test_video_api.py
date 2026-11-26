@@ -10,6 +10,22 @@ from app.Viedo_generation import catalog_prompt, jobs, router1
 
 
 class VideoApiTests(unittest.TestCase):
+    def test_generation_requires_catalog_selection_without_history_fallback(self):
+        with (
+            patch.object(jobs, "get_job", return_value={"request": {"user_id": "buyer"}}),
+            patch("app.Viedo_generation.history.searched_projects") as history,
+            patch.object(catalog_prompt, "fetch") as fetch,
+            self.assertRaisesRegex(catalog_prompt.PromptError, "project or community names"),
+        ):
+            jobs._pipeline("test")
+        history.assert_not_called()
+        fetch.assert_not_called()
+
+    def test_explicit_legacy_inputs_resolve_in_the_catalog(self):
+        with patch.object(catalog_prompt, "catalog_candidates") as resolve:
+            catalog_prompt.resolve_catalog_selection(None, ["CIEL_KEY"], ["Mudon"])
+            resolve.assert_called_once_with("CIEL_KEY, Mudon")
+
     def test_agent_input_uses_catalog_even_without_history(self):
         row = {"key": "PROJECT_KEY", "name": "Example", "area": "Example area"}
         with (

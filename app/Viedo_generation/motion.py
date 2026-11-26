@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 FPS = 25
-TRANSITION_FRAMES = 15
+TRANSITION_FRAMES = 25
 MIN_PHOTO_FRAMES = 6 * FPS
 
 
@@ -28,10 +28,10 @@ def motion_filter(index: int, frames: int, width: int, height: int) -> str:
     progress = f"min(on/{max(1, frames - 1)},1)"
     eased = f"({progress}*{progress}*(3-2*{progress}))"
     direction = 1 if index % 2 == 0 else -1
-    travel = (0.18, 0.14, 0.20, 0.16)[index % 4]
+    travel = (0.09, 0.07, 0.10, 0.08)[index % 4]
     zoom = f"1.01+{travel}*{eased}"
-    x = f"(iw-iw/zoom)*(0.5+({direction * 0.24})*{eased})"
-    y = f"(ih-ih/zoom)*(0.5+({0.09 if index % 3 else -0.09})*{eased})"
+    x = f"(iw-iw/zoom)*(0.5+({direction * 0.12})*{eased})"
+    y = f"(ih-ih/zoom)*(0.5+({0.05 if index % 3 else -0.05})*{eased})"
     return (
         f"zoompan=z='{zoom}':x='{x}':y='{y}':"
         f"d={frames}:s={width}x{height}:fps={FPS},"

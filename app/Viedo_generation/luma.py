@@ -1,6 +1,7 @@
 """Run one paid Ray 3.2 entrance-clip pilot from a verified pair of photo URLs."""
 
 import argparse
+import base64
 import os
 import time
 from pathlib import Path
@@ -40,26 +41,31 @@ def _json(response: httpx.Response) -> dict:
 
 
 def generate_entrance_clip(
-    client: httpx.Client, api_key: str, exterior: str, interior: str, output: Path,
+    client: httpx.Client, api_key: str, exterior: str | bytes, interior: str | None, output: Path,
     *, initial_wait: int = 30, poll_interval: int = 2,
+    resolution: str = "720p", prompt: str = PROMPT, aspect_ratio: str = "9:16",
 ) -> str:
     if not api_key.strip():
         raise LumaError("Set LUMA_AGENTS_API_KEY in the Python environment.")
-    if not all(_https(url) for url in (exterior, interior)):
-        raise LumaError("Both photo URLs must use HTTPS.")
+    if (isinstance(exterior, str) and not _https(exterior)) or (interior is not None and not _https(interior)):
+        raise LumaError("Photo URLs must use HTTPS.")
+    start_frame = (
+        {"data": base64.b64encode(exterior).decode("ascii"), "media_type": "image/jpeg"}
+        if isinstance(exterior, bytes) else {"url": exterior}
+    )
     if output.suffix.lower() != ".mp4" or output.exists():
         raise LumaError("Choose a new .mp4 output path.")
     headers = {"Authorization": f"Bearer {api_key.strip()}"}
     job = _json(client.post(f"{BASE}/generations", headers=headers, json={
         "model": "ray-3.2",
         "type": "video",
-        "prompt": PROMPT,
-        "aspect_ratio": "9:16",
+        "prompt": prompt,
+        "aspect_ratio": aspect_ratio,
         "video": {
-            "resolution": "720p",
+            "resolution": resolution,
             "duration": "5s",
-            "start_frame": {"url": exterior},
-            "end_frame": {"url": interior},
+            "start_frame": start_frame,
+            **({"end_frame": {"url": interior}} if interior else {}),
         },
     }))
     job_id = job.get("id")
@@ -106,14 +112,17 @@ def main() -> None:
     load_dotenv()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--exterior", required=True, help="HTTPS URL for the exterior entrance photo")
-    parser.add_argument("--interior", required=True, help="HTTPS URL for the matching interior entrance photo")
+    parser.add_argument("--interior", help="Optional HTTPS URL for a matching end frame")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--resolution", choices=("360p", "540p", "720p"), default="720p")
+    parser.add_argument("--prompt", default=PROMPT, help="Override the camera direction for this shot")
     options = parser.parse_args()
     try:
         with httpx.Client(timeout=30) as client:
             job_id = generate_entrance_clip(
                 client, os.getenv("LUMA_AGENTS_API_KEY", ""),
                 options.exterior, options.interior, options.output,
+                resolution=options.resolution, prompt=options.prompt,
             )
     except LumaError as exc:
         parser.exit(1, f"{exc}\n")

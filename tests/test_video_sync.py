@@ -32,14 +32,29 @@ def tone(seconds, frequency):
 
 
 class VideoSyncTests(unittest.TestCase):
+    def test_short_video_has_two_projects_and_a_45_second_audio_timeline(self):
+        project = {"name": "Example", "photos": ["photo"]}
+        script = build_script({"ok": True, "projects": [
+            project, {**project, "name": "Second"}, {**project, "name": "Excluded"},
+        ]})
+        self.assertEqual([s["kind"] for s in script["slides"]], ["intro", "project", "project", "outro"])
+        self.assertEqual(renderer._slide_durations(script["slides"], 45), [5, 18, 18, 4])
+        with tempfile.TemporaryDirectory() as directory:
+            audio = Path(directory) / "speech.wav"
+            with patch("app.Viedo_generation.tts.speak", return_value=tone(2.0, 220)):
+                timed = narrate_script(script, audio, voice="female")
+            self.assertEqual(renderer._slide_durations(timed["slides"], 45), [5, 18, 18, 4])
+            with wave.open(str(audio), "rb") as stream:
+                self.assertEqual(stream.getnframes(), 45 * 24000)
+
     def test_facts_are_paired_with_their_narration(self):
         project = {"name": "Example", "community": "Community", "developer": "Developer", "bedrooms_min": 2, "photos": ["photo"], "recent_sale": {"price": 1200000, "bedrooms": 2, "date": "2026-10-01"}, "rent": {"annual": 80000, "bedrooms": 2, "date": "2026-10-02"}, "handover": "ready"}
         script = build_script({"ok": True, "projects": [project, {**project, "name": "Second"}]})
         cues = script["slides"][1]["cues"]
         self.assertEqual(len(cues), 4)
-        self.assertIn("Recent sale:", cues[1]["narration"])
+        self.assertIn("A recent sale was", cues[1]["narration"])
         self.assertTrue(cues[1]["lines"][0].startswith("Sale "))
-        self.assertIn("Recent rent:", cues[2]["narration"])
+        self.assertIn("A recent rental was", cues[2]["narration"])
         self.assertTrue(cues[2]["lines"][0].startswith("Rent "))
         self.assertEqual(" ".join(cue["narration"] for cue in cues), script["slides"][1]["narration"])
 
