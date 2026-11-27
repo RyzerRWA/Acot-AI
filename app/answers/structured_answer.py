@@ -2018,6 +2018,7 @@ def _build_fast_structured_answer(
             intro = filter_intro
         # Browse lists: facts only — no duplicated Understood / motive block.
         lines = [intro, ""]
+        grouped = []
 
         for project in projects:
             name = project.get("name") or "Unknown project"
@@ -2060,6 +2061,21 @@ def _build_fast_structured_answer(
             community = str(project.get("community") or "").strip()
             if community and len(projects) == 1:
                 details.append(f"In {community}.")
+            if len(projects) == 1:
+                try:
+                    from app.retrieval.propai_catalog import latest_sale_record
+
+                    rec = latest_sale_record(project.get("name"))
+                except Exception:
+                    rec = None
+                if rec and rec.get("sale_price"):
+                    beds_rec = rec.get("bedrooms")
+                    beds_txt = "studio" if beds_rec == 0 else (f"{int(beds_rec)}-bed" if beds_rec is not None else "bedrooms not recorded")
+                    size_txt = f", {int(rec['procedure_area_sqft']):,} sq ft" if rec.get("procedure_area_sqft") else ""
+                    details.append(
+                        f"Latest recorded sale: {rec['instance_date']}, AED {int(rec['sale_price']):,}, {beds_txt}{size_txt}"
+                        + (f" (DLD transaction {rec['transaction_id']})." if rec.get("transaction_id") else ".")
+                    )
             sales = project.get("sales_count") or project.get("recent_sales_count")
             if sales and len(projects) == 1:
                 details.append(f"{int(sales)} recorded sales.")
@@ -2075,7 +2091,25 @@ def _build_fast_structured_answer(
             if details:
                 sentence = f"{sentence} {' '.join(details)}"
 
-            lines.append(sentence)
+            grouped.append((_handover_is_upcoming(handover_raw)
+                            or "off" in str(project.get("project_status") or project.get("status") or "").lower(), sentence))
+
+        if structured_summary.get("split_launches"):
+            # ACOT QA R07 / AI-012: developer launches and resale stock listed apart, each dated by its latest sale.
+            launches = [s for up, s in grouped if up]
+            resale = [s for up, s in grouped if not up]
+            if launches:
+                lines += ["**Developer launches (off-plan, handover still ahead)**", *launches, ""]
+            if resale:
+                lines += ["**Resale (ready, completed)**", *resale]
+            lines += ["", "Each price is the median of Dubai Land Department sale registrations in the last 12 months, "
+                      "dated by the latest recorded sale shown on the line. A sale record is not a current listing."]
+        else:
+            lines += [s for _, s in grouped]
+        if structured_summary.get("constraint_note"):
+            lines += ["", structured_summary["constraint_note"]]
+        elif structured_summary.get("split_launches") and structured_summary.get("applied_filters"):
+            lines += ["", "**Filters applied:** " + ", ".join(structured_summary["applied_filters"]) + "."]
 
         if communities:
             community_total = structured_summary.get("community_total") or len(communities)

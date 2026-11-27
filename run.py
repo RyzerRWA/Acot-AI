@@ -777,6 +777,9 @@ _CHART_ASK = re.compile(
     r"\b(?:bar\s*-?\s*(?:chart|chat|graph)|chart|graph|plot|diagram|visuali[sz]e|visuali[sz]ation|visual\s+representation)\b",
     re.I,
 )
+# "Separate developer projects from resale" (ACOT QA AI-012, R07)
+_SPLIT_ASK = re.compile(r"\b(?:separate|split|launch(?:es)?|resale|primary|secondary market)\b", re.I)
+_CONSTRAINT_ASK = re.compile(r"\b(?:constraints?|retain\w*|carr(?:y|ied) over|keeping|which (?:filters|criteria))\b", re.I)
 _VILLA_ASK = re.compile(r"\b(?:villas?|townhouses?|town\s+houses?)\b", re.I)
 _READY_ONLY_ASK = re.compile(
     r"\b(?:ready(?:\s+only)?|only\s+ready|completed\s+only|only\s+completed)\b",
@@ -1504,6 +1507,35 @@ def _execute_sales_from_state(question, conversation_memory, *, more: bool = Fal
     )
 
 
+def _applied_filters(payload, beds, place):
+    """The filters a project search actually used, in words (ACOT QA R07)."""
+    return [b for b in (
+        "ready only" if payload.get("ready_only") else None,
+        _bed_label(beds) if beds is not None else None,
+        "villa / townhouse" if payload.get("property_types") else None,
+        ("developer " + " or ".join(d.title() for d in payload["developers"])) if payload.get("developers") else None,
+        f"in {place}" if place and str(place).strip().lower() != "dubai" else None,
+        f"under AED {int(payload['max_price']):,}" if payload.get("max_price") is not None else None,
+        f"above AED {int(payload['min_price']):,}" if payload.get("min_price") is not None else None,
+    ) if b]
+
+
+def _relax_offer(payload, beds, place):
+    """When filters exclude everything, name the ones that can be relaxed instead of a dead end (ACOT QA R07)."""
+    options = [opt for cond, opt in (
+        (payload.get("developers"), "include other developers"),
+        (payload.get("property_types"), "include apartments"),
+        (beds is not None, "change the number of bedrooms"),
+        (payload.get("max_price") is not None, "raise the budget"),
+        (payload.get("ready_only"), "include off-plan"),
+        (place and str(place).strip().lower() != "dubai", "look in nearby communities"),
+    ) if cond]
+    if not options:
+        return ""
+    joined = options[0] if len(options) == 1 else ", ".join(options[:-1]) + " or " + options[-1]
+    return f"\n\nTo widen the search I can relax one filter: {joined}. Which would you like me to change?"
+
+
 def _execute_search_from_state(question, conversation_memory, *, more: bool = False):
     """Re-run project browse from dialogue_state slots."""
     from app.retrieval.propai_catalog import browse_projects_near_budget
@@ -1577,9 +1609,10 @@ def _execute_search_from_state(question, conversation_memory, *, more: bool = Fa
                 "with the same filters."
                 if more
                 else (
-                    f"I don't have projects for {where} with those exact filters "
-                    "in the last 12 months of recorded sales. "
-                    "Try a nearby area, a higher budget, or fewer filters."
+                    f"I don't have projects for {where} with those exact filters ("
+                    + (", ".join(_applied_filters(payload, beds, place)) or "no filters")
+                    + ") in the last 12 months of recorded sales."
+                    + (_relax_offer(payload, beds, place) or " Try a nearby area, a higher budget, or fewer filters.")
                 )
             ),
             "context": None,
@@ -1588,6 +1621,12 @@ def _execute_search_from_state(question, conversation_memory, *, more: bool = Fa
     summary = _empty_structured_summary()
     summary["projects"] = rows
     summary["catalog_place"] = str(place or "Dubai").strip()
+    asked = f"{state.get('source_question') or ''} {question or ''}"
+    summary["applied_filters"] = _applied_filters(payload, beds, place)
+    summary["split_launches"] = bool(payload.get("developers") or _SPLIT_ASK.search(asked))
+    if _CONSTRAINT_ASK.search(question or ""):
+        summary["constraint_note"] = ("**Filters kept for this search:** "
+                                      + (", ".join(summary["applied_filters"]) or "none") + ". Anything not listed was not carried over.")
     if budget_meta and budget_meta.get("budget_miss"):
         summary["budget_miss"] = True
         summary["asked_max_price"] = budget_meta.get("asked_max_price")
@@ -4471,22 +4510,38 @@ def _sql_project_browse_turn(question, conversation_memory=None):
         return None
     if not rows:
         # Honest empty answer for ready/budget filters instead of falling to the LLM.
-        if payload.get("ready_only") or payload.get("min_price") or payload.get("max_price"):
+        if (payload.get("ready_only") or payload.get("min_price") or payload.get("max_price")
+                or payload.get("developers") or payload.get("property_types")):
             where = resolved or "Dubai"
             bits = []
             if payload.get("ready_only"):
                 bits.append("ready")
             if beds:
                 bits.append(_bed_label(beds[0]))
+            if payload.get("property_types"):
+                bits.append("villa / townhouse")
+            if payload.get("developers"):
+                bits.append("by " + " or ".join(d.title() for d in payload["developers"]))
             bits.append(f"in {where}")
             if payload.get("max_price") is not None:
                 bits.append(f"under AED {int(payload['max_price']):,}")
             if payload.get("min_price") is not None:
                 bits.append(f"starting above AED {int(payload['min_price']):,}")
+            relax = [opt for cond, opt in (
+                (payload.get("developers"), "include other developers"),
+                (payload.get("property_types"), "include apartments"),
+                (beds, "change the number of bedrooms"),
+                (payload.get("max_price") is not None, "raise the budget"),
+                (payload.get("ready_only"), "include off-plan"),
+                (resolved, "look in nearby communities"),
+            ) if cond]
             answer = (
                 "I found no matching projects for "
                 + " ".join(bits)
                 + " in the last 12 months of recorded sales."
+                # ACOT QA R07: when filters exclude everything, offer the one to relax instead of a dead end.
+                + (f"\n\nTo widen the search I can relax one filter: {', '.join(relax[:-1]) + ' or ' + relax[-1] if len(relax) > 1 else relax[0]}. "
+                   "Which would you like me to change?" if relax else "")
             )
             summary = _empty_structured_summary()
             summary["project_total"] = 0
@@ -4518,6 +4573,30 @@ def _sql_project_browse_turn(question, conversation_memory=None):
     summary = _empty_structured_summary()
     summary["projects"] = rows
     summary["catalog_place"] = str(resolved or "Dubai").strip()
+    applied = [b for b in (
+        "ready only" if payload.get("ready_only") else None,
+        _bed_label(beds[0]) if beds else None,
+        "villa / townhouse" if payload.get("property_types") else None,
+        ("developer " + " or ".join(d.title() for d in payload["developers"])) if payload.get("developers") else None,
+        f"in {resolved}" if resolved else None,
+        f"under AED {int(payload['max_price']):,}" if payload.get("max_price") is not None else None,
+        f"above AED {int(payload['min_price']):,}" if payload.get("min_price") is not None else None,
+    ) if b]
+    summary["applied_filters"] = applied
+    summary["split_launches"] = bool(payload.get("developers") or _SPLIT_ASK.search(text))
+    if _CONSTRAINT_ASK.search(text):
+        getter = getattr(conversation_memory, "get_dialogue_state", None)
+        prior = (getter() if callable(getter) else getattr(conversation_memory, "dialogue_state", None)) or {}
+        dropped = [b for b in (
+            f"in {prior['place']}" if prior.get("place") and prior.get("place") != resolved else None,
+            _bed_label(prior["beds"]) if prior.get("beds") is not None and (not beds or prior["beds"] != beds[0]) else None,
+            f"budget AED {int(prior['budget_aed']):,}" if prior.get("budget_aed") and prior.get("budget_aed") != budget else None,
+        ) if b]
+        summary["constraint_note"] = (
+            "**Kept from your request:** " + (", ".join(applied) or "no filters") + ". "
+            + ("**Replaced from the last search:** " + ", ".join(dropped) + ", because you changed them."
+               if dropped else "Nothing else was carried over from an earlier search.")
+        )
     if budget_meta and budget_meta.get("budget_miss"):
         summary["budget_miss"] = True
         summary["asked_max_price"] = budget_meta.get("asked_max_price")
@@ -5782,6 +5861,133 @@ def _supply_turn(question):
     return _fast_answer(question, "\n".join(lines))
 
 
+_MONTH_NUM = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+_PERIOD_RE = re.compile(
+    r"\b(?:(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(20\d\d)|q([1-4])\s*(20\d\d)|(?:in|during|for|of)\s+(20\d\d))\b",
+    re.I)
+_COHORT_METRIC = re.compile(r"\b(?:sales?|sold|median|price|count|rents?|lease|renewals?|new[\s-]contract|sq\.?\s*ft|psf|yield)\b", re.I)
+
+
+def _periods(text):
+    """Every month, quarter or year named in the question, as (label, start, end) with end exclusive."""
+    from datetime import date
+
+    out = []
+    for m in _PERIOD_RE.finditer(text or ""):
+        if m.group(1):
+            mon, yr = _MONTH_NUM[m.group(1).lower()[:3]], int(m.group(2))
+            start = date(yr, mon, 1)
+            end = date(yr + (mon == 12), mon % 12 + 1, 1)
+            label = start.strftime("%B %Y")
+        elif m.group(3):
+            q, yr = int(m.group(3)), int(m.group(4))
+            start, end = date(yr, 3 * q - 2, 1), date(yr + (q == 4), (3 * q) % 12 + 1, 1)
+            label = f"Q{q} {yr}"
+        else:
+            yr = int(m.group(5))
+            start, end, label = date(yr, 1, 1), date(yr + 1, 1, 1), str(yr)
+        if all(label != o[0] for o in out):
+            out.append((label, start, end))
+    return out
+
+
+def _cohort_turn(question):
+    """Dated cohorts from DLD records: the exact month / quarter / year, bedrooms, ready or off-plan, and the measure
+    asked for (sale price, AED per sq ft, new vs renewal rents, matched gross yield). ACOT QA R05 / AI-016–AI-022
+    got a trailing 12-month sale median whatever was asked."""
+    from datetime import date
+
+    from app.answers.area_comparison import areas_in
+    from app.answers.intent_route import parse_bedrooms
+    from app.database.postgres import CLEAN_SALE, fetch
+
+    text = question or ""
+    periods = _periods(text)
+    named = areas_in(text)
+    if not periods or not named or not _COHORT_METRIC.search(text) or re.search(r"\bhypothetical|sample\b", text, re.I):
+        return None
+    place = named[0]
+    beds = parse_bedrooms(text)
+    bed = beds[0] if beds else None
+    clause, cparams = _area_clause(place)
+    status = "Existing" if re.search(r"\bready\b", text, re.I) else "Off-Plan" if re.search(r"\boff[\s-]?plan\b", text, re.I) else None
+    wants_rent = bool(re.search(r"\b(?:rents?|lease|renewals?|new[\s-]contract|ejari)\b", text, re.I))
+    wants_psf = bool(re.search(r"\b(?:sq\.?\s*ft|psf|per square foot)\b", text, re.I))
+    wants_yield = bool(re.search(r"\byield\b", text, re.I))
+    apartments = bool(re.search(r"\bapartments?|flats?\b", text, re.I))
+    today = date.today()
+    head = ["Period", "Records", "Median", "Latest record"]
+    rows, notes = [], []
+
+    def sale_stats(start, end):
+        where = [CLEAN_SALE, clause, "instance_date >= %s", "instance_date < %s"]
+        params = [*cparams, start, end]
+        if bed is not None:
+            where.append("bedrooms = %s"); params.append(bed)
+        if status:
+            where.append("development_status = %s"); params.append(status)
+        if apartments:
+            where.append("property_sub_type_en = 'Flat'")
+        col = "price_per_sqft" if wants_psf else "sale_price"
+        r = fetch(f"select count(*)::int n, percentile_cont(0.5) within group (order by {col}) m, max(instance_date) last "
+                  f"from propai_sales where {' and '.join(where)} and {col} > 0", tuple(params))
+        return r[0] if r else {"n": 0}
+
+    def rent_stats(start, end, kind=None):
+        where = ["deleted_at is null", "coalesce(outlier_flag, '') <> '1'", clause.replace("area_name_prop_ai", "area_name_prop_ai"),
+                 "contract_start_date >= %s", "contract_start_date < %s", "contract_months between 11 and 13", "annual_amount > 0"]
+        params = [*cparams, start, end]
+        if bed is not None:
+            where.append("bedrooms = %s"); params.append(bed)
+        if kind:
+            where.append("contract_type = %s"); params.append(kind)
+        r = fetch(f"select count(*)::int n, percentile_cont(0.5) within group (order by annual_amount) m, max(contract_start_date) last "
+                  f"from propai_rents where {' and '.join(where)}", tuple(params))
+        return r[0] if r else {"n": 0}
+
+    aed = lambda v: f"AED {int(round(v)):,}" if v else "–"
+    for label, start, end in periods:
+        future = start > today
+        partial = end > today
+        if wants_rent and not wants_yield:
+            for kind, name in (("New", "new contracts"), ("Renew", "renewals")):
+                r = rent_stats(start, end, kind)
+                rows.append([f"{label} · {name}", f"{r['n']:,}", aed(r.get("m")), str(r.get("last") or "–")])
+            if start < date(2025, 9, 1):
+                notes.append("Registered rent contracts in ACOT start on 1 Sep 2025, so earlier months are not covered.")
+        else:
+            r = sale_stats(start, end)
+            median = (f"AED {int(round(r['m'])):,} per sq ft" if wants_psf and r.get("m") else aed(r.get("m")))
+            rows.append([label + (" (so far)" if partial and not future else ""), f"{r['n']:,}", median, str(r.get("last") or "–")])
+            if wants_yield:
+                rr = rent_stats(start, end)
+                y = (rr["m"] / r["m"] * 100) if r.get("m") and rr.get("m") and not wants_psf else None
+                rows.append([f"{label} · rents (12-month contracts)", f"{rr['n']:,}", aed(rr.get("m")), str(rr.get("last") or "–")])
+                rows.append([f"{label} · matched gross yield", "", f"{y:.2f}%" if y else "not enough matching records", ""])
+                if start < date(2025, 9, 1):
+                    notes.append("Rent records start on 1 Sep 2025, so the yield uses rents from that date only.")
+        if future:
+            notes.append(f"{label} has not happened yet, so there are no completed records.")
+    mapped = fetch(f"select area_name_prop_ai a, count(*)::int n from propai_sales where {clause} and instance_date >= %s "
+                   f"group by 1 order by 2 desc limit 3", (*cparams, min(p[1] for p in periods)))
+    mapping = ", ".join(str(m["a"]).title() for m in mapped if m.get("a"))
+    filt = [f"area: {place.title()}" + (f" (DLD area records: {mapping})" if mapping else ""), f"bedrooms: {bed}" if bed is not None else "all bedroom counts",
+            {"Existing": "ready (existing) only", "Off-Plan": "off-plan only"}.get(status, "ready and off-plan"),
+            "apartments only" if apartments else "all property types",
+            "12-month contracts only (other lengths excluded)" if wants_rent or wants_yield else "deleted and outlier-flagged records excluded"]
+    lines = [f"Dubai Land Department records for **{place.title()}**, exactly as filtered below:", "",
+             "| " + " | ".join(head) + " |", "| " + " | ".join("---" for _ in head) + " |",
+             *["| " + " | ".join(r) + " |" for r in rows], "",
+             "**Filters:** " + "; ".join(filt) + ".",
+             "**Measure:** " + ("median price per sq ft (DLD records area in square metres; converted at 1 m² = 10.764 sq ft; records without an area are excluded)" if wants_psf
+                               else "median annual rent" if wants_rent and not wants_yield else "median sale price")
+             + (". Gross yield = median rent ÷ median sale price for the same area, bedrooms and period (not the same units)." if wants_yield else "."),
+             ]
+    lines += [f"- {n}" for n in dict.fromkeys(notes)]
+    return _fast_answer(question, "\n".join(lines))
+
+
 _PULSE_ASK = re.compile(r"\bmarket\s+(?:pulse|overview)\b", re.I)
 
 
@@ -5884,6 +6090,16 @@ async def _prepare_acot_turn(question, components):
     from app.answers.advice_turn import availability_note, document_note, scope_note
 
     doc_note = None if prepared.get("advice_kind") else document_note(question, prepared.get("documents"))
+    if doc_note:
+        from app.answers.advice_turn import documents_block
+        from app.retrieval.propai_catalog import project_documents_for_question
+
+        try:
+            found = documents_block(project_documents_for_question(question))
+        except Exception as exc:
+            print(f"project documents unavailable: {exc}")
+            found = None
+        doc_note = found or doc_note  # the official files when on file; "not on file" only when there are none
     if doc_note and prepared.get("use_fast") and prepared.get("fast_answer"):
         # A brochure ask is answered first with "not on file", before any sale card (ACOT QA AI-013).
         prepared["fast_answer"] = f"{doc_note}\n\n{prepared['fast_answer']}"
@@ -6033,6 +6249,13 @@ async def _prepare_acot_turn_inner(
     # Two named areas plus an analytical ask ("Rank Arjan and JVC for net income… which costs could reverse it?"):
     # the area table from the database, then a short answer to the actual question over those figures (ACOT QA
     # AI-004, AI-005, AI-010 got a citywide ranking or only one of the two areas).
+    from app.answers.advice_turn import advice_kind as _ak
+
+    cohort = None if _ak(question) == "calc" else await asyncio.to_thread(_cohort_turn, question)
+    if cohort is not None:
+        cohort.update({"timing_ms": timing_ms, "ask_started": ask_started, "rag_chain": rag_chain,
+                       "conversation_memory": conversation_memory})
+        return cohort
     pulse = await asyncio.to_thread(_market_pulse_turn, question)
     if pulse is not None:
         pulse.update({"timing_ms": timing_ms, "ask_started": ask_started, "rag_chain": rag_chain,

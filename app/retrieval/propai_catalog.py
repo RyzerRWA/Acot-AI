@@ -2718,3 +2718,67 @@ def project_fact_sheet(key: str) -> dict:
     facts["sales"] = {**(sales or {}), "by_bedrooms_12m": by_beds, "most_recent": recent}
     facts["rents"] = {**(rents or {}), "by_bedrooms_12m": rent_beds}
     return {k: v for k, v in facts.items() if v not in (None, "", [], {})}
+
+
+_DOC_KINDS = (("docs_brochure", "Official brochure"), ("docs_floorplans", "Floor plans"), ("docs_masterplan", "Masterplan"))
+
+
+def _doc_links(value) -> list[str]:
+    """Prop-AI stores document links as a list, or as the text of a Python-style list."""
+    import json
+
+    if isinstance(value, list):
+        return [str(v) for v in value if str(v).startswith("http")]
+    if isinstance(value, str) and value.strip().startswith("["):
+        try:
+            return [str(v) for v in json.loads(value.replace("'", '"')) if str(v).startswith("http")]
+        except ValueError:
+            return re.findall(r"https://[^'\"\]\s,]+", value)
+    return [value] if isinstance(value, str) and value.startswith("http") else []
+
+
+def project_documents_for_question(question: str | None) -> dict | None:
+    """The named project's official documents (brochure, floor plans, masterplan) with fresh links, or None.
+
+    ACOT QA R06 / AI-013: the brochure is on file for 1,400+ projects but was never shown. Prop-AI links are signed
+    for one hour, so they are fetched live; "Creek Beach Surf" must match "Creek Beach - Surf".
+    """
+    text = re.sub(r"[^A-Z0-9]", "", (question or "").upper())
+    if len(text) < 5:
+        return None
+    rows = fetch(
+        """
+        select name, location_key as key, master_project, area, developer
+        from propai_projects
+        where coalesce(name, '') <> '' and length(name) >= 5 and not is_plot
+          and position(regexp_replace(upper(name), '[^A-Z0-9]', '', 'g') in %s) > 0
+        order by length(name) desc limit 5
+        """,
+        (text,),
+    )
+    row = next((r for r in rows or [] if not known_dubai_label(r.get("name"))), None)
+    if not row:
+        return None
+    details = _live_project_details(row["key"]) or {}
+    docs = []
+    for field, label in _DOC_KINDS:
+        links = _doc_links(details.get(field) or (details.get("dosc_masterplan") if field == "docs_masterplan" else None))
+        for i, url in enumerate(links[:6], 1):
+            name = re.sub(r"\.pdf$", "", url.split("?")[0].rsplit("/", 1)[-1], flags=re.I).replace("_", " ")
+            docs.append({"kind": label, "url": url, "file": name, "n": i, "of": len(links[:6])})
+    return {"project": row["name"], "community": row.get("master_project") or row.get("area"),
+            "developer": row.get("developer"), "status": details.get("offplan_status"),
+            "completion": details.get("offplan_completion_year"), "documents": docs}
+
+
+def latest_sale_record(project_name: str | None) -> dict | None:
+    """The project's most recent clean DLD sale as one record (date, price, beds, size, transaction number), so chat,
+    card and project page quote the same row (ACOT QA R01: one sale's date was paired with another amount)."""
+    if not project_name:
+        return None
+    rows = fetch(
+        f"select instance_date, sale_price, bedrooms, procedure_area_sqft, transaction_id from propai_sales "
+        f"where {CLEAN_SALE} and upper(project_name_prop_ai) = upper(%s) order by instance_date desc, transaction_id desc limit 1",
+        (project_name,),
+    )
+    return rows[0] if rows else None
