@@ -22,6 +22,20 @@ class VideoMotionTests(unittest.TestCase):
                 lengths, offsets = shot_timing(frames, count)
                 self.assertEqual((offsets[-1] if offsets else 0) + lengths[-1], frames)
 
+    def test_flythrough_shots_keep_their_speed_without_shortening_the_scene(self):
+        lengths, offsets = shot_timing(650, 3, moving={0, 1})
+        self.assertEqual(lengths[:2], [150, 150])
+        self.assertEqual(offsets[0], 150)
+        self.assertEqual(offsets[-1] + lengths[-1], 650)
+
+    def test_portrait_crop_can_follow_an_amenity_at_the_edge(self):
+        photo = Image.new("RGB", (720, 360), "black")
+        ImageDraw.Draw(photo).rectangle((540, 0, 719, 359), fill="orange")
+        centered = renderer._cover(photo, 180, 320)
+        framed = renderer._cover(photo, 180, 320, focus_x=0.88)
+        self.assertEqual(centered.getpixel((90, 160)), (0, 0, 0))
+        self.assertGreater(framed.getpixel((90, 160))[0], 240)
+
     def test_slide_timing_uses_narration_and_preserves_frames(self):
         slides = [{"narration": "one two"}, {"narration": "one two three four six seven"}]
         durations = renderer._slide_durations(slides, 10.03)

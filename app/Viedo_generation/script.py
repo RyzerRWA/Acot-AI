@@ -19,7 +19,10 @@ ROOM_WORDS_HI = {"bedroom": "बेडरूम", "living room": "लिवि�
 MAX_SCRIPT_PROJECTS = 2
 
 
-def build_script(pack: dict[str, Any], *, language: str = "en") -> dict[str, Any]:
+def build_script(
+    pack: dict[str, Any], *, language: str = "en", cinematic: bool = False,
+    broker_card: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """
     Turn a complete pack into narration + slide cues.
 
@@ -101,7 +104,7 @@ def build_script(pack: dict[str, Any], *, language: str = "en") -> dict[str, Any
     )
 
     for i, project in enumerate(projects):
-        cues = _project_cues(project, i + 1, len(projects), say)
+        cues = _project_cues(project, i + 1, len(projects), say, include_amenities=not cinematic)
         narration = " ".join(cue["narration"] for cue in cues)
         slides.append(
             {
@@ -154,9 +157,38 @@ def build_script(pack: dict[str, Any], *, language: str = "en") -> dict[str, Any
     )
 
     seconds_per_slide = (INSIDE_SLIDE_SECONDS if rooms else SINGLE_SLIDE_SECONDS) if single else SLIDE_SECONDS
+    if cinematic:
+        slides = [slide for slide in slides if slide["kind"] in ("project", "inside")]
+        if single:
+            amenity_urls = set(projects[0].get("amenity_urls") or [])
+            slides[0]["photo_urls"] = [url for url in photos if url not in amenity_urls] or photos
+            seconds_per_slide = (17, 22) if rooms else (33,)
+        else:
+            seconds_per_slide = (22.48, 22.52)
+        if not single:
+            for slide, project in zip(slides, projects):
+                interiors = [item["url"] for item in project.get("interior_photos", []) if item.get("url")]
+                amenities = set(project.get("amenity_urls") or [])
+                exterior_photos = [url for url in project.get("photos", []) if url not in interiors and url not in amenities]
+                if interiors:
+                    slide["photo_urls"] = exterior_photos[:1] + interiors
+                elif exterior_photos:
+                    slide["photo_urls"] = exterior_photos[:4]
+        amenities = _amenity_slides(projects, slides, say)
+        slides.extend(amenities)
+        seconds_per_slide = (*seconds_per_slide, *(4 for _ in amenities))
+        if broker_card:
+            from app.Viedo_generation.render import AGENT_PANEL_SECONDS
+
+            agent_name = str(broker_card.get("name") or "ACOT Agent").strip()
+            slides.append({
+                "kind": "agent",
+                "narration": say["agent"].format(name=agent_name),
+            })
+            seconds_per_slide = (*seconds_per_slide, AGENT_PANEL_SECONDS)
     for slide, seconds in zip(slides, seconds_per_slide, strict=True):
-        slide["target_frames"] = seconds * FPS
-        slide.setdefault("cues", [{"narration": slide["narration"], "lines": slide["lines"]}])
+        slide["target_frames"] = round(seconds * FPS)
+        slide.setdefault("cues", [{"narration": slide["narration"], "lines": slide.get("lines", [])}])
     full_text = " ".join(s["narration"].strip() for s in slides if s.get("narration"))
     full_text = " ".join(full_text.split())
     words = len(full_text.split())
@@ -171,7 +203,37 @@ def build_script(pack: dict[str, Any], *, language: str = "en") -> dict[str, Any
     }
 
 
-def _project_cues(project: dict[str, Any], index: int, total: int, say: dict[str, str] | None = None) -> list[dict[str, Any]]:
+def _amenity_slides(projects: list[dict[str, Any]], slides: list[dict], say: dict[str, str]) -> list[dict]:
+    result = []
+    def amenity_key(name: str) -> str:
+        return name.strip().casefold().replace("shared ", "").replace("swimming pool", "pool")
+
+    for i, project in enumerate(projects):
+        name = project["name"]
+        shown = (project.get("amenity_photos") or [])[:2]
+        for shot in shown:
+            result.append({
+                "kind": "amenity", "title": shot["name"], "subtitle": name,
+                "narration": say["amenity_shot"].format(name=shot["name"]),
+                "photo_urls": [shot["url"]],
+                "amenity_photo": True,
+                "focus_x": shot.get("focus_x"),
+            })
+        shown_names = {amenity_key(shot["name"]) for shot in shown}
+        listed = [item for item in (project.get("amenities") or []) if item and amenity_key(item) not in shown_names][:2]
+        if listed:
+            result.append({
+                "kind": "amenity", "title": "Amenities", "subtitle": " · ".join(listed),
+                "narration": say["amenities"].format(list=f" {say['and']} ".join(listed)),
+                "photo_urls": (slides[i].get("photo_urls") or [])[:1],
+            })
+    return result[:3]
+
+
+def _project_cues(
+    project: dict[str, Any], index: int, total: int, say: dict[str, str] | None = None,
+    *, include_amenities: bool = True,
+) -> list[dict[str, Any]]:
     """Keep every spoken fact paired with its caption before calling TTS."""
     say = say or PHRASES["en"]
     hindi = say is PHRASES["hi"]
@@ -209,7 +271,7 @@ def _project_cues(project: dict[str, Any], index: int, total: int, say: dict[str
         hand_bit = ""
     captions = _project_caption_lines(project)
     amenities = [a for a in (project.get("amenities") or []) if a][:4]
-    if amenities:
+    if amenities and include_amenities:
         joined = amenities[0] if len(amenities) == 1 else f"{', '.join(amenities[:-1])} {say['and']} {amenities[-1]}"
         opener = f"{opener} {say['amenities'].format(list=joined)}"
     cues = [
@@ -254,6 +316,8 @@ PHRASES: dict[str, dict[str, str]] = {
         "to": "to",
         "and": "and",
         "amenities": "You also get {list}, right at home.",
+        "amenity_shot": "Here's a look at the {name}.",
+        "agent": "For a viewing, contact your agent, {name}.",
         "inside": "Now let's step inside.",
         "inside_rooms": "Here's a look at the {rooms}.",
         "a_home": "a home",
@@ -276,6 +340,8 @@ PHRASES: dict[str, dict[str, str]] = {
         "to": "से",
         "and": "और",
         "amenities": "यहाँ {list} जैसी सुविधाएँ भी मिलती हैं।",
+        "amenity_shot": "यहाँ देखिए {name}।",
+        "agent": "घर देखने के लिए अपने एजेंट {name} से संपर्क करें।",
         "inside": "चलिए, अब घर के अंदर चलते हैं।",
         "inside_rooms": "देखिए {rooms}।",
         "a_home": "एक घर",

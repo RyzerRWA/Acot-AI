@@ -15,8 +15,10 @@ import os
 import shutil
 import subprocess
 import tempfile
+from io import BytesIO
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -28,6 +30,8 @@ from app.Viedo_generation.storage import DEFAULT_OUT_DIR
 DEFAULT_LOGO_PATH = Path(__file__).resolve().parent / "assets" / "acot-logo.png"
 LOGO_PATH = Path(os.getenv("VIDEO_LOGO_PATH") or DEFAULT_LOGO_PATH)
 LOGO_OPACITY = 0.7
+REEL_SIZE = (1080, 1920)
+AGENT_PANEL_SECONDS = 5
 
 
 class RenderError(RuntimeError):
@@ -42,6 +46,7 @@ def render(
     output_path: str | Path | None = None,
     job_id: str = "preview",
     presenter: str | None = None,
+    broker_card: dict[str, Any] | None = None,
 ) -> Path:
     """
     Build an MP4 from pack + script.
@@ -52,6 +57,7 @@ def render(
       output_path: where to write the mp4; default VIDEO_OUTPUT_DIR / {job_id}.mp4
       job_id: used in the default filename
       presenter: male/female or a Neural2 voice name used to select the character
+      broker_card: agent details shown for the last five seconds of a portrait Reel
 
     Returns:
       Path to the finished MP4
@@ -80,24 +86,32 @@ def render(
     try:
         from app.Viedo_generation.motion import render_slides
 
-        clips = render_slides(slides, pack, work, slide_durations, ffmpeg, presenter=presenter)
+        frame_size = REEL_SIZE if broker_card else (WIDTH, HEIGHT)
+        clips = render_slides(
+            slides, pack, work, slide_durations, ffmpeg, frame_size=frame_size, presenter=presenter,
+            broker_card=broker_card,
+        )
 
-        # Dissolve from slide to slide. Each clip but the last carries SLIDE_FADE_FRAMES of tail,
-        # so the offsets land on the narration boundaries and the total length is unchanged.
+        # Each clip but the last carries a dissolve handle. Offsets land on the narration boundaries.
         from app.Viedo_generation.motion import FPS as MOTION_FPS, SLIDE_FADE_FRAMES
 
         silent = work / "silent.mp4"
-        cmd = [ffmpeg, "-y"]
+        cmd = [ffmpeg, "-y", "-filter_complex_threads", "2"]
         for path in clips:
             cmd.extend(["-i", str(path)])
         filters, previous, elapsed = [], "0:v", 0
-        for i, seconds in enumerate(slide_durations[:-1], 1):
-            elapsed += max(1, round(seconds * MOTION_FPS))
-            filters.append(
-                f"[{previous}][{i}:v]xfade=transition=fade:duration={SLIDE_FADE_FRAMES / MOTION_FPS:.4f}"
-                f":offset={elapsed / MOTION_FPS:.4f}[x{i}]"
-            )
-            previous = f"x{i}"
+        if broker_card and len(clips) > 1:
+            inputs = "".join(f"[{i}:v]" for i in range(len(clips)))
+            filters.append(f"{inputs}concat=n={len(clips)}:v=1:a=0[film]")
+            previous = "film"
+        elif not broker_card:
+            for i, seconds in enumerate(slide_durations[:-1], 1):
+                elapsed += max(1, round(seconds * MOTION_FPS))
+                filters.append(
+                    f"[{previous}][{i}:v]xfade=transition=fade:duration={SLIDE_FADE_FRAMES / MOTION_FPS:.4f}"
+                    f":offset={elapsed / MOTION_FPS:.4f}[x{i}]"
+                )
+                previous = f"x{i}"
         if filters:
             cmd.extend(["-filter_complex", ";".join(filters), "-map", f"[{previous}]"])
         cmd.extend([
@@ -119,6 +133,7 @@ def render(
                 "copy",
                 "-c:a",
                 "aac",
+                *(["-af", "apad"] if broker_card else []),
                 "-shortest",
                 "-movflags",
                 "+faststart",
@@ -350,12 +365,12 @@ def _add_logo(canvas: Any) -> Any:
     try:
         logo = Image.open(LOGO_PATH).convert("RGBA")
         # Small and quiet: never upscale the 142px source (that made it blurry), and keep it translucent.
-        target_width = min(logo.width, max(64, round(min(WIDTH, HEIGHT) * 0.105)))
+        target_width = min(logo.width, max(64, round(min(canvas.size) * 0.105)))
         target_height = max(1, round(target_width * logo.height / logo.width))
         logo = logo.resize((target_width, target_height), Image.Resampling.LANCZOS)
         logo.putalpha(logo.getchannel("A").point(lambda a: round(a * LOGO_OPACITY)))
 
-        margin = max(24, round(min(WIDTH, HEIGHT) * 0.045))
+        margin = max(24, round(min(canvas.size) * 0.045))
         overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
         shadow = Image.new("RGBA", logo.size)
         shadow.putalpha(logo.getchannel("A").point(lambda a: a // 3).filter(ImageFilter.GaussianBlur(3)))
@@ -364,6 +379,28 @@ def _add_logo(canvas: Any) -> Any:
         return Image.alpha_composite(canvas.convert("RGBA"), overlay).convert(canvas.mode)
     except Exception:
         return canvas
+
+
+def _broker_photo(url: str) -> Any:
+    from PIL import Image, ImageOps
+
+    try:
+        source = urlsplit(url)
+        if source.scheme != "https" or source.netloc.lower() != "mobile.dubailand.gov.ae":
+            return None
+        content = bytearray()
+        with httpx.stream("GET", url, timeout=4.0, follow_redirects=False) as response:
+            response.raise_for_status()
+            for chunk in response.iter_bytes():
+                content.extend(chunk)
+                if len(content) > 4_000_000:
+                    return None
+        with Image.open(BytesIO(content)) as photo:
+            if photo.width * photo.height <= 12_000_000:
+                return ImageOps.exif_transpose(photo).convert("RGB")
+    except (httpx.HTTPError, OSError, ValueError, Image.DecompressionBombError):
+        pass
+    return None
 
 
 def _wrap_to_width(draw: Any, text: str, font: Any, max_width: int) -> list[str]:
@@ -383,18 +420,18 @@ def _wrap_to_width(draw: Any, text: str, font: Any, max_width: int) -> list[str]
     return rows
 
 
-def _cover(image: Any, width: int, height: int) -> Any:
+def _cover(image: Any, width: int, height: int, *, focus_x: float = 0.5) -> Any:
     """Scale/crop image to fill width x height."""
     from PIL import Image, ImageFilter, ImageOps
 
     image = ImageOps.exif_transpose(image)
     iw, ih = image.size
     scale = max(width / iw, height / ih)
-    nw, nh = int(iw * scale), int(ih * scale)
+    nw, nh = max(width, int(iw * scale)), max(height, int(ih * scale))
     resized = image.resize((nw, nh), resample=Image.Resampling.LANCZOS)
     if scale < 1:
         resized = resized.filter(ImageFilter.UnsharpMask(radius=1.0, percent=90, threshold=3))
-    left = (nw - width) // 2
+    left = min(max(0, int(nw * focus_x - width / 2)), nw - width)
     top = (nh - height) // 2
     return resized.crop((left, top, left + width, top + height))
 

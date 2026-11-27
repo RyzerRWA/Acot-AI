@@ -1825,6 +1825,85 @@ def _llm_generate_from(conversation_memory, components=None):
     return None
 
 
+_PROJECT_TURN_SKIP = re.compile(r"\b(?:compar\w*|vs\.?|versus|agents?|brokers?|charts?|graphs?)\b", re.I)
+_AMENITY_ASK = re.compile(r"\b(?:amenit\w*|facilit\w*|features?)\b", re.I)
+_ON_SCREEN_WORDS = re.compile(r"\b(?:these|those|them|their|each|all|this|it|its)\b", re.I)
+
+_PROJECT_FACTS_PROMPT = """You are ACOT, a Dubai property assistant. Answer the buyer's question about {subject} \
+using ONLY the facts below (Prop-AI project details from the developer, and Dubai Land Department sales and \
+rent registrations).
+- Answer exactly what was asked first, in one or two sentences, then a short bulleted list of the most relevant facts.
+- "Starting price" means the lowest layout starting_price_from (developer price). Also give the 12-month median \
+recorded sale when present, labelled as recorded sales.
+- Features or amenities: list the amenities and highlights as given; mention project_details points when useful.
+- Sales or rent questions: use the sales and rents sections (AED, dates as Month YYYY, newest first).
+- If what was asked is not in the facts, say it is not on record for this project. Never invent facts.
+- Markdown bullets, no headings, AED amounts with thousands separators, under 220 words.
+
+Facts (JSON):
+{facts}
+
+Question: {question}"""
+
+
+async def _named_project_turn(question, conversation_memory, components=None):
+    """A question that names one project, or asks amenities of the projects on screen.
+
+    Runs before the on-screen / follow-up handlers so "starting price of Serenz by Danube" answers
+    Serenz instead of re-listing the last browse. Facts: Prop-AI details (amenities, layouts,
+    payment plan) plus that project's own sales and rents.
+    """
+    from app.retrieval.hybrid.question_text import comparison_pair
+    from app.retrieval.propai_catalog import _id_index, project_fact_sheet, project_in_question
+
+    text = question or ""
+    if _PROJECT_TURN_SKIP.search(text) or comparison_pair(text):
+        return None
+    llm_generate = _llm_generate_from(conversation_memory, components)
+    if llm_generate is None:
+        return None
+    project = await asyncio.to_thread(project_in_question, text)
+    if project:
+        targets = [(project["name"], project["key"])]
+    elif _AMENITY_ASK.search(text) and _ON_SCREEN_WORDS.search(text):
+        ids = await asyncio.to_thread(_id_index)
+        targets = [
+            (item["name"], ids.get(str(item.get("id") or "")))
+            for item in _active_projects(conversation_memory)[:8]
+        ]
+        targets = [(name, key) for name, key in targets if key]
+        if not targets:
+            return None
+    else:
+        return None
+
+    facts = {}
+    for name, key in targets:
+        sheet = await asyncio.to_thread(project_fact_sheet, key)
+        if len(targets) > 1:
+            sheet = {k: sheet[k] for k in ("executive_summary", "amenities", "highlights", "project_details") if k in sheet}
+        facts[name] = sheet or {"note": "nothing on record"}
+    subject = targets[0][0] if len(targets) == 1 else "the projects on screen"
+    prompt = _PROJECT_FACTS_PROMPT.format(
+        subject=subject, question=text.strip(),
+        facts=json.dumps(facts, default=str, ensure_ascii=False)[:24000],
+    )
+    try:
+        answer = (await llm_generate(prompt) or "").strip()
+    except Exception as exc:
+        print(f"named project answer failed: {exc}")
+        return None
+    if not answer:
+        return None
+    if len(targets) == 1:
+        turn = await asyncio.to_thread(_project_detail_turn, text, conversation_memory, targets[0][0])
+        if turn is None:
+            turn = _fast_answer(text, answer, question_type="search")
+        turn["fast_answer"] = answer
+        return turn
+    return _fast_answer(text, answer, projects=_active_projects(conversation_memory)[:8], question_type="search")
+
+
 async def _dialogue_followup_turn(question, conversation_memory, components=None):
     """Phase 2: continue the active task from dialogue_state (LLM resolve + execute)."""
     from app.answers.followup_resolve import (
@@ -3606,6 +3685,26 @@ def _fast_answer(question, answer, projects=None, question_type="general"):
                              "documents": []},
         "use_fast": True, "fast_answer": answer, "context": None, "small_talk": None,
     }
+
+
+_COMMUNITY_DEVELOPER_QUESTION = re.compile(
+    r"(?:who\s+(?:(?:is|was)\s+(?:the\s+)?(?:master\s+)?developer\s+(?:of|for)|developed)"
+    r"|(?:the\s+)?(?:master\s+)?developer\s+(?:of|for))\s+"
+    r"(?:jvc|jumeirah village circle(?:\s*\(jvc\))?)(?:\s+in dubai)?[?.!]*",
+    re.I,
+)
+
+
+def _community_developer_turn(question):
+    if not _COMMUNITY_DEVELOPER_QUESTION.fullmatch((question or "").strip()):
+        return None
+    # Nakheel confirms its role for the master community:
+    # https://www.nakheel.com/en/media-centre/blogs/detail/nakheel-neighbourhoods-in-dubai-with-high-roi-for-real-estate-buyers
+    return _fast_answer(
+        question,
+        "**Nakheel** is the master developer of **Jumeirah Village Circle (JVC)**. "
+        "Individual projects in JVC can have their own developers.",
+    )
 
 
 def _aed(value) -> str:
@@ -5649,6 +5748,14 @@ async def _prepare_acot_turn_inner(
             "audience": components.get("audience") or "buyer",
         }
 
+    community_developer = _community_developer_turn(question)
+    if community_developer is not None:
+        community_developer.update(
+            timing_ms=timing_ms, ask_started=ask_started, rag_chain=rag_chain,
+            conversation_memory=conversation_memory,
+        )
+        return community_developer
+
     # Another city / emirate is out of coverage: say so, never map it onto Dubai data.
     outside_reply = _outside_dubai_market_reply(question)
     if outside_reply:
@@ -5717,6 +5824,17 @@ async def _prepare_acot_turn_inner(
                 "conversation_memory": conversation_memory, "advice_kind": kind,
             })
             return advice
+
+    # A named project ("starting price of Serenz by Danube", "What is Sartoria") or amenities of the
+    # cards on screen: answer that project from its own facts, never re-list the last browse. Before the
+    # place-inheritance rewrite below, which turns "recent sale of Gallery Villas" into a Sports City browse.
+    named_project = await _named_project_turn(question, conversation_memory, components)
+    if named_project is not None:
+        named_project["timing_ms"] = timing_ms
+        named_project["ask_started"] = ask_started
+        named_project["rag_chain"] = rag_chain
+        named_project["conversation_memory"] = conversation_memory
+        return named_project
 
     # After clarify: rewrite to a clean browse so SQL can answer (low tokens).
     prior = prior_anchor_question(conversation_memory, question)

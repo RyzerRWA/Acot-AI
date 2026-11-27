@@ -291,6 +291,8 @@ def _from_catalog(key: str, bedrooms: int | None, web: bool = False) -> dict[str
     photos = _catalog_photos(key, 16 if web else MAX_PHOTOS_PER_PROJECT)
     amenities: list[str] = []
     interiors: list[dict[str, Any]] = []
+    amenity_photos: list[dict[str, Any]] = []
+    amenity_urls: list[str] = []
     min_photos = MIN_PHOTOS
     if web:
         from app.Viedo_generation.collector import collect, label_photos
@@ -299,7 +301,10 @@ def _from_catalog(key: str, bedrooms: int | None, web: bool = False) -> dict[str
         amenities = found["amenities"]
         photos = _dedupe_photos(photos + found["photos"])
         min_photos = 3  # one property: three good official photos are enough
-        photos, interiors = _split_inside(photos, label_photos(photos))
+        labels = label_photos(photos)
+        photos, interiors = _split_inside(photos, labels)
+        amenity_photos = _amenity_shots(labels)
+        amenity_urls = [label["url"] for label in labels if label["kind"] == "amenity"]
     if len(photos) < min_photos:
         return None
 
@@ -340,6 +345,8 @@ def _from_catalog(key: str, bedrooms: int | None, web: bool = False) -> dict[str
         "developer": developer,
         "photos": photos[:MAX_PHOTOS_PER_PROJECT] + [x["url"] for x in interiors],
         "interior_photos": interiors,
+        "amenity_photos": amenity_photos,
+        "amenity_urls": amenity_urls,
         "min_photos": min_photos,
         "amenities": amenities,
         "recent_sale": recent_sale,
@@ -371,6 +378,31 @@ def _split_inside(photos: list[str], labels: list[dict[str, Any]]) -> tuple[list
     labelled = {x["url"] for x in labels}
     # Photos past the 16 labelled ones keep their old place as outside shots.
     return outside + [u for u in photos if u not in labelled], chosen
+
+
+def _amenity_shots(labels: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    unique = {}
+    for label in labels:
+        if label.get("kind") == "amenity" and label.get("amenity") and label.get("url"):
+            unique.setdefault(label["amenity"], {
+                "name": label["amenity"], "url": label["url"], "focus_x": label.get("focus_x"),
+            })
+    return list(unique.values())
+
+
+def label_film_interiors(pack: dict[str, Any]) -> None:
+    """Identify rooms and amenities from the selected projects' catalog photos."""
+    from app.Viedo_generation.collector import label_photos
+
+    for project in pack["projects"]:
+        photos = project["photos"]
+        labels = label_photos(photos)
+        exterior, rooms = _split_inside(photos, labels)
+        project["amenity_photos"] = _amenity_shots(labels)
+        project["amenity_urls"] = [label["url"] for label in labels if label["kind"] == "amenity"]
+        if exterior and rooms:
+            project["photos"] = exterior + [room["url"] for room in rooms]
+            project["interior_photos"] = rooms
 
 
 def _dedupe_photos(urls: list[str]) -> list[str]:

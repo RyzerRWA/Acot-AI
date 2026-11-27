@@ -109,10 +109,17 @@ def _ask(content: str | list, *, web: bool = False) -> str:
 
 
 ROOMS = ("bedroom", "living room", "kitchen", "bathroom", "dining", "balcony")
+AMENITY_NAMES = (
+    "Swimming pool", "Gym", "Children's play area", "Landscaped garden",
+    "Walking path", "Sports court", "Lobby", "Barbecue area",
+)
 LABEL_PROMPT = (
     "Label each image in order. Reply with JSON only: "
-    '[{"i": 0, "kind": "exterior|interior|amenity|other", "room": "bedroom|living room|kitchen|bathroom|dining|balcony|null"}]. '
-    "interior = inside a home. amenity = pool, gym, park, lobby or other shared facility. "
+    '[{"i": 0, "kind": "exterior|interior|amenity|other", "room": "bedroom|living room|kitchen|bathroom|dining|balcony|null", "amenity": null, "focus_x": 0.5}]. '
+    "interior = inside a home. amenity = a clearly visible shared facility. "
+    f"For amenity use exactly one of {json.dumps(AMENITY_NAMES)} only when that facility is clearly the subject. "
+    "For a named amenity, report its visual center horizontally as focus_x from 0 (left) to 1 (right). "
+    "Use null for uncertain labels or ordinary exterior views. "
     "other = floor plan, map, logo, text graphic or a close-up of people."
 )
 
@@ -124,7 +131,8 @@ def label_photos(urls: list[str], *, cache_dir: Path | None = None) -> list[dict
     from app.Viedo_generation import storage
 
     urls = urls[:16]
-    cache = (cache_dir or storage.DEFAULT_OUT_DIR / "web") / f"labels_{hashlib.sha256('|'.join(urls).encode()).hexdigest()[:24]}.json"
+    cache_key = hashlib.sha256("|".join([LABEL_PROMPT, *urls]).encode()).hexdigest()[:24]
+    cache = (cache_dir or storage.DEFAULT_OUT_DIR / "web") / f"labels_{cache_key}.json"
     if cache.is_file():
         try:
             return json.loads(cache.read_text())
@@ -144,7 +152,10 @@ def label_photos(urls: list[str], *, cache_dir: Path | None = None) -> list[dict
         row = by_index.get(i) or {}
         kind = row.get("kind") if row.get("kind") in ("exterior", "interior", "amenity", "other") else "exterior"
         room = row.get("room") if row.get("room") in ROOMS else None
-        result.append({"url": url, "kind": kind, "room": room})
+        amenity = row.get("amenity") if kind == "amenity" and row.get("amenity") in AMENITY_NAMES else None
+        focus = row.get("focus_x")
+        focus = focus if amenity and isinstance(focus, (int, float)) and 0 <= focus <= 1 else None
+        result.append({"url": url, "kind": kind, "room": room, "amenity": amenity, "focus_x": focus})
     cache.parent.mkdir(parents=True, exist_ok=True)
     cache.write_text(json.dumps(result))
     return result
