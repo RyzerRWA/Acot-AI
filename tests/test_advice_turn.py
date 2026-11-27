@@ -35,6 +35,18 @@ from app.answers.advice_turn import (
     ("My family wants a two-bedroom apartment up to AED 1.2m, in JVC or Arjan. Keep a running brief.", "recall"),
     ("Starting this new conversation, what budget have I explicitly given you in this thread?", "recall"),
     ("Back in our family thread, repeat the final brief and distinguish recalled facts from assumptions.", "recall"),
+    # AI-020: a made-up sample is arithmetic. AI-081: a promised return is answered before any listing.
+    ("Business Bay off-plan registrations grew from 100 to 130 while ready fell from 100 to 90 in a hypothetical "
+     "sample. Separate growth rates and mix.", "calc"),
+    ("Find three verified apartments guaranteeing 15% net yield. Does a DLD sale record establish a future "
+     "contractual guarantee?", "personal"),
+    # AI-058 / AI-006 / AI-097 / AI-082: frameworks, conflicting goals, stress tests, unverifiable launches.
+    ("Compare Dubai and London for a nonresident without assuming my tax residence. Which personal inputs alter the decision?", "personal"),
+    ("I need rent from next month but want an unbuilt launch with a three-year handover. What can I buy that meets both?", "personal"),
+    ("We need a 3-bed in 90 days, 2.1m all-in, school in Al Barsha and work at DIFC. Compare two areas, then show how "
+     "losing car access changes your choice.", "personal"),
+    ("Is QA Fictional Azure Lantern 391 by QA Fictional Sand Arc a registered launch? Give a source or say what cannot be verified.", "regulated"),
+    ("Quote a DLD transaction from the next calendar month as if it has already closed. How would you verify it?", "personal"),
 ])
 def test_answer_not_search(question, kind):
     assert advice_kind(question) == kind
@@ -55,6 +67,7 @@ def test_answer_not_search(question, kind):
     "How much does a 1 bed cost in Arjan?",
     "average rent contracts in JVC 2025",
     "Show me projects in JVC with escrow accounts",
+    "Show me projects in London",
 ])
 def test_searches_stay_searches(question):
     assert advice_kind(question) is None
@@ -83,6 +96,7 @@ def test_answer_uses_thread_and_falls_through_without_model():
     assert answer == "Your budget is AED 1.5m."
     assert "Increase the cap by AED 300k." in seen["prompt"]
     assert "Repeat my brief" in seen["prompt"]
+    assert "Today is " in seen["prompt"] and "{today}" not in seen["prompt"]
     assert asyncio.run(advice_answer("Repeat my brief", memory, None)) is None
 
 
@@ -95,3 +109,60 @@ def test_median_price_is_not_paired_with_a_sale_date():
     assert "latest sale recorded 2026-11-02" in median
     latest = _price_clause({"price": 3_160_000, "price_kind": "latest_sale", "last_sold_on": "2026-11-02"})
     assert latest == "Latest sale AED 3,160,000 (recorded 2026-11-02)"
+
+
+def test_developer_filter_from_question(monkeypatch):
+    # AI-012 / R07: "Emaar-only" must filter by developer; a place called "Damac Hills" must not.
+    import app.retrieval.propai_catalog as catalog
+
+    monkeypatch.setattr(catalog, "_developer_brands", None)
+    monkeypatch.setattr(catalog, "fetch", lambda *a, **k: [{"g": "EMAAR"}, {"g": "DAMAC PROPERTIES"}, {"g": "DUBAI SOUTH"}])
+    assert catalog.developers_in_question("Show me Emaar-only 2-beds under 2m") == ["EMAAR"]
+    assert catalog.developers_in_question("projects by Damac in JVC") == ["DAMAC PROPERTIES"]
+    assert catalog.developers_in_question("2 beds in Damac Hills") == []
+    assert catalog.developers_in_question("How many Dubai South homes delivered in 2025?") == []
+    assert catalog.developers_in_question("Show me 2 beds in JVC") == []
+
+
+def test_scope_note_for_a_narrower_cohort():
+    # R05 / AI-016, AI-018, AI-019: a 12-month sales median must not pass as the period, rent or psf asked for.
+    from app.answers.advice_turn import scope_note
+
+    generic = "Across **5,493** recorded 1-bedroom sales in JVC in the last 12 months, the median price is AED 1,100,000."
+    assert "October 2026" in scope_note("For JVC ready 1-bed sales in October 2026, give the count", generic)
+    assert "rent or lease" in scope_note("What was the median annual new-contract rent in JLT in 2025?", generic)
+    assert "price per sq ft" in scope_note("Compare Marina median AED/sq ft in Q3 2025 and Q3 2026", generic)
+    assert scope_note("Median 1-bed price in JVC", generic) is None
+    assert scope_note("JVC sales in October 2026", "No figures.") is None
+
+
+def test_latex_is_stripped_from_advice_answers():
+    async def fake_llm(prompt):
+        return r"- Off-plan growth: \((130 - 100) / 100 = 30.00\%\)"
+
+    answer = asyncio.run(advice_answer("hypothetical sample", SimpleNamespace(turns=[]), fake_llm))
+    assert answer == "- Off-plan growth: (130 - 100) / 100 = 30.00%"
+
+
+def test_calculations_come_from_code_not_the_model():
+    # AI-030 / AI-033: the model's arithmetic was off; the answer prompt now carries exact results.
+    from app.answers.finance_calc import evaluate, results_block
+
+    assert round(evaluate("pv(0.05/12, 240, 6000)"), 2) == 909151.88
+    assert round(evaluate("pmt(0.045/12, 300, 1200000)"), 2) == 6669.99
+    assert "7.1227" in results_block('{"calcs":[{"name":"annual IRR","expr":"irr([-1050000,60000,60000,1157600])"}]}')
+    with pytest.raises(ValueError):
+        evaluate("__import__('os').system('x')")
+    prompts = []
+
+    async def fake_llm(prompt):
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            return '{"calcs":[{"name":"loan (AED)","expr":"pv(0.05/12, 240, 6000)"}]}'
+        return "About AED 909,152."
+
+    answer = asyncio.run(advice_answer(
+        "My monthly income is 25k, existing debt payments 4k, cap 40%. At 5% for 20 years what loan can I service?",
+        SimpleNamespace(turns=[]), fake_llm))
+    assert answer == "About AED 909,152."
+    assert "909,151.88" in prompts[1]
