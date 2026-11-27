@@ -34,6 +34,8 @@ def build_pack(
     communities: list[str] | None = None,
     project_keys: list[str] | None = None,
     limit: int = DEFAULT_LIMIT,
+    min_projects: int = 2,
+    web: bool = False,
 ) -> dict[str, Any]:
     """
     Return a video pack ready for script / TTS / render.
@@ -44,6 +46,8 @@ def build_pack(
       communities: keep only these community names (case-insensitive); None = all
       project_keys: if set, keep only these catalog keys / names
       limit: legacy input, capped at two projects
+      min_projects: 1 for a one-click single-property video, else 2 for a comparison
+      web: fill missing photos and add amenities from the developer's official page (single property only)
 
     Shape:
       {
@@ -74,7 +78,7 @@ def build_pack(
 
     enriched: list[dict[str, Any]] = []
     for candidate in shortlist:
-        row = _enrich(candidate, bedrooms)
+        row = _enrich(candidate, bedrooms, web)
         if row is None:
             continue
         # Incomplete or stale projects never go into the video.
@@ -96,7 +100,7 @@ def build_pack(
     )
     chosen = enriched[:DEFAULT_LIMIT]
 
-    if len(chosen) < 2:
+    if len(chosen) < min_projects:
         return {
             "ok": False,
             "reason": (
@@ -184,12 +188,12 @@ def _apply_filters(
     return out
 
 
-def _enrich(candidate: dict[str, Any], bedrooms: int | None) -> dict[str, Any] | None:
+def _enrich(candidate: dict[str, Any], bedrooms: int | None, web: bool = False) -> dict[str, Any] | None:
     """Only catalog projects can be complete (sale + rent + handover + photos)."""
     key = (candidate.get("key") or "").strip() or None
     if not key:
         return None
-    catalog = _from_catalog(key, bedrooms)
+    catalog = _from_catalog(key, bedrooms, web)
     if catalog is None:
         return None
     catalog["appeared"] = int(candidate.get("appeared") or 1)
@@ -214,7 +218,7 @@ def _is_complete(row: dict[str, Any]) -> bool:
         return False
     if not (row.get("developer") or "").strip():
         return False
-    if len(row.get("photos") or []) < MIN_PHOTOS:
+    if len(row.get("photos") or []) < row.get("min_photos", MIN_PHOTOS):
         return False
     if not (row.get("handover") or "").strip():
         return False
@@ -247,7 +251,7 @@ def _is_recent_date(value: Any) -> bool:
         return False
 
 
-def _from_catalog(key: str, bedrooms: int | None) -> dict[str, Any] | None:
+def _from_catalog(key: str, bedrooms: int | None, web: bool = False) -> dict[str, Any] | None:
     rows = fetch(
         """
         select
@@ -277,15 +281,26 @@ def _from_catalog(key: str, bedrooms: int | None) -> dict[str, Any] | None:
     if not location_key:
         return None
 
-    photos = _catalog_photos(key)
-    if len(photos) < MIN_PHOTOS:
-        return None
-
     name = (project.get("name") or "").strip()
     community = (project.get("masterCommunity") or project.get("community") or "").strip()
     developer = (project.get("developer") or "").strip()
     handover = _handover_label(project)
     if not name or not community or not developer or not handover:
+        return None
+
+    photos = _catalog_photos(key, 16 if web else MAX_PHOTOS_PER_PROJECT)
+    amenities: list[str] = []
+    interiors: list[dict[str, Any]] = []
+    min_photos = MIN_PHOTOS
+    if web:
+        from app.Viedo_generation.collector import collect, label_photos
+
+        found = collect(key, name, community, developer)
+        amenities = found["amenities"]
+        photos = _dedupe_photos(photos + found["photos"])
+        min_photos = 3  # one property: three good official photos are enough
+        photos, interiors = _split_inside(photos, label_photos(photos))
+    if len(photos) < min_photos:
         return None
 
     stats = fetch(
@@ -323,7 +338,10 @@ def _from_catalog(key: str, bedrooms: int | None) -> dict[str, Any] | None:
         "name": name,
         "community": community,
         "developer": developer,
-        "photos": photos[:MAX_PHOTOS_PER_PROJECT],
+        "photos": photos[:MAX_PHOTOS_PER_PROJECT] + [x["url"] for x in interiors],
+        "interior_photos": interiors,
+        "min_photos": min_photos,
+        "amenities": amenities,
         "recent_sale": recent_sale,
         "rent": rent,
         "handover": handover,
@@ -334,6 +352,37 @@ def _from_catalog(key: str, bedrooms: int | None) -> dict[str, Any] | None:
         "appeared": 1,
         "source": "catalog",
     }
+
+
+ROOM_ORDER = ("living room", "bedroom", "kitchen", "dining", "bathroom", "balcony", None)
+
+
+def _split_inside(photos: list[str], labels: list[dict[str, Any]]) -> tuple[list[str], list[dict[str, Any]]]:
+    """Outside shots (building first, then amenities) and up to 4 room shots, one per room type first.
+
+    Floor plans, maps and logos are dropped. Without labels, every photo stays an outside shot.
+    """
+    if not labels:
+        return photos, []
+    outside = [x["url"] for x in labels if x["kind"] == "exterior"] + [x["url"] for x in labels if x["kind"] == "amenity"]
+    rooms = sorted((x for x in labels if x["kind"] == "interior"), key=lambda x: ROOM_ORDER.index(x["room"]))
+    first = list({x["room"]: x for x in reversed(rooms)}.values())[::-1]  # one of each room type
+    chosen = (sorted(first, key=lambda x: ROOM_ORDER.index(x["room"])) + [x for x in rooms if x not in first])[:4]
+    labelled = {x["url"] for x in labels}
+    # Photos past the 16 labelled ones keep their old place as outside shots.
+    return outside + [u for u in photos if u not in labelled], chosen
+
+
+def _dedupe_photos(urls: list[str]) -> list[str]:
+    """Drop the same image served from two hosts (same file name)."""
+    seen: set[str] = set()
+    out = []
+    for url in urls:
+        name = url.rsplit("/", 1)[-1].split("?", 1)[0].lower()
+        if name not in seen:
+            seen.add(name)
+            out.append(url)
+    return out
 
 
 def _from_saved(candidate: dict[str, Any]) -> dict[str, Any] | None:
@@ -370,7 +419,7 @@ def _from_saved(candidate: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def _catalog_photos(key: str) -> list[str]:
+def _catalog_photos(key: str, limit: int = MAX_PHOTOS_PER_PROJECT) -> list[str]:
     rows = fetch(
         """
         select object_name as "objectName"
@@ -379,7 +428,7 @@ def _catalog_photos(key: str) -> list[str]:
         order by position
         limit %s
         """,
-        (key, MAX_PHOTOS_PER_PROJECT),
+        (key, limit),
     )
     return [f"{IMAGES_BASE_URL}/{r['objectName']}" for r in rows if r.get("objectName")]
 

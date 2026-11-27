@@ -9,7 +9,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-DEFAULT_OUT_DIR = Path(os.getenv("VIDEO_OUTPUT_DIR") or r"C:\acot_video_output")
+DEFAULT_OUT_DIR = Path(
+    os.getenv("VIDEO_OUTPUT_DIR")
+    or (r"C:\acot_video_output" if os.name == "nt" else Path.home() / "acot_video_output")
+)
 
 
 def output_dir() -> Path:
