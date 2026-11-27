@@ -166,3 +166,17 @@ def test_calculations_come_from_code_not_the_model():
         SimpleNamespace(turns=[]), fake_llm))
     assert answer == "About AED 909,152."
     assert "909,151.88" in prompts[1]
+
+
+def test_documents_block_lists_official_files():
+    # R06 / AI-013: Surf's brochure and floor plans are on file and must be linked, not reported missing.
+    from app.answers.advice_turn import documents_block
+
+    info = {"project": "Creek Beach - Surf", "community": "Dubai Creek Harbour", "developer": "DUBAI CREEK HARBOUR L.L.C",
+            "status": "Secondary Ready", "completion": "Q1 2023", "documents": [
+                {"kind": "Official brochure", "url": "https://x/a.pdf", "file": "SURF DCH BROCHURE EN", "n": 1, "of": 1},
+                {"kind": "Floor plans", "url": "https://x/b1.pdf", "file": "SURF B1", "n": 1, "of": 2}]}
+    text = documents_block(info)
+    assert "Official documents for Creek Beach - Surf" in text and "[SURF DCH BROCHURE EN](https://x/a.pdf)" in text
+    assert "Floor plans 1 of 2" in text
+    assert documents_block({"documents": []}) is None
