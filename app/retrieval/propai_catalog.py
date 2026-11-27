@@ -139,6 +139,154 @@ def _attach_photos(projects: list[dict]) -> None:
         stored = grouped.get(str(project.get("id")))
         if stored:
             project["photos"] = stored
+    _fallback_photos(projects)
+
+
+def _fallback_photos(projects: list[dict]) -> None:
+    """A project with no photo of its own shows a same-named project's photo, else its area's cover photo
+    (marked area_photo so the app can say so). Never an empty card when something real exists."""
+    missing = [p for p in projects if not p.get("photos")]
+    if not missing:
+        return
+    names = list({str(p["name"]).upper() for p in missing if p.get("name")})
+    areas = list({str(p.get("sub_community") or "").upper() for p in missing if p.get("sub_community")})
+    try:
+        siblings = {r["n"]: _public_photo(r["object_name"]) for r in fetch(
+            "select distinct on (upper(p.name)) upper(p.name) as n, i.object_name from propai_projects p "
+            "join propai_project_images i on i.project_key = p.key where upper(p.name) = any(%s) "
+            "order by upper(p.name), i.position", (names,))} if names else {}
+        covers = {r["a"]: _public_photo(r["cover_object"]) for r in fetch(
+            "select upper(area) as a, cover_object from propai_area_stats where upper(area) = any(%s) and cover_object is not null",
+            (areas,))} if areas else {}
+    except Exception:
+        return
+    for project in missing:
+        same = siblings.get(str(project.get("name") or "").upper())
+        if same:
+            project["photos"] = [same]
+            continue
+        cover = covers.get(str(project.get("sub_community") or "").upper())
+        if cover:
+            project["photos"] = [cover]
+            project["area_photo"] = True
+
+
+def _add_rent_yield(projects: list[dict], bedrooms=None) -> None:
+    """Gross rental yield per project: the median yearly rent of its recent contracts over its median recent sale price.
+
+    Needs at least 5 recent contracts and a sale price; otherwise the project simply has no yield (never a guess).
+    With a bedroom filter both sides use that bedroom count, so it compares like with like."""
+    keys = [str(p["id"]) for p in projects if p.get("id") and p.get("price")]
+    if not keys:
+        return
+    parts = [
+        "location_key_project = any(%s)", "deleted_at is null", "annual_amount > 0", "coalesce(outlier_flag, '') <> '1'",
+        "contract_start_date between current_date - interval '24 months' and current_date",
+    ]
+    params: list = [keys]
+    try:
+        if bedrooms is not None and bedrooms != "":
+            parts.append("bedrooms = %s")
+            params.append(int(float(bedrooms)))
+        rows = fetch(
+            "select location_key_project as k, count(*)::int as n, "
+            "percentile_cont(0.5) within group (order by annual_amount)::float8 as rent "
+            f"from propai_rents where {' and '.join(parts)} group by 1",
+            tuple(params),
+        )
+    except Exception:
+        return
+    by_key = {r["k"]: r for r in rows}
+    for project in projects:
+        stat = by_key.get(str(project.get("id")))
+        if not stat or stat["n"] < 5 or not project.get("price"):
+            continue
+        gross = stat["rent"] / float(project["price"]) * 100
+        if 1 <= gross <= 20:  # outside this the rent or the price is a data slip, not a yield
+            project["gross_yield_pct"] = round(gross, 1)
+            project["median_rent_aed"] = int(round(stat["rent"]))
+            project["rent_contracts"] = stat["n"]
+
+
+def top_yield_projects(max_price=None, min_price=None, place=None, bedrooms=None, limit: int = 8) -> tuple[list[dict], int]:
+    """Residential projects ranked by gross rental yield: median yearly rent of contracts from the last 24 months over the
+    median sale price of the last 12 months. Needs 10+ sales and 20+ contracts, and the yield must be between 2% and 12%
+    (outside that the rents and prices describe different kinds of unit, not a real return). With a bedroom count, rents and sales are both for that count."""
+    cache_key = (max_price, min_price, str(place or "").lower(), str(bedrooms), int(limit))
+    cached = _YIELD_CACHE.get(cache_key)
+    if cached and time.time() - cached[0] < 1800:
+        return [dict(p) for p in cached[1]], cached[2]
+    bed_sql, bed_params = "", []
+    if bedrooms is not None and bedrooms != "":
+        bed_sql, bed_params = " and bedrooms = %s", [int(float(bedrooms))]
+    where = ["not p.is_plot", "coalesce(p.development_status, '') <> 'CANCELLED'", "lower(coalesce(p.usage, '')) = 'residential'",
+             "r.rent / s.price * 100 between 2 and 12"]
+    wparams: list = []
+    if min_price is not None:
+        where.append("s.price >= %s")
+        wparams.append(float(min_price))
+    if max_price is not None:
+        where.append("s.price <= %s")
+        wparams.append(float(max_price))
+    if place:
+        clause, extra = contains_place_sql(["p.master_project", "p.area", "p.name"], _expanded([place]))
+        where.append(clause)
+        wparams.extend(extra)
+    rows = fetch(
+        f"""
+        with s as (
+          select location_key_project as k, count(*)::int as n, percentile_cont(0.5) within group (order by sale_price)::float8 as price,
+                 max(instance_date) as last_sale
+          from propai_sales
+          where location_key_project is not null and deleted_at is null and sale_price between 100000 and 2000000000
+            and coalesce(outlier_flag, '') <> 'True' and (property_type = 'Land' or price_per_sqft is null or price_per_sqft >= 150)
+            and instance_date between current_date - interval '12 months' and current_date{bed_sql}
+          group by 1 having count(*) >= 10),
+        r as (
+          select location_key_project as k, count(*)::int as n, percentile_cont(0.5) within group (order by annual_amount)::float8 as rent
+          from propai_rents
+          where location_key_project is not null and deleted_at is null and annual_amount > 0 and coalesce(outlier_flag, '') <> '1'
+            and contract_start_date between current_date - interval '24 months' and current_date{bed_sql}
+          group by 1 having count(*) >= 20)
+        select p.key, p.name, p.developer, p.area, p.master_project, p.offplan_status, p.end_date,
+               s.price, s.n as sales, s.last_sale, r.rent, r.n as contracts, r.rent / s.price * 100 as gross,
+               count(*) over () as total
+        from s join r on r.k = s.k join propai_projects p on p.location_key = s.k
+        where {' and '.join(where)}
+        order by gross desc, r.n desc
+        limit %s
+        """,
+        tuple([*bed_params, *bed_params, *wparams, int(limit) * 3]),
+    )
+    projects, seen = [], set()
+    for row in rows:
+        name = str(row["name"] or "").upper()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        projects.append({
+            "id": row["key"], "name": row["name"], "developer_name": row.get("developer"),
+            "community": row.get("master_project") or row.get("area"), "sub_community": row.get("area"), "city": "Dubai",
+            "price": int(round(row["price"])), "price_kind": "recent_sale",
+            "bedroom_min": int(float(bedrooms)) if bedrooms not in (None, "") else None,
+            "bedroom_max": int(float(bedrooms)) if bedrooms not in (None, "") else None,
+            "status": row.get("offplan_status"), "project_status": row.get("offplan_status"), "handover_time": _handover(row.get("end_date")),
+            "photos": [], "source": "propai", "size_min": None, "size_max": None, "property_types": None, "brochure_url": None,
+            "sales_count": row["sales"], "last_sale": row.get("last_sale"), "last_sold_on": str(row.get("last_sale") or "")[:10] or None,
+            "gross_yield_pct": round(row["gross"], 1), "median_rent_aed": int(round(row["rent"])), "rent_contracts": row["contracts"],
+        })
+        if len(projects) >= limit:
+            break
+    total = int(rows[0]["total"]) if rows else 0
+    _attach_photos(projects)
+    for project in projects:
+        project["key"] = project["id"]
+        project["id"] = _agent_id(str(project["id"]))
+    _YIELD_CACHE[cache_key] = (time.time(), [dict(p) for p in projects], total)
+    return projects, total
+
+
+_YIELD_CACHE: dict = {}  # the ranking scans a year of sales and two years of rents (about 4 s), so answers are kept 30 minutes
 
 
 def _handover(value):
@@ -768,7 +916,9 @@ def agent_projects(
             from propai_projects
             {band_join}
             where {where}
-            order by upper(name), (developer is not null) desc, name
+            order by upper(name),
+                     (exists (select 1 from propai_project_images i where i.project_key = propai_projects.key)) desc,
+                     (developer is not null) desc, name
         ) unique_projects
         order by {ranked}
         limit %s
@@ -818,6 +968,7 @@ def agent_projects(
         })
     bedrooms = filters.get("bedrooms")
     _add_sale_facts(projects, bedrooms=bedrooms)
+    _add_rent_yield(projects, bedrooms=bedrooms)
     if communities:
         projects = drop_numbered_siblings(projects, communities)
         # Soft reject only: drop rows that clearly name a *different* marketing
@@ -1053,6 +1204,12 @@ def latest_sales(
     params: list = []
     text = str(place or "").strip()
     project_row = _exact_project_row(text) if text else None
+    if project_row and project_row.get("master_project") and (
+        " ".join(project_row["name"].upper().split()) == " ".join(project_row["master_project"].upper().split())
+    ):
+        # A record named like its own community ("Dubai Marina" inside the Dubai Marina master project) is the
+        # community's namesake, not one building: the sales wanted are the whole community's.
+        project_row = None
     if project_row:
         # Named project (AC3 / The Woods at Sobha Sanctuary): keep building/plot
         # sales and resolve short sale-table titles under the same master.

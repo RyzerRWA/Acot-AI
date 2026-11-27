@@ -31,7 +31,7 @@ ALLOWANCE = int(os.getenv("MARKET_REFRESH_REQUESTS", "3000"))
 MANUAL_GAP = timedelta(minutes=10)  # a second manual run this soon is refused, so the button cannot burn the quota
 JOBS = ("sales", "rents", "projects")
 TABLE = {"sales": "propai_sales", "rents": "propai_rents", "projects": "propai_raw"}
-VIEWS = ("propai_project_prices", "propai_derived_projects", "propai_area_stats")
+VIEWS = ("propai_project_prices", "propai_derived_projects", "propai_area_stats", "propai_master_stats")
 LOCK_KEY = 7_201_126
 STALE_RUN = timedelta(hours=6)  # a "running" row older than this is a run that died with its process
 

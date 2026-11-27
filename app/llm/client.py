@@ -62,9 +62,10 @@ class AICreditsClient:
             api_key=AICREDITS_API_KEY,
         )
 
-        self.model = os.getenv(
-            "AICREDITS_MODEL",
-            "openai/gpt-6-luna",
+        self.model = (
+            os.getenv("AICREDITS_MODEL")
+            or os.getenv("OPENAI_MODEL")
+            or "openai/gpt-6-luna"
         )
 
         # One retry of the same model.

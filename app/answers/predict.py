@@ -257,11 +257,13 @@ def _project_detail_line(row: dict) -> str:
     if price and price > 0:
         pretty = _pretty_date(row.get("last_sold_on"))
         kind = str(row.get("price_kind") or "")
-        if kind == "latest_sale" or pretty:
+        if kind == "latest_sale":
             bits.append(f"latest sale AED {price:,}" + (f" on {pretty}" if pretty else ""))
+        elif kind == "recent_sale":
+            # A 12-month median: never put the newest sale's date beside it as if it were that sale.
+            bits.append(f"median recent sale AED {price:,}" + (f" (latest sale {pretty})" if pretty else ""))
         else:
-            label = "recent sale" if kind == "recent_sale" else "from"
-            bits.append(f"{label} AED {price:,}")
+            bits.append(f"from AED {price:,}")
     lo, hi = row.get("bedroom_min"), row.get("bedroom_max")
     if lo is not None or hi is not None:
         lo = lo if lo is not None else hi

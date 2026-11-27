@@ -190,6 +190,12 @@ def analyze_questions(user_id: str) -> dict:
         },
         "interests": interests,
         "repeated_questions": repeated[:20],
+        # The buyer's own words, oldest first: the brief needs the stated budget, beds, areas and must-haves,
+        # and a later revision ("make it 1.5m") must win over the earlier one.
+        "recent_questions": [
+            {"question": row["question"], "asked_at": row["created_at"], "conversation_id": row["conversation_id"]}
+            for row in valid[-15:]
+        ],
         "latest_question_at": (
             valid[-1]["created_at"] if valid else None
         ),

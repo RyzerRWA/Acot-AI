@@ -108,10 +108,29 @@ def get_account_summary(
             if cached is not None:
                 return cached
 
-        payload = _build_payload(user_id, analysis)
+        try:
+            payload = _build_payload(user_id, analysis)
+        except Exception as exc:
+            # ACOT QA R17: one Admin account summary failed to load. A slow or failed model call used to become
+            # a 500; show the last good summary, or say plainly that it could not be generated.
+            print(f"Account summary generation failed for {user_id}: {exc}")
+            return _last_good(user_id) or {
+                **_empty_payload(user_id, analysis),
+                "error": "The AI summary could not be generated right now. Try again in a minute.",
+            }
         _write_cache(key, payload)
 
     return payload
+
+
+def _last_good(user_id: str) -> dict | None:
+    """The newest cached summary for this user (an older question set or plan), marked stale."""
+    with _cache_lock:
+        entries = [entry for key, entry in _cache.items() if key.startswith(f"{user_id}:")]
+    if not entries:
+        return None
+    _, payload = max(entries, key=lambda entry: entry[0])
+    return {**payload, "stale": True}
 
 
 # ============================================================

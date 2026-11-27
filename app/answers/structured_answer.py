@@ -146,10 +146,15 @@ def _price_clause(record, *, sentence: bool = False) -> str | None:
         sold = str(
             (record or {}).get("last_sold_on") or (record or {}).get("last_sale") or ""
         ).strip()[:10]
-        if sold and re.match(r"^\d{4}-\d{2}-\d{2}$", sold):
-            bit = f"Recent sale {text} (recorded {sold})."
-            return bit if sentence else bit.rstrip(".")
-        return f"Recent sale {text}." if sentence else f"recent sale {text}"
+        dated = bool(sold and re.match(r"^\d{4}-\d{2}-\d{2}$", sold))
+        if str((record or {}).get("price_kind") or "").lower() == "latest_sale":
+            # The price and date belong to the same sale here.
+            bit = f"Latest sale {text}" + (f" (recorded {sold})" if dated else "")
+        else:
+            # recent_sale is the MEDIAN of the last 12 months; the date is the newest sale, a different row.
+            # Saying "Recent sale AED 1.66m (recorded 2 Nov)" paired one sale's date with the median (ACOT QA R01).
+            bit = f"Median recorded sale {text} (last 12 months" + (f"; latest sale recorded {sold})" if dated else ")")
+        return f"{bit}." if sentence else bit
     return f"Starting price {text}." if sentence else f"Starting price: {text}"
 
 
@@ -319,6 +324,10 @@ def _format_project_card(record):
         "sales_count": _json_safe(
             record.get("sales_count") or record.get("sales")
         ),
+        # Indicative gross yield (median recent rent over median recent sale price); only when enough contracts exist.
+        "gross_yield_pct": _json_safe(record.get("gross_yield_pct")),
+        "median_rent_aed": _json_safe(record.get("median_rent_aed")),
+        "rent_contracts": _json_safe(record.get("rent_contracts")),
         "amenities": _json_safe(
             record.get("amenities") or []
         ),
@@ -1298,6 +1307,8 @@ def build_frontend_response(
             "comparison": (_build_comparison(structured_summary) or {}).get("sides") or [],
             # Recorded sales (date, price, bedrooms, size, project) for "recent transactions" answers.
             "transactions": _json_safe(structured_summary.get("transactions") or []),
+            # A bar chart the user asked for ("show me in a bar chart"): drawn by the app from these bars.
+            "chart": _json_safe(structured_summary.get("chart")),
         },
         "meta": {
             "counts": {
@@ -1490,12 +1501,12 @@ def _listing_answer(listings, structured_summary, question=None):
         )
     elif showing_sample:
         intro = (
-            f"I found {total} {noun}{place}. "
+            f"I found **{total}** {noun}{place}. "
             f"Here are {count} of them{price_clause}:"
         )
     else:
         intro = (
-            f"I found {count} {noun}{place}{price_clause}. "
+            f"I found **{count}** {noun}{place}{price_clause}. "
             "Here is a short look at each one:"
         )
 
@@ -2198,10 +2209,10 @@ def _price_range_clause(projects):
     recent = any(_recent_sale_row(project) for project in projects)
     if low == high:
         if recent:
-            return f", with a recent sale of {low}"
+            return f", with a median recorded sale of {low}"
         return f", with a starting price of {low}"
     if recent:
-        return f", with recent sale prices from {low} to {high}"
+        return f", with median recorded sale prices from {low} to {high}"
     return f", with starting prices from {low} to {high}"
 
 

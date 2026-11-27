@@ -17,7 +17,8 @@ MODEL = os.getenv("SUMMARY_AICREDITS_MODEL", "scaledown/summarize")
 if not API_KEY or not BASE_URL:
     raise RuntimeError("Summary AI Credits configuration is missing.")
 
-client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+# Fail inside the backend's 60s wait, so the caller gets a clear answer rather than a dropped request.
+client = OpenAI(api_key=API_KEY, base_url=BASE_URL, timeout=45, max_retries=1)
 
 
 SCORE_LIMITS = {
@@ -151,10 +152,14 @@ RULES:
   "A ready 1-bed in JVC or Dubai Marina to rent out, comparing handover dates and service charges."
   Do not start with "The user". Do not mention budget, timing or bedrooms unless the questions say so.
   If the questions are too general to say what they want, write what they have been researching.
+- Read "recent_questions_oldest_first". State every requirement the buyer gave in their own words: budget
+  (as an AED figure), bedrooms, ready or off-plan, areas, and must-haves such as metro walk or school bus.
+  When they revised a requirement, use only the LATEST value ("raise it to AED 1.5m" replaces AED 1.2m).
+  Never add a requirement they did not state. A research-only buyer who has not asked for an agent: say so.
 - "acot_score" MUST be between 0 and {max_score:g}.
 - Do not exceed the subscription maximum under any circumstance.
-- "key_insights" holds 4 to 6 short strings, each one observation.
-- Never mention counts, statistics or raw numbers in the summary.
+- "key_insights" holds 4 to 6 short strings, each one observation; put each stated requirement in one.
+- Never mention question counts or statistics in the summary. The buyer's own stated figures (budget) are allowed.
 
 ACCOUNT INTELLIGENCE:
 {_compact_intelligence(intelligence)}
@@ -213,6 +218,11 @@ def _compact_intelligence(intelligence: dict) -> str:
             for item in intelligence.get("repeated_questions", []) or []
             if isinstance(item, dict)
         ][:10],
+        "recent_questions_oldest_first": [
+            item.get("question")
+            for item in intelligence.get("recent_questions", []) or []
+            if isinstance(item, dict)
+        ],
         "latest_question_at": intelligence.get("latest_question_at"),
     }
 

@@ -3,9 +3,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-AICREDITS_API_KEY = os.getenv("AICREDITS_API_KEY")
+# Prefer AICREDITS_*; fall back to OPENAI_* (same AICredits gateway keys in local .env).
+AICREDITS_API_KEY = os.getenv("AICREDITS_API_KEY") or os.getenv("OPENAI_API_KEY")
 AICREDITS_BASE_URL = (
-    os.getenv("AICREDITS_BASE_URL") or "https://api.aicredits.in/v1"
+    os.getenv("AICREDITS_BASE_URL")
+    or os.getenv("OPENAI_BASE_URL")
+    or "https://api.aicredits.in/v1"
 ).rstrip("/")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_OPENAI_BASE_URL = (
