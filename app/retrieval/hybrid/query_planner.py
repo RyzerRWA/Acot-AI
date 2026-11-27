@@ -107,8 +107,8 @@ class QueryPlanner:
 
         if self.use_llm and self._llm_client is None:
             try:
-                from app.llm.client import AICreditsClient
-                self._llm_client = AICreditsClient()
+                from app.llm.client import LLMClient
+                self._llm_client = LLMClient()
             except Exception as exc:
                 self._llm_client = None
                 self._llm_error = str(exc)

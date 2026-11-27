@@ -44,7 +44,7 @@ from app.subscription.token_usage import (
 logger = logging.getLogger("acot.api")
 
 # How many full chats may run at once. Each chat still takes several model
-# calls, and those stay capped by AICREDITS_MAX_CONCURRENCY. Past this limit
+# calls, and those stay capped by LLM_MAX_CONCURRENCY. Past this limit
 # the API answers "busy" in a couple of seconds instead of holding the
 # client until the 110s stream abort.
 _CHAT_LIMIT = int(os.getenv("ACOT_MAX_INFLIGHT_CHATS", "40"))
@@ -193,7 +193,7 @@ def get_api_components():
         # log without mutating global state.
         _api_components = initialize_acot()
 
-        # Reuse the same AICredits client used by QueryPlanner.
+        # Reuse the same LLM client used by QueryPlanner.
         _api_components["ai_analysis_engine"] = AIAnalysisEngine(
             llm=_api_components["query_planner"]._llm_client
         )

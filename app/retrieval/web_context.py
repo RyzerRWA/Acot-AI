@@ -16,7 +16,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from openai import OpenAI
 
-from app.core.config import AICREDITS_API_KEY, AICREDITS_BASE_URL
+from app.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
 
 _CACHE_FILE = Path(__file__).resolve().parents[2] / "data" / "web_profile_cache.json"
 _TTL_SECONDS = 7 * 86400
@@ -91,15 +91,15 @@ _ANSWER_PROMPT = (
 
 def _search(key: str, prompt: str, ttl: float) -> dict | None:
     """One cached web-search answer; the last good one is reused if the search fails."""
-    if not AICREDITS_API_KEY or "openai.com" not in str(AICREDITS_BASE_URL):
+    if not OPENAI_API_KEY or "openai.com" not in str(OPENAI_BASE_URL):
         return None  # web search is an OpenAI Responses tool; other gateways do not offer it
     hit = _CACHE.get(key)
     if hit and time.time() - hit[0] < ttl:
         return hit[1]
     try:
-        client = OpenAI(base_url=AICREDITS_BASE_URL, api_key=AICREDITS_API_KEY, timeout=45, max_retries=1)
+        client = OpenAI(base_url=OPENAI_BASE_URL, api_key=OPENAI_API_KEY, timeout=45, max_retries=1)
         response = client.responses.create(
-            model=os.getenv("AICREDITS_MODEL", "gpt-6-luna"),
+            model=OPENAI_MODEL,
             tools=[{"type": "web_search"}],
             reasoning={"effort": "low"},
             max_output_tokens=900,

@@ -1,9 +1,9 @@
 import asyncio
 
-from app.llm.client import AICreditsClient
+from app.llm.client import LLMClient
 
 
-llm = AICreditsClient()
+llm = LLMClient()
 
 
 response = asyncio.run(llm.generate(

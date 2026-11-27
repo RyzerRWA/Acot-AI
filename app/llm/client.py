@@ -7,15 +7,15 @@ from threading import Lock
 
 from openai import AsyncOpenAI
 
-from app.core.config import AICREDITS_API_KEY, AICREDITS_BASE_URL, llm_chat_extras
+from app.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL, llm_chat_extras
 from app.subscription.token_usage import (
     add_tokens,
     get_tokens,
 )
 
-# Limits concurrent in-flight LLM calls to AICredits. The provider's
+# Limits concurrent in-flight LLM calls to OpenAI. The provider's
 # concurrency cap is ~5, so anything above that risks HTTP 429s.
-_LLM_CONCURRENCY = int(os.getenv("AICREDITS_MAX_CONCURRENCY", "10"))
+_LLM_CONCURRENCY = int(os.getenv("LLM_MAX_CONCURRENCY", "10"))
 _llm_semaphore = asyncio.Semaphore(_LLM_CONCURRENCY)
 
 # How long a request may wait for a free LLM slot before we give
@@ -23,7 +23,7 @@ _llm_semaphore = asyncio.Semaphore(_LLM_CONCURRENCY)
 # as clients hanging until their own timeout (e.g. 120s).
 
 _LLM_QUEUE_TIMEOUT_SECONDS = float(
-    os.getenv("AICREDITS_QUEUE_TIMEOUT_SECONDS", "15")
+    os.getenv("LLM_QUEUE_TIMEOUT_SECONDS", "15")
 )
 
 # Whether a cached LLM response counts against the caller's usage quota.
@@ -42,30 +42,25 @@ class LLMQueueTimeoutError(RuntimeError):
     """No LLM slot freed up within the queue budget."""
 
 
-class AICreditsClient:
+class LLMClient:
     """
-    ACOT LLM client using AICredits and openai/gpt-6-luna.
-
-    AICredits is an OpenAI-compatible gateway:
-        https://api.aicredits.in/v1
+    ACOT LLM client: OpenAI (OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL).
     """
 
     def __init__(self):
 
-        if not AICREDITS_API_KEY:
+        if not OPENAI_API_KEY:
             raise ValueError(
-                "AICREDITS_API_KEY is not configured."
+                "OPENAI_API_KEY is not configured."
             )
 
         self.client = AsyncOpenAI(
-            base_url=AICREDITS_BASE_URL,
-            api_key=AICREDITS_API_KEY,
+            base_url=OPENAI_BASE_URL,
+            api_key=OPENAI_API_KEY,
         )
 
         self.model = (
-            os.getenv("AICREDITS_MODEL")
-            or os.getenv("OPENAI_MODEL")
-            or "openai/gpt-6-luna"
+            OPENAI_MODEL
         )
 
         # One retry of the same model.
@@ -75,7 +70,7 @@ class AICreditsClient:
         # Output token limit.
         self.max_output_tokens = int(
             os.getenv(
-                "AICREDITS_MAX_OUTPUT_TOKENS",
+                "LLM_MAX_OUTPUT_TOKENS",
                 "800",
             )
         )
@@ -290,19 +285,19 @@ class AICreditsClient:
 
         if not response:
             raise RuntimeError(
-                "AICredits returned an empty response."
+                "LLM returned an empty response."
             )
 
         if not response.choices:
             raise RuntimeError(
-                "AICredits returned no choices."
+                "LLM returned no choices."
             )
 
         message = response.choices[0].message
 
         if not message:
             raise RuntimeError(
-                "AICredits returned an empty message."
+                "LLM returned an empty message."
             )
 
         content = self._message_text(
@@ -311,7 +306,7 @@ class AICreditsClient:
 
         if not content:
             raise RuntimeError(
-                "AICredits returned no text content."
+                "LLM returned no text content."
             )
 
         return content.strip()
@@ -351,7 +346,7 @@ class AICreditsClient:
 
         if not stream:
             raise RuntimeError(
-                "AICredits returned an empty response."
+                "LLM returned an empty response."
             )
 
         async for chunk in stream:
@@ -483,7 +478,7 @@ class AICreditsClient:
             or "rate limit" in lowered
         ):
             return (
-                f"AICredits rate limit reached "
+                f"LLM rate limit reached "
                 f"for model '{model}': {message}"
             )
 
@@ -494,12 +489,12 @@ class AICreditsClient:
             or "unauthorized" in lowered
         ):
             return (
-                f"AICredits authentication/access "
+                f"LLM authentication/access "
                 f"error for model '{model}': {message}"
             )
 
         return (
-            f"AICredits generation failed on "
+            f"LLM generation failed on "
             f"model '{model}': {message}"
         )
 
@@ -532,7 +527,7 @@ class AICreditsClient:
         if cached is not None:
 
             print(
-                f"AICredits cache hit: {model}"
+                f"LLM cache hit: {model}"
             )
 
             cached_text, cached_tokens = cached
@@ -569,7 +564,7 @@ class AICreditsClient:
                     ]
 
                     print(
-                        f"AICredits temporary "
+                        f"LLM temporary "
                         f"failure on {model}. "
                         f"Retrying in "
                         f"{delay:.1f}s "
@@ -629,7 +624,7 @@ class AICreditsClient:
                 break
 
         raise RuntimeError(
-            "AICredits generation failed on "
+            "LLM generation failed on "
             f"model '{model}'. "
             f"Last error: {last_error}"
         ) from last_error
@@ -670,7 +665,7 @@ class AICreditsClient:
         if cached is not None:
 
             print(
-                f"AICredits cache hit: {model}"
+                f"LLM cache hit: {model}"
             )
 
             cached_text, cached_tokens = cached
@@ -705,7 +700,7 @@ class AICreditsClient:
                     ]
 
                     print(
-                        f"AICredits temporary "
+                        f"LLM temporary "
                         f"failure on {model}. "
                         f"Retrying in "
                         f"{delay:.1f}s "
@@ -745,7 +740,7 @@ class AICreditsClient:
                 if not response:
 
                     raise RuntimeError(
-                        "AICredits returned no text content."
+                        "LLM returned no text content."
                     )
 
                 self._set_cached(
@@ -792,7 +787,7 @@ class AICreditsClient:
                 break
 
         raise RuntimeError(
-            "AICredits generation failed on "
+            "LLM generation failed on "
             f"model '{model}'. "
             f"Last error: {last_error}"
         ) from last_error

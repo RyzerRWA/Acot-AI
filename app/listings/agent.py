@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 
 from openai import OpenAI
 
-from app.core.config import AICREDITS_API_KEY, AICREDITS_BASE_URL, llm_chat_extras
+from app.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL, llm_chat_extras
 from app.graph.graph import build_agent_graph
 from app.listings.prompt import SYSTEM_PROMPT, TOOLS, tools_for
 from app.listings.tools import ToolInputError, data_context, mentions_known_name, run_tool
@@ -83,9 +83,9 @@ class ListingAgent:
         # pgvector: the shared brochure retriever, so the agent does not load a second embedding model
         self.pgvector = pgvector
         if client is None:
-            if not AICREDITS_API_KEY:
-                raise ValueError("AICREDITS_API_KEY is not configured.")
-            client = OpenAI(base_url=AICREDITS_BASE_URL, api_key=AICREDITS_API_KEY, timeout=45.0)
+            if not OPENAI_API_KEY:
+                raise ValueError("OPENAI_API_KEY is not configured.")
+            client = OpenAI(base_url=OPENAI_BASE_URL, api_key=OPENAI_API_KEY, timeout=45.0)
             if os.getenv("LANGSMITH_TRACING", "").strip().lower() in ("1", "true", "yes", "on") \
                     and os.getenv("LANGSMITH_API_KEY"):
                 # Optional: every model call, tool call and graph step shows up in LangSmith with timing and tokens.
@@ -95,9 +95,8 @@ class ListingAgent:
                 except Exception as exc:
                     log.warning("LangSmith tracing is not available: %s", exc)
         self.client = client
-        #primary = os.getenv("AICREDITS_MODEL", "openai/gpt-4o-mini")
-        primary = os.getenv("AICREDITS_MODEL", "openai/gpt-6-luna")
-        fallbacks = [m.strip() for m in os.getenv("AICREDITS_FALLBACK_MODELS", "").split(",") if m.strip()]
+        primary = OPENAI_MODEL
+        fallbacks = [m.strip() for m in os.getenv("OPENAI_FALLBACK_MODELS", "").split(",") if m.strip()]
         self.models = [primary, *fallbacks]
 
     # one model call, trying the fallback models if the first one fails

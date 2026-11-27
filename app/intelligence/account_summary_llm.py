@@ -10,12 +10,12 @@ from openai import OpenAI
 ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(ROOT / ".env")
 
-API_KEY = os.getenv("SUMMARY_AICREDITS_API_KEY")
-BASE_URL = os.getenv("SUMMARY_AICREDITS_BASE_URL")
-MODEL = os.getenv("SUMMARY_AICREDITS_MODEL", "scaledown/summarize")
+from app.core.config import OPENAI_API_KEY as API_KEY, OPENAI_BASE_URL as BASE_URL, OPENAI_MODEL
 
-if not API_KEY or not BASE_URL:
-    raise RuntimeError("Summary AI Credits configuration is missing.")
+MODEL = os.getenv("SUMMARY_MODEL") or OPENAI_MODEL
+
+if not API_KEY:
+    raise RuntimeError("OPENAI_API_KEY is not configured.")
 
 # Fail inside the backend's 60s wait, so the caller gets a clear answer rather than a dropped request.
 client = OpenAI(api_key=API_KEY, base_url=BASE_URL, timeout=45, max_retries=1)

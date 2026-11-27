@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
@@ -25,7 +26,7 @@ log = logging.getLogger(__name__)
 # Portals whose terms forbid scraping and whose photos are licensed.
 BLOCKED = ("bayut.", "propertyfinder.", "dubizzle.", "houza.", "zillow.", "airbnb.", "booking.com")
 MIN_SIZE = (900, 500)
-UA = {"User-Agent": "Mozilla/5.0 (compatible; ACOT-video/1.0)"}
+UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"}
 
 PROMPT = """Find the official developer page or official brochure for this Dubai real-estate project, using web search.
 Project: "{name}". Community: "{community}". Developer: "{developer}".
@@ -35,7 +36,8 @@ Reply with JSON only, no prose, in this shape:
 {{"official_url": "https://...", "amenities": ["..."], "image_urls": ["https://..."]}}
 amenities: up to 8 short items exactly as the official source lists them.
 image_urls: up to 12 direct image file URLs of this exact project from the official source: the building outside,
-and inside the homes (bedroom, living room, kitchen, bathroom) wherever the source shows them.
+inside the homes (bedroom, living room, kitchen, bathroom), and the gardens, pool, gym and other amenities,
+wherever the source shows them.
 Use null or [] when you are not sure. Do not guess."""
 
 
@@ -51,7 +53,7 @@ def collect(key: str, name: str, community: str = "", developer: str = "", *, ca
         return empty
     from app.Viedo_generation import storage
 
-    cache = (cache_dir or storage.DEFAULT_OUT_DIR / "web") / f"{hashlib.sha256(f'v2|{key}'.encode()).hexdigest()[:24]}.json"
+    cache = (cache_dir or storage.DEFAULT_OUT_DIR / "web") / f"{hashlib.sha256(f'v3|{key}'.encode()).hexdigest()[:24]}.json"
     if cache.is_file():
         try:
             return json.loads(cache.read_text())
@@ -70,7 +72,7 @@ def collect(key: str, name: str, community: str = "", developer: str = "", *, ca
         "official_url": official,
         # Amenities only count when they come with an official source.
         "amenities": [str(a).strip() for a in (found.get("amenities") or []) if str(a).strip()][:8] if official else [],
-        "photos": _usable(list(dict.fromkeys(candidates)))[:12],
+        "photos": _usable(list(dict.fromkeys(candidates)))[:16],
     }
     cache.parent.mkdir(parents=True, exist_ok=True)
     cache.write_text(json.dumps(result))
@@ -94,12 +96,16 @@ def _ask(content: str | list, *, web: bool = False) -> str:
     }
     if web:
         body["tools"] = [{"type": "web_search"}]
-    response = httpx.post(
-        f"{base}/responses",
-        headers={"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY', '').strip()}"},
-        json=body,
-        timeout=120,
-    )
+    for attempt in range(6):  # 429 = over the account's per-minute limit: wait as OpenAI asks, then retry
+        response = httpx.post(
+            f"{base}/responses",
+            headers={"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY', '').strip()}"},
+            json=body,
+            timeout=120,
+        )
+        if response.status_code != 429:
+            break
+        time.sleep(min(float(response.headers.get("retry-after") or 0) or 5 * 2 ** attempt, 60))
     response.raise_for_status()
     return "".join(
         part.get("text", "")
@@ -143,6 +149,15 @@ def label_photos(urls: list[str], *, cache_dir: Path | None = None) -> list[dict
                     + [{"type": "input_image", "image_url": u, "detail": "low"} for u in urls])
         match = re.search(r"\[.*\]", text, re.S)
         rows = json.loads(match.group(0)) if match else []
+    except httpx.HTTPStatusError as exc:
+        # 400 = OpenAI could not open one of the image links: label the halves so one bad link drops only itself.
+        if exc.response.status_code != 400:
+            log.warning("Photo labelling failed: %s", exc)
+            return []
+        if len(urls) == 1:
+            return [{"url": urls[0], "kind": "other", "room": None, "amenity": None, "focus_x": None}]
+        half = len(urls) // 2
+        return label_photos(urls[:half], cache_dir=cache_dir) + label_photos(urls[half:], cache_dir=cache_dir)
     except (httpx.HTTPError, ValueError) as exc:
         log.warning("Photo labelling failed: %s", exc)
         return []
@@ -175,10 +190,16 @@ def _page_images(url: str) -> list[str]:
         html = httpx.get(url, headers=UA, timeout=20, follow_redirects=True).text[:3_000_000]
     except httpx.HTTPError:
         return []
+    html = html.replace("\\/", "/")  # image links inside JSON page data (Contentful/Next.js sites) are escaped
     found = re.findall(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', html, re.I)
-    found += re.findall(r'(?:src|data-src|srcset)=["\']([^"\'\s,]+\.(?:jpe?g|png|webp))', html, re.I)
-    urls = [urljoin(url, u) for u in found]
-    return [u for u in urls if _allowed(u) and not re.search(r"logo|icon|sprite|favicon|avatar", u, re.I)][:24]
+    found += re.findall(r'(?:src|data-src|srcset)=["\']([^"\'\s,]+\.(?:jpe?g|png|webp|avif))', html, re.I)
+    # galleries often live only in page data, not <img> tags
+    found += re.findall(r'(?:https?:)?//[^"\'\s()<>,]+?\.(?:jpe?g|png|webp|avif)', html, re.I)
+    urls = list(dict.fromkeys(urljoin(url, u) for u in found))
+    urls = [u for u in urls if _allowed(u) and not re.search(r"logo|icon|sprite|favicon|avatar|map|plan|brochure|team|award", u, re.I)]
+    # gallery/render shots first; the vision check later drops anything that is not the project
+    urls.sort(key=lambda u: not re.search(r"gallery|render|exterior|interior|amenit|pool|garden|view|lobby|bedroom|living", u, re.I))
+    return urls[:40]
 
 
 def _usable(urls: list[str]) -> list[str]:
@@ -192,7 +213,8 @@ def _usable(urls: list[str]) -> list[str]:
                 return None
             with Image.open(BytesIO(r.content)) as im:
                 return url if im.width >= MIN_SIZE[0] and im.height >= MIN_SIZE[1] else None
-        except (httpx.HTTPError, OSError, ValueError):
+        except (httpx.HTTPError, OSError, ValueError, Image.DecompressionBombError):
+            # Oversized images (one developer site served 231 MP) are skipped, never fatal.
             return None
 
     with ThreadPoolExecutor(max_workers=8) as pool:

@@ -51,7 +51,7 @@ def ordered(urls):  # cover image first
     return sorted(urls, key=lambda u: "_cover" not in urlparse(u).path)
 
 
-MIME = {"jpg": "image/jpeg", "png": "image/png", "webp": "image/webp"}
+MIME = {"jpg": "image/jpeg", "png": "image/png", "webp": "image/webp", "avif": "image/avif", "gif": "image/gif"}
 BIG = 500_000      # bytes: smaller images are copied untouched
 MAX_SIDE = 1600    # px
 
