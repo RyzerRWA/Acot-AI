@@ -57,7 +57,7 @@ _PERSONAL = re.compile(
     # AI-058 / AI-006 / AI-097: decision frameworks, conflicting goals and stress tests are reasoning, not searches.
     r"tax residen\w*|non-?resident|personal inputs|meets? both|satisf\w* both|"
     # AI-086: asked to present a future sale as closed; the answer is a refusal and how to verify, not a sales list.
-    r"as if (?:it|they) (?:has|have|had) already|next calendar month|invent\w*|fabricat\w*|"
+    r"as if (?:it|they) (?:has|have|had) already|next calendar month|invent(?:ed|ing|s)?\b|fabricat\w*|"
     r"(?:losing|lose|without)\s+(?:my\s+|our\s+)?(?:car|job|income|tenant)\w*)\b",
     re.I,
 )
@@ -288,3 +288,20 @@ def scope_note(question: str | None, answer: str | None) -> str | None:
         + " or ".join(missing)
         + ". ACOT cannot filter that cohort yet, so treat them as context rather than the figure you asked for."
     )
+
+
+def documents_block(info: dict | None) -> str | None:
+    """The official documents for a brochure / floor-plan ask, as links (ACOT QA R06, AI-013)."""
+    docs = (info or {}).get("documents") or []
+    if not docs:
+        return None
+    bits = [b for b in (info.get("community"), f"developer {info['developer'].title()}" if info.get("developer") else None,
+                        info.get("status"), f"completion {info['completion']}" if info.get("completion") else None) if b]
+    lines = [f"**Official documents for {info['project']}**" + (f" ({', '.join(bits)})" if bits else "") + ":", ""]
+    for doc in docs:
+        label = doc["kind"] + (f" {doc['n']} of {doc['of']}" if doc["of"] > 1 else "")
+        lines.append(f"- {label}: [{doc['file']}]({doc['url']})")
+    lines += ["", "These are the developer's published files as held by Prop-AI. Floor plans are filed per building; "
+              "ACOT cannot read page numbers inside the files, so open the floor plans to find the layout you need. "
+              "Links are valid for about an hour; ask again for a fresh link."]
+    return "\n".join(lines)
