@@ -161,7 +161,7 @@ Do not commit `.env` or paste real credentials into source code, logs, or docume
 | `PHOTOS_BASE_URL` | No | Base URL used when constructing rental listing photo links. |
 | `ACOT_PERSIST_SESSIONS` | No | Enables persistent rental-agent session storage when set to a truthy value. |
 | `ACOT_USE_AGENT` | No | Enables the optional agent path when set to a truthy value. |
-| `SUMMARY_AICREDITS_API_KEY`, `SUMMARY_AICREDITS_BASE_URL`, `SUMMARY_AICREDITS_MODEL` | No | Separate configuration for the account-summary model integration. |
+| `SUMMARY_AICREDITS_API_KEY`, `SUMMARY_AICREDITS_BASE_URL`, `SUMMARY_AICREDITS_MODEL` | No | Account summaries use the chat provider and model by default. Set both summary credentials to use a dedicated provider, or set the summary model alone to choose a different model on the chat provider. |
 
 The code loads environment variables from `.env` where configured. Do not copy production credentials into local or example configuration files.
 

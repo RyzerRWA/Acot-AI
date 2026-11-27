@@ -111,6 +111,7 @@ def build_script(
                 "kind": "project",
                 "title": project.get("name") or "Project",
                 "subtitle": project.get("community"),
+                "uses_listing_photos": project.get("uses_listing_photos", False),
                 "lines": _project_caption_lines(project),
                 "stats": _project_stats(project),
                 "narration": narration,
@@ -130,6 +131,7 @@ def build_script(
         project = projects[0]
         slides.append({
             "kind": "inside",
+            "uses_listing_photos": project.get("uses_listing_photos", False),
             "title": project.get("name") or "Project",
             "subtitle": "Inside the home" + (f" · {' · '.join(n.title() for n in dict.fromkeys(x['room'] for x in rooms if x.get('room')))}" if any(x.get("room") for x in rooms) else ""),
             "lines": _project_caption_lines(project),
@@ -214,6 +216,7 @@ def _amenity_slides(projects: list[dict[str, Any]], slides: list[dict], say: dic
         for shot in shown:
             result.append({
                 "kind": "amenity", "title": shot["name"], "subtitle": name,
+                "uses_listing_photos": project.get("uses_listing_photos", False),
                 "narration": say["amenity_shot"].format(name=shot["name"]),
                 "photo_urls": [shot["url"]],
                 "amenity_photo": True,
@@ -224,6 +227,7 @@ def _amenity_slides(projects: list[dict[str, Any]], slides: list[dict], say: dic
         if listed:
             result.append({
                 "kind": "amenity", "title": "Amenities", "subtitle": " · ".join(listed),
+                "uses_listing_photos": project.get("uses_listing_photos", False),
                 "narration": say["amenities"].format(list=f" {say['and']} ".join(listed)),
                 "photo_urls": (slides[i].get("photo_urls") or [])[:1],
             })

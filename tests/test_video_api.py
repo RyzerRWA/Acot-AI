@@ -1,15 +1,88 @@
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from app.Viedo_generation import catalog_prompt, jobs, router1
+from app.Viedo_generation import catalog_prompt, jobs, pack, router1
 
 
 class VideoApiTests(unittest.TestCase):
+    def test_partial_comparison_offers_only_the_qualified_project(self):
+        request = {"user_id": "buyer", "prompt_text": "SURF_KEY, SPRING_KEY"}
+        candidates = [{"key": "SURF_KEY", "explicit_project": True}, {"key": "SPRING_KEY", "explicit_project": True}]
+        qualified = {"key": "SURF_KEY", "name": "Creek Beach - Surf"}
+        with (
+            patch.object(jobs, "get_job", return_value={"request": request}),
+            patch.object(jobs, "_update") as update,
+            patch.object(catalog_prompt, "resolve_catalog_selection", return_value=candidates),
+            patch.object(pack, "build_pack", return_value={"ok": False, "projects": [qualified], "reason": "Spring has no photos"}),
+        ):
+            jobs._run_job("test")
+        self.assertEqual(update.call_args.kwargs["single_project_option"], qualified)
+        self.assertEqual(update.call_args.kwargs["error"], "Spring has no photos")
+
+    def test_interior_photos_count_toward_single_property_readiness(self):
+        project = {"key": "SURF_KEY", "name": "Creek Beach - Surf", "community": "Dubai Creek Harbour",
+                   "developer": "Developer", "locationKey": "surf", "status": "ready"}
+        photos = ["exterior", "living", "bedroom"]
+        labels = [{"url": "exterior", "kind": "exterior", "room": None},
+                  {"url": "living", "kind": "interior", "room": "living room"},
+                  {"url": "bedroom", "kind": "interior", "room": "bedroom"}]
+        today = date.today().isoformat()
+        with (
+            patch.object(pack, "fetch", side_effect=[[project], [{"sales12m": 1, "rents12m": 1}]]),
+            patch.object(pack, "_catalog_photos", return_value=photos),
+            patch.object(pack, "_latest_sale", return_value={"price": 1, "date": today}),
+            patch.object(pack, "_latest_rent", return_value={"annual": 1, "date": today}),
+            patch("app.Viedo_generation.collector.collect", return_value={"amenities": [], "photos": []}),
+            patch("app.Viedo_generation.collector.label_photos", return_value=labels),
+        ):
+            result = pack.build_pack([{"key": "SURF_KEY", "name": project["name"]}], min_projects=1, web=True)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["projects"][0]["photos"], photos)
+
+    def test_video_pack_names_missing_catalog_photos(self):
+        project = {"name": "Spring", "community": "Dubai Silicon Oasis", "developer": "Developer",
+                   "locationKey": "spring", "completionDate": "2025-09-01"}
+        with (
+            patch.object(pack, "fetch", return_value=[project]),
+            patch.object(pack, "_catalog_photos", return_value=[]),
+            patch.object(pack, "_matching_listing_photos", return_value=[]),
+        ):
+            result = pack.build_pack([{"key": "SPRING_DSO", "name": "Spring"}], min_projects=1)
+        self.assertFalse(result["ok"])
+        self.assertIn("Spring: property photos (0 available, 4 needed)", result["reason"])
+
+    def test_listing_photo_fallback_matches_both_the_project_and_master_community(self):
+        with patch.object(pack, "fetch", return_value=[{"listing_id": 123, "stored_photos": 4}]) as fetch:
+            photos = pack._matching_listing_photos("Spring", "Arabian Ranches III")
+        self.assertEqual(fetch.call_args.args[1], ("spring", ["arabian ranches iii", "arabian ranches 3", "arabian ranches-3"]))
+        self.assertEqual([url.rsplit("/", 2)[-2:] for url in photos],
+                         [["123", f"{index}.jpeg"] for index in range(4)])
+
+    def test_ambiguous_project_choices_keep_other_projects_in_the_request(self):
+        rows = [
+            {"key": "SPRING_DSO", "name": "Spring", "area": "Dubai Silicon Oasis"},
+            {"key": "SPRING_AR3", "name": "Spring", "area": "Wadi Al Safa 5", "master_project": "Arabian Ranches III"},
+        ]
+        request = {"user_id": "buyer", "prompt_text": "Spring (2 bed), Ciel"}
+        with (
+            patch.object(catalog_prompt, "fetch", return_value=rows),
+            patch.object(jobs, "get_job", return_value={"request": request}),
+            patch.object(jobs, "_update") as update,
+        ):
+            jobs._run_job("test")
+        status = update.call_args.kwargs
+        self.assertEqual(status["status"], "failed")
+        self.assertEqual(status["project_choices"][1], {
+            "key": "SPRING_AR3", "name": "Spring", "community": "Arabian Ranches III",
+            "prompt_text": "SPRING_AR3, Ciel",
+        })
+
     def test_generation_requires_catalog_selection_without_history_fallback(self):
         with (
             patch.object(jobs, "get_job", return_value={"request": {"user_id": "buyer"}}),
@@ -41,6 +114,7 @@ class VideoApiTests(unittest.TestCase):
         history.assert_not_called()
         self.assertEqual(fetch.call_args.args[1], ("example",) * 3)
         self.assertEqual(pack.call_args.args[0][0]["key"], "PROJECT_KEY")
+        self.assertEqual(pack.call_args.kwargs["min_projects"], 1)
 
     def test_scoped_job_and_range_request(self):
         app = FastAPI()

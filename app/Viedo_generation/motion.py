@@ -127,6 +127,9 @@ def draw_overlay(path: Path, slide: dict[str, Any], lines: list[str], width: int
     from app.Viedo_generation.render import _add_logo, _font, _wrap_to_width
     from app.Viedo_generation.presenter import presenter_enabled, presenter_bounds
 
+    if slide.get("uses_listing_photos"):
+        subtitle = " · ".join(filter(None, (slide.get("subtitle"), "Example listing photos")))
+        slide = {**slide, "subtitle": subtitle}
     if width >= height or cinematic or broker_card:
         return draw_wide_overlay(path, slide, lines, width, height, broker_card=broker_card)
 

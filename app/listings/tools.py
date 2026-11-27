@@ -281,14 +281,14 @@ def _clean_title(title) -> str:
     return re.sub(r"\s+", " ", str(title or "")).strip()[:110]
 
 
-def _photo(listing_id: str, stored) -> str | None:
-    if not stored or int(stored) <= 0:
+def _photo(listing_id: str, stored, *, index: int = 0) -> str | None:
+    if not stored or not 0 <= index < int(stored):
         return None
     base = os.getenv(
         "PHOTOS_BASE_URL",
         "https://storage.googleapis.com/kinetic-axle-442714-m6-dubai-photos/photos",
     ).rstrip("/")
-    return f"{base}/{listing_id}/0.jpeg"
+    return f"{base}/{listing_id}/{index}.jpeg"
 
 
 def _card(row: dict) -> dict:

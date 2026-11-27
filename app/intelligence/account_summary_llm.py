@@ -1,14 +1,12 @@
 import json
 import os
 import re
-from pathlib import Path
+from functools import lru_cache
 
-from dotenv import load_dotenv
 from openai import OpenAI
 
+from app.core.config import AICREDITS_API_KEY, AICREDITS_BASE_URL, chat_model, llm_chat_extras
 
-ROOT = Path(__file__).resolve().parents[2]
-load_dotenv(ROOT / ".env")
 
 from app.core.config import OPENAI_API_KEY as API_KEY, OPENAI_BASE_URL as BASE_URL, OPENAI_MODEL
 
@@ -178,11 +176,16 @@ ACCOUNT INTELLIGENCE:
 # ============================================================
 
 def _complete(prompt: str) -> str | None:
+    client, model, dedicated = _summary_backend()
+    options = (
+        {"max_tokens": 1200, "reasoning_effort": "low"}
+        if dedicated
+        else {"max_completion_tokens": 1200, **llm_chat_extras(model)}
+    )
     response = client.chat.completions.create(
-        model=MODEL,
+        model=model,
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=1200,
-        reasoning_effort="low",
+        **options,
     )
 
     content = response.choices[0].message.content
