@@ -6019,7 +6019,7 @@ def _market_pulse_turn(question):
     lines = [
         f"The Market Overview card for **{row['area'].title()}** counts recorded Dubai Land Department sales:",
         "",
-        f"- **Period:** {start:%-d %b %Y} to {today:%-d %b %Y} (a rolling 12 months ending today)",
+        f"- **Period:** {start:%d %b %Y} to {today:%d %b %Y} (a rolling 12 months ending today)",
         "- **Included:** every recorded sale in the area, off-plan and ready, all property types, with a sale price above zero",
         "- **Excluded:** deleted records, records flagged as outliers, and dates after today",
         f"- **Count today:** **{int(row['sales_12m']):,}** sales; latest recorded sale {row['last_sale']}",

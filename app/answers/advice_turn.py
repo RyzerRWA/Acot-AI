@@ -196,7 +196,7 @@ async def advice_answer(question: str, conversation_memory, llm_generate) -> str
     """The model's answer, or None (no model, or it failed) so the caller falls through to the normal paths."""
     if llm_generate is None:
         return None
-    today = datetime.now(ZoneInfo("Asia/Dubai")).strftime("%-d %B %Y")
+    today = datetime.now(ZoneInfo("Asia/Dubai")).strftime("%d %B %Y").lstrip("0")
     history = _history(conversation_memory)
     calcs = ""
     if advice_kind(question) in {"calc", "challenge"} or _money_count(question) >= 2:

@@ -1,24 +1,31 @@
 import json
 import os
 import re
-from pathlib import Path
+from functools import lru_cache
 
-from dotenv import load_dotenv
 from openai import OpenAI
 
+from app.core.config import AICREDITS_API_KEY, AICREDITS_BASE_URL, chat_model, llm_chat_extras
 
-ROOT = Path(__file__).resolve().parents[2]
-load_dotenv(ROOT / ".env")
 
-API_KEY = os.getenv("SUMMARY_AICREDITS_API_KEY")
-BASE_URL = os.getenv("SUMMARY_AICREDITS_BASE_URL")
-MODEL = os.getenv("SUMMARY_AICREDITS_MODEL", "scaledown/summarize")
+@lru_cache(maxsize=1)
+def _summary_backend() -> tuple[OpenAI, str, bool]:
+    api_key = os.getenv("SUMMARY_AICREDITS_API_KEY", "").strip()
+    base_url = os.getenv("SUMMARY_AICREDITS_BASE_URL", "").strip()
+    dedicated = bool(api_key or base_url)
+    if dedicated:
+        if not api_key or not base_url:
+            raise RuntimeError("A separate summary provider requires both its API key and base URL.")
+        default_model = "scaledown/summarize"
+    else:
+        api_key, base_url = AICREDITS_API_KEY, AICREDITS_BASE_URL
+        default_model = chat_model()
+    if not api_key:
+        raise RuntimeError("Account summaries require the chat API key or a separate summary provider.")
 
-if not API_KEY or not BASE_URL:
-    raise RuntimeError("Summary AI Credits configuration is missing.")
-
-# Fail inside the backend's 60s wait, so the caller gets a clear answer rather than a dropped request.
-client = OpenAI(api_key=API_KEY, base_url=BASE_URL, timeout=45, max_retries=1)
+    model = os.getenv("SUMMARY_AICREDITS_MODEL", "").strip() or default_model
+    client = OpenAI(api_key=api_key, base_url=base_url, timeout=45, max_retries=1)
+    return client, model, dedicated
 
 
 SCORE_LIMITS = {
@@ -178,11 +185,16 @@ ACCOUNT INTELLIGENCE:
 # ============================================================
 
 def _complete(prompt: str) -> str | None:
+    client, model, dedicated = _summary_backend()
+    options = (
+        {"max_tokens": 1200, "reasoning_effort": "low"}
+        if dedicated
+        else {"max_completion_tokens": 1200, **llm_chat_extras(model)}
+    )
     response = client.chat.completions.create(
-        model=MODEL,
+        model=model,
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=1200,
-        reasoning_effort="low",
+        **options,
     )
 
     content = response.choices[0].message.content

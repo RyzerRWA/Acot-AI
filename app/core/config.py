@@ -20,6 +20,10 @@ LLM_API_KEY = AICREDITS_API_KEY or GEMINI_API_KEY
 LLM_BASE_URL = AICREDITS_BASE_URL if AICREDITS_API_KEY else GEMINI_OPENAI_BASE_URL
 
 
+def chat_model() -> str:
+    return os.getenv("AICREDITS_MODEL") or os.getenv("OPENAI_MODEL") or "openai/gpt-6-luna"
+
+
 def llm_chat_extras(model: str) -> dict:
     """GPT-6 Luna reasons by default. Chat Completions tools only work with reasoning off."""
     name = (model or "").lower()

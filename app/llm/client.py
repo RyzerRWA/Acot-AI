@@ -7,7 +7,7 @@ from threading import Lock
 
 from openai import AsyncOpenAI
 
-from app.core.config import AICREDITS_API_KEY, AICREDITS_BASE_URL, llm_chat_extras
+from app.core.config import AICREDITS_API_KEY, AICREDITS_BASE_URL, chat_model, llm_chat_extras
 from app.subscription.token_usage import (
     add_tokens,
     get_tokens,
@@ -62,11 +62,7 @@ class AICreditsClient:
             api_key=AICREDITS_API_KEY,
         )
 
-        self.model = (
-            os.getenv("AICREDITS_MODEL")
-            or os.getenv("OPENAI_MODEL")
-            or "openai/gpt-6-luna"
-        )
+        self.model = chat_model()
 
         # One retry of the same model.
         self.max_retries = 2
