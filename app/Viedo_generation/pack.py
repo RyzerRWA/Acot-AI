@@ -77,12 +77,13 @@ def build_pack(
     shortlist = _shortlist(candidates, ENRICH_CAP)
 
     enriched: list[dict[str, Any]] = []
+    incomplete: list[str] = []
     for candidate in shortlist:
-        row = _enrich(candidate, bedrooms, web)
+        missing: list[str] = []
+        row = _enrich(candidate, bedrooms, web, missing)
         if row is None:
-            continue
-        # Incomplete or stale projects never go into the video.
-        if not _is_complete(row):
+            if len(incomplete) < 3 and candidate.get("name") and missing:
+                incomplete.append(f"{candidate['name']}: {', '.join(missing)}")
             continue
         row["explicit_project"] = bool(candidate.get("explicit_project"))
         enriched.append(row)
@@ -101,13 +102,16 @@ def build_pack(
     chosen = enriched[:DEFAULT_LIMIT]
 
     if len(chosen) < min_projects:
+        reason = "This project does not have enough data for a video." if min_projects == 1 else (
+            f"A comparison needs {min_projects} complete projects. {len(chosen)} qualified."
+        )
+        if incomplete:
+            reason += " Missing data. " + ". ".join(incomplete) + "."
+        if min_projects > 1 and len(chosen) == 1:
+            reason += f" You can generate a single-property video for {chosen[0]['name']}."
         return {
             "ok": False,
-            "reason": (
-                "Not enough complete projects yet. "
-                "Each project needs photos, a recent sale, a recent rent, "
-                "and a handover or ready status."
-            ),
+            "reason": reason,
             "bedrooms": bedrooms,
             "communities": communities or [],
             "projects": chosen,
@@ -188,12 +192,13 @@ def _apply_filters(
     return out
 
 
-def _enrich(candidate: dict[str, Any], bedrooms: int | None, web: bool = False) -> dict[str, Any] | None:
+def _enrich(candidate: dict[str, Any], bedrooms: int | None, web: bool, missing: list[str]) -> dict[str, Any] | None:
     """Only catalog projects can be complete (sale + rent + handover + photos)."""
     key = (candidate.get("key") or "").strip() or None
     if not key:
+        missing.append("catalog project record")
         return None
-    catalog = _from_catalog(key, bedrooms, web)
+    catalog = _from_catalog(key, bedrooms, web, missing)
     if catalog is None:
         return None
     catalog["appeared"] = int(candidate.get("appeared") or 1)
@@ -203,39 +208,6 @@ def _enrich(candidate: dict[str, Any], bedrooms: int | None, web: bool = False) 
     if candidate.get("bedrooms_max") is not None:
         catalog["bedrooms_max"] = candidate.get("bedrooms_max")
     return catalog
-
-
-def _is_complete(row: dict[str, Any]) -> bool:
-    """
-    True only when every video field is present and market facts are recent.
-
-    Required: name, community, developer, 4+ photos, recent sale, recent rent,
-    handover (or "ready"). Sale and rent dates must fall inside RECENT_MONTHS.
-    """
-    if not (row.get("name") or "").strip():
-        return False
-    if not (row.get("community") or "").strip():
-        return False
-    if not (row.get("developer") or "").strip():
-        return False
-    if len(row.get("photos") or []) < row.get("min_photos", MIN_PHOTOS):
-        return False
-    if not (row.get("handover") or "").strip():
-        return False
-
-    sale = row.get("recent_sale")
-    rent = row.get("rent")
-    if not isinstance(sale, dict) or not isinstance(rent, dict):
-        return False
-    if sale.get("price") is None or not sale.get("date"):
-        return False
-    if rent.get("annual") is None or not rent.get("date"):
-        return False
-    if not _is_recent_date(sale.get("date")):
-        return False
-    if not _is_recent_date(rent.get("date")):
-        return False
-    return True
 
 
 def _is_recent_date(value: Any) -> bool:
@@ -251,7 +223,7 @@ def _is_recent_date(value: Any) -> bool:
         return False
 
 
-def _from_catalog(key: str, bedrooms: int | None, web: bool = False) -> dict[str, Any] | None:
+def _from_catalog(key: str, bedrooms: int | None, web: bool, missing: list[str]) -> dict[str, Any] | None:
     rows = fetch(
         """
         select
@@ -274,38 +246,50 @@ def _from_catalog(key: str, bedrooms: int | None, web: bool = False) -> dict[str
         (key,),
     )
     if not rows:
+        missing.append("catalog project record")
         return None
     project = rows[0]
     location_key = project.get("locationKey")
 
     if not location_key:
+        missing.append("catalog location key")
         return None
 
     name = (project.get("name") or "").strip()
     community = (project.get("masterCommunity") or project.get("community") or "").strip()
     developer = (project.get("developer") or "").strip()
     handover = _handover_label(project)
-    if not name or not community or not developer or not handover:
+    missing.extend(label for value, label in (
+        (name, "project name"), (community, "community"),
+        (developer, "developer"), (handover, "handover or ready status"),
+    ) if not value)
+    if missing:
         return None
 
     photos = _catalog_photos(key, 16 if web else MAX_PHOTOS_PER_PROJECT)
+    min_photos = 3 if web else MIN_PHOTOS
+    listing_photos = []
+    if len(set(photos)) < min_photos:
+        listing_photos = _matching_listing_photos(name, community)
+        photos = list(dict.fromkeys(photos + listing_photos))
     amenities: list[str] = []
     interiors: list[dict[str, Any]] = []
     amenity_photos: list[dict[str, Any]] = []
     amenity_urls: list[str] = []
-    min_photos = MIN_PHOTOS
     if web:
         from app.Viedo_generation.collector import collect, label_photos
 
-        found = collect(key, name, community, developer)
-        amenities = found["amenities"]
-        photos = _dedupe_photos(photos + found["photos"])
-        min_photos = 3  # one property: three good official photos are enough
+        if not listing_photos or len(photos) < min_photos:
+            found = collect(key, name, community, developer)
+            amenities = found["amenities"]
+            photos = _dedupe_photos(photos + found["photos"])
         labels = label_photos(photos)
         photos, interiors = _split_inside(photos, labels)
         amenity_photos = _amenity_shots(labels)
         amenity_urls = [label["url"] for label in labels if label["kind"] == "amenity"]
-    if len(photos) < min_photos:
+    usable_photos = len(set(photos) | {room["url"] for room in interiors})
+    if usable_photos < min_photos:
+        missing.append(f"property photos ({usable_photos} available, {min_photos} needed)")
         return None
 
     stats = fetch(
@@ -335,7 +319,11 @@ def _from_catalog(key: str, bedrooms: int | None, web: bool = False) -> dict[str
 
     recent_sale = _latest_sale(location_key, bedrooms, project.get("projectNumber"))
     rent = _latest_rent(location_key, bedrooms, project.get("projectNumber"))
-    if recent_sale is None or rent is None:
+    if not recent_sale or recent_sale.get("price") is None or not _is_recent_date(recent_sale.get("date")):
+        missing.append("recorded sale in the last 12 months")
+    if not rent or rent.get("annual") is None or not _is_recent_date(rent.get("date")):
+        missing.append("recorded rent in the last 12 months")
+    if missing:
         return None
 
     return {
@@ -344,6 +332,7 @@ def _from_catalog(key: str, bedrooms: int | None, web: bool = False) -> dict[str
         "community": community,
         "developer": developer,
         "photos": photos[:MAX_PHOTOS_PER_PROJECT] + [x["url"] for x in interiors],
+        "uses_listing_photos": bool(listing_photos),
         "interior_photos": interiors,
         "amenity_photos": amenity_photos,
         "amenity_urls": amenity_urls,
@@ -463,6 +452,40 @@ def _catalog_photos(key: str, limit: int = MAX_PHOTOS_PER_PROJECT) -> list[str]:
         (key, limit),
     )
     return [f"{IMAGES_BASE_URL}/{r['objectName']}" for r in rows if r.get("objectName")]
+
+
+def _matching_listing_photos(name: str, community: str) -> list[str]:
+    """Use stored photos of an exact project listing inside the same master community."""
+    from psycopg.errors import UndefinedTable
+    from app.listings.tools import _photo
+
+    communities = [community.lower()]
+    for number, roman in (("2", "ii"), ("3", "iii")):
+        if communities[0] == f"arabian ranches {roman}":
+            communities.extend((f"arabian ranches {number}", f"arabian ranches-{number}"))
+    try:
+        rows = fetch(
+            """
+            select listing_id, stored_photos
+            from public.listings
+            where lower(btrim(sub_community)) = %s
+              and lower(btrim(community)) = any(%s)
+              and stored_photos > 0
+            order by stored_photos desc, last_seen desc nulls last, listing_id
+            limit 1
+            """,
+            (name.lower(), communities),
+        )
+    except UndefinedTable:
+        return []
+    if not rows:
+        return []
+    listing = rows[0]
+    stored = int(listing["stored_photos"])
+    return [
+        url for index in range(min(stored, MAX_PHOTOS_PER_PROJECT))
+        if (url := _photo(str(listing["listing_id"]), stored, index=index))
+    ]
 
 
 def _count_sales_12m(location_key: str) -> int:

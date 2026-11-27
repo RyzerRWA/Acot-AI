@@ -92,6 +92,8 @@ def get_job(
         "status": job["status"],
         "video_url": job.get("video_url"),
         "error": job.get("error"),
+        "project_choices": job.get("project_choices"),
+        "single_project_option": job.get("single_project_option"),
         "pack": job.get("pack"),
         "script_preview": job.get("script_preview"),
         "created_at": job.get("created_at"),

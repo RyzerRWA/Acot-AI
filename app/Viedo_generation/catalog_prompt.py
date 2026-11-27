@@ -9,6 +9,12 @@ class PromptError(ValueError):
     pass
 
 
+class AmbiguousProject(PromptError):
+    def __init__(self, name: str, choices: list[dict]):
+        super().__init__(f'More than one project is named "{name}". Choose the community you want.')
+        self.choices = choices
+
+
 def resolve_catalog_selection(
     prompt: str | None,
     project_keys: list[str] | None = None,
@@ -48,8 +54,14 @@ def catalog_candidates(prompt: str) -> list[dict]:
         if matches and matches[0]["key"].strip().lower() == normalized:
             matches = matches[:1]
         elif len(matches) > 1:
-            options = ", ".join(row["key"] for row in matches[:5])
-            raise PromptError(f'"{name}" matches several projects. Use an exact project key: {options}.')
+            raise AmbiguousProject(name, [
+                {
+                    "key": row["key"], "name": row["name"],
+                    "community": row.get("master_project") or row.get("area"),
+                    "prompt_text": ", ".join(row["key"] if term == normalized else value for term, value in terms.items()),
+                }
+                for row in matches
+            ])
         explicit_project = bool(matches)
         if not matches:
             matches = fetch(

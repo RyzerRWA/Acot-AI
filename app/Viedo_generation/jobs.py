@@ -14,11 +14,17 @@ import uuid
 from typing import Any
 
 from app.Viedo_generation import storage
-from app.Viedo_generation.catalog_prompt import PromptError
+from app.Viedo_generation.catalog_prompt import AmbiguousProject, PromptError
 
 _lock = threading.Lock()
 _jobs: dict[str, dict[str, Any]] = {}
 _render_lock = threading.Lock()
+
+
+class IncompleteComparison(PromptError):
+    def __init__(self, message: str, project: dict[str, Any]):
+        super().__init__(message)
+        self.single_project_option = {"key": project["key"], "name": project["name"]}
 
 
 def create_job(request: dict[str, Any]) -> dict[str, Any]:
@@ -79,6 +85,8 @@ def _run_job(job_id: str) -> None:
                 job_id,
                 status="failed",
                 error=str(exc) if isinstance(exc, PromptError) else "Video generation failed. Please try again.",
+                project_choices=exc.choices if isinstance(exc, AmbiguousProject) else None,
+                single_project_option=exc.single_project_option if isinstance(exc, IncompleteComparison) else None,
                 finished_at=time.time(),
             )
 
@@ -102,14 +110,18 @@ def _pipeline(job_id: str) -> dict[str, Any]:
     bedrooms = req.get("bedrooms")
     limit = int(req.get("limit") or 2)
     candidates = resolve_catalog_selection(req.get("prompt_text"), req.get("project_keys"), req.get("communities"))
-    # One picked property (the one-click flow) makes a single-property video.
-    single = len(req.get("project_keys") or []) == 1 and not req.get("prompt_text")
+    # A single named project makes a single-property video. Community searches still compare projects.
+    single = len(candidates) == 1 and bool(candidates[0].get("explicit_project"))
     pack_kwargs: dict[str, Any] = {"limit": limit, "min_projects": 1 if single else 2, "web": single}
     if bedrooms is not None:
         pack_kwargs["bedrooms"] = int(bedrooms)
     pack = build_pack(candidates, **pack_kwargs)
     if not pack.get("ok"):
-        raise PromptError(pack.get("reason") or "No complete project data.")
+        reason = pack.get("reason") or "No complete project data."
+        qualified = pack.get("projects") or []
+        if not single and len(qualified) == 1:
+            raise IncompleteComparison(reason, qualified[0])
+        raise PromptError(reason)
 
     language = "hi" if req.get("language") == "hi" else "en"
     cinematic = bool(req.get("broker_card"))
