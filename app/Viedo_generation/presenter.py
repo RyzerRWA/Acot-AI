@@ -26,7 +26,8 @@ class PresenterSequence:
 
 
 def presenter_enabled() -> bool:
-    raw = (os.getenv("VIDEO_PRESENTER_ENABLED") or "true").strip().lower()
+    # Off by default: the cartoon presenter looked unprofessional. VIDEO_PRESENTER_ENABLED=true brings it back.
+    raw = (os.getenv("VIDEO_PRESENTER_ENABLED") or "false").strip().lower()
     return raw not in {"0", "false", "no", "off"}
 
 

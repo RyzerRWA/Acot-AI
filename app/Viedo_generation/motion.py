@@ -8,6 +8,9 @@ from typing import Any
 FPS = 25
 TRANSITION_FRAMES = 25
 MIN_PHOTO_FRAMES = 6 * FPS
+# Each slide (except the last) runs this much longer so the next one can dissolve over it.
+SLIDE_FADE_FRAMES = 20
+LUMA_FRAMES = 5 * FPS
 
 
 def shot_timing(total_frames: int, count: int) -> tuple[list[int], list[int]]:
@@ -39,12 +42,28 @@ def motion_filter(index: int, frames: int, width: int, height: int) -> str:
     )
 
 
+def shot_filter(frames: int, width: int, height: int) -> str:
+    """Fit a 5 s Luma clip to its slot by slowing it down smoothly, never freezing on the last frame."""
+    stretch = max(1.0, frames / LUMA_FRAMES)
+    return (
+        f"setpts={stretch:.4f}*(PTS-STARTPTS),framerate=fps={FPS},fps={FPS},"
+        f"scale={width}:{height}:force_original_aspect_ratio=increase:flags=lanczos,crop={width}:{height},"
+        "unsharp=5:5:0.4:5:5:0.0,"
+        f"tpad=stop_mode=clone:stop=-1,trim=end_frame={frames},"
+        f"setsar=1,format=yuv420p,settb=1/{FPS},setpts=PTS-STARTPTS"
+    )
+
+
 def _prepare_photo(source: Path, target: Path, width: int, height: int) -> None:
     from PIL import Image, ImageFilter, ImageOps
     from app.Viedo_generation.render import _cover
 
     with Image.open(source) as opened:
         photo = ImageOps.exif_transpose(opened).convert("RGB")
+    if width >= height and photo.width >= photo.height * 1.2:
+        # Landscape photo on a landscape frame: fill edge to edge, like a film shot.
+        _cover(photo, width * 2, height * 2).save(target, compress_level=2)
+        return
     # Keep the complete room/building visible. A soft extension fills the space
     # around landscape photos on a portrait canvas, rather than a severe crop.
     size = (width * 2, height * 2)
@@ -84,6 +103,9 @@ def draw_overlay(path: Path, slide: dict[str, Any], lines: list[str], width: int
     from PIL import Image, ImageDraw
     from app.Viedo_generation.render import _add_logo, _font, _wrap_to_width
     from app.Viedo_generation.presenter import presenter_enabled, presenter_bounds
+
+    if width >= height:
+        return draw_wide_overlay(path, slide, lines, width, height)
 
     canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(canvas)
@@ -130,15 +152,91 @@ def draw_overlay(path: Path, slide: dict[str, Any], lines: list[str], width: int
     canvas.save(path, compress_level=2)
 
 
+def draw_wide_overlay(path: Path, slide: dict[str, Any], lines: list[str], width: int, height: int) -> None:
+    """16:9 lower-third: soft gradient, name and community, then sale / rent / handover columns."""
+    from PIL import Image, ImageDraw
+    from app.Viedo_generation.render import _add_logo, _font
+
+    s = height / 1080
+    canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    # Gradient keeps the shot clean up top and the text readable at the bottom.
+    band = round(height * 0.5)
+    gradient = Image.new("L", (1, band))
+    gradient.putdata([round(215 * (i / band) ** 1.6) for i in range(band)])
+    shade = Image.new("RGBA", (width, band), (10, 8, 7, 255))
+    shade.putalpha(gradient.resize((width, band)))
+    canvas.alpha_composite(shade, (0, height - band))
+    draw = ImageDraw.Draw(canvas)
+
+    margin = round(80 * s)
+    white, soft, muted = (255, 255, 255, 255), (226, 218, 210, 235), (196, 186, 176, 220)
+    stats = [x for x in (slide.get("stats") or []) if x.get("value")][:3]
+    title = str(slide.get("title") or "")
+    subtitle = str(slide.get("subtitle") or "")
+    extra = "" if stats else next((str(line) for line in lines if line), "")
+
+    def fit(text: str, size: int, bold: bool, max_width: int):
+        font = _font(round(size * s), bold=bold)
+        while draw.textlength(text, font=font) > max_width and font.size > 14:
+            font = _font(font.size - 2, bold=bold)
+        return font
+
+    def spaced(x: int, y: int, text: str, font, fill, gap: float) -> None:
+        for ch in text:
+            draw.text((x, y), ch, font=font, fill=fill)
+            x += round(draw.textlength(ch, font=font) + gap)
+
+    bottom = height - round(64 * s)
+    if stats:
+        col_w = (width - 2 * margin) // 3
+        label_f, value_f, sub_f = _font(round(19 * s), bold=True), _font(round(38 * s), bold=True), _font(round(20 * s))
+        row_top = bottom - round(112 * s)
+        for i, stat in enumerate(stats):
+            x = margin + i * col_w
+            spaced(x, row_top, stat["label"], label_f, muted, 2.2 * s)
+            value = stat["value"]
+            vf = value_f
+            while draw.textlength(value, font=vf) > col_w - round(24 * s) and vf.size > 16:
+                vf = _font(vf.size - 2, bold=True)
+            draw.text((x, row_top + round(30 * s)), value, font=vf, fill=white)
+            if stat.get("sub"):
+                draw.text((x, row_top + round(80 * s)), stat["sub"], font=sub_f, fill=muted)
+        rule_y = row_top - round(26 * s)
+        draw.line((margin, rule_y, width - margin, rule_y), fill=(255, 255, 255, 70), width=max(1, round(s)))
+        text_bottom = rule_y - round(22 * s)
+    else:
+        text_bottom = bottom
+        if extra:
+            ef = fit(extra, 26, False, width - 2 * margin)
+            draw.text((margin, text_bottom - ef.size), extra, font=ef, fill=muted)
+            text_bottom -= ef.size + round(18 * s)
+
+    sub_f = fit(subtitle, 30, False, width - 2 * margin) if subtitle else None
+    title_f = fit(title, 66 if not stats else 60, True, width - 2 * margin)
+    if sub_f:
+        draw.text((margin, text_bottom - sub_f.size), subtitle, font=sub_f, fill=soft)
+        text_bottom -= sub_f.size + round(12 * s)
+    draw.text((margin, text_bottom - round(title_f.size * 1.15)), title, font=title_f, fill=white)
+    # Thin accent above the title, in ACOT brown.
+    accent_y = text_bottom - round(title_f.size * 1.15) - round(22 * s)
+    draw.line((margin, accent_y, margin + round(56 * s), accent_y), fill=(193, 146, 116, 255), width=max(2, round(3 * s)))
+    canvas = _add_logo(canvas)
+    canvas.save(path, compress_level=2)
+
+
 def render_slides(slides: list[dict[str, Any]], pack: dict[str, Any], work: Path,
                   durations: list[float], ffmpeg: str, *, presenter: str | None = None) -> list[Path]:
     from app.Viedo_generation.render import WIDTH, HEIGHT, RenderError, _download_image, _run
     from app.Viedo_generation.presenter import build_presenter_sequence, presenter_enabled
 
-    photo_height = round(HEIGHT * 0.68) // 2 * 2
+    from app.Viedo_generation import storage
+    from app.Viedo_generation.luma import animate_photos
+
+    # Landscape: shots fill the frame under a lower-third. Portrait: photo above a text panel.
+    photo_height = HEIGHT if WIDTH >= HEIGHT else round(HEIGHT * 0.68) // 2 * 2
     cache: dict[str, Path | None] = {}
-    clips = []
-    for slide_index, (slide, duration) in enumerate(zip(slides, durations)):
+    plans = []
+    for slide, duration in zip(slides, durations):
         urls = list(dict.fromkeys(slide.get("photo_urls") or []))
         project_index = slide.get("project_index")
         if not urls and isinstance(project_index, int) and 0 <= project_index < len(pack.get("projects", [])):
@@ -155,23 +253,37 @@ def render_slides(slides: list[dict[str, Any]], pack: dict[str, Any], work: Path
                 except (OSError, ValueError):
                     cache[url] = None
             if cache[url]:
-                sources.append(cache[url])
+                sources.append((url, cache[url]))
         if not sources:
             raise RenderError(f"No usable property photos for {slide.get('title') or 'slide'}. Please check the image URLs.")
         total_frames = max(1, round(duration * FPS))
         # Allow at least six seconds per photo. Caption timing is independent.
-        sources = sources[:max(1, min(len(sources), total_frames // MIN_PHOTO_FRAMES))]
-        lengths, offsets = shot_timing(total_frames, len(sources))
-        overlap = (sum(lengths) - total_frames) // max(1, len(sources) - 1)
+        plans.append((slide, duration, total_frames, sources[:max(1, min(len(sources), total_frames // MIN_PHOTO_FRAMES))]))
+
+    # Real photos become Luma moving shots where possible; failures keep the still-photo motion.
+    # Luma's few shots go to the opening photo of each part first (intro, facts, rooms), then the rest.
+    ordered = [sources[0][0] for *_, sources in plans] + [url for *_, sources in plans for url, _ in sources[1:]]
+    shots = animate_photos(ordered, storage.DEFAULT_OUT_DIR / "luma")
+    clips = []
+    for slide_index, (slide, duration, total_frames, sources) in enumerate(plans):
+        tail = SLIDE_FADE_FRAMES if slide_index < len(plans) - 1 else 0
+        frames = total_frames + tail
+        lengths, offsets = shot_timing(frames, len(sources))
+        overlap = (sum(lengths) - frames) // max(1, len(sources) - 1)
         cmd = [ffmpeg, "-y", "-filter_complex_threads", "2"]
-        for source in sources:
-            cmd.extend(["-i", str(source)])
+        for url, still in sources:
+            cmd.extend(["-i", str(shots.get(url) or still)])
         pages = caption_schedule(slide, total_frames)
+        # The last caption stays up through the dissolve into the next slide.
+        pages[-1] = (pages[-1][0], pages[-1][1], frames)
         for i, (page, _, _) in enumerate(pages):
             overlay = work / f"overlay_{slide_index}_{i}.png"
             draw_overlay(overlay, slide, page, WIDTH, HEIGHT)
             cmd.extend(["-i", str(overlay)])
-        filters = [f"[{i}:v]{motion_filter(i + slide_index, length, WIDTH, photo_height)}[p{i}]" for i, length in enumerate(lengths)]
+        filters = [
+            f"[{i}:v]{shot_filter(length, WIDTH, photo_height) if shots.get(url) else motion_filter(i + slide_index, length, WIDTH, photo_height)}[p{i}]"
+            for i, ((url, _), length) in enumerate(zip(sources, lengths))
+        ]
         previous = "p0"
         for i, offset in enumerate(offsets, 1):
             filters.append(f"[{previous}][p{i}]xfade=transition=fade:duration={overlap / FPS:.6f}:offset={offset / FPS:.6f}[mix{i}]")
@@ -195,9 +307,10 @@ def render_slides(slides: list[dict[str, Any]], pack: dict[str, Any], work: Path
             )
             previous = "presented"
         target = work / f"clip_{slide_index:02d}.mp4"
-        cmd.extend(["-filter_complex", ";".join(filters), "-map", f"[{previous}]", "-frames:v", str(total_frames),
-                    "-an", "-r", str(FPS), "-c:v", "libx264", "-threads", "2", "-preset", "veryfast",
-                    "-crf", "23", "-maxrate", "1600k", "-bufsize", "3200k",
+        # Near-lossless intermediate; the final stitch sets the delivery quality.
+        cmd.extend(["-filter_complex", ";".join(filters), "-map", f"[{previous}]", "-frames:v", str(frames),
+                    "-an", "-r", str(FPS), "-c:v", "libx264", "-threads", "2", "-preset", "faster",
+                    "-crf", "15",
                     "-pix_fmt", "yuv420p", "-video_track_timescale", "12800", str(target)])
         _run(cmd, f"Photo motion render failed for {slide.get('title')}")
         clips.append(target)
