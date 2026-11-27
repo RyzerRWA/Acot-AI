@@ -3608,6 +3608,26 @@ def _fast_answer(question, answer, projects=None, question_type="general"):
     }
 
 
+_COMMUNITY_DEVELOPER_QUESTION = re.compile(
+    r"(?:who\s+(?:(?:is|was)\s+(?:the\s+)?(?:master\s+)?developer\s+(?:of|for)|developed)"
+    r"|(?:the\s+)?(?:master\s+)?developer\s+(?:of|for))\s+"
+    r"(?:jvc|jumeirah village circle(?:\s*\(jvc\))?)(?:\s+in dubai)?[?.!]*",
+    re.I,
+)
+
+
+def _community_developer_turn(question):
+    if not _COMMUNITY_DEVELOPER_QUESTION.fullmatch((question or "").strip()):
+        return None
+    # Nakheel confirms its role for the master community:
+    # https://www.nakheel.com/en/media-centre/blogs/detail/nakheel-neighbourhoods-in-dubai-with-high-roi-for-real-estate-buyers
+    return _fast_answer(
+        question,
+        "**Nakheel** is the master developer of **Jumeirah Village Circle (JVC)**. "
+        "Individual projects in JVC can have their own developers.",
+    )
+
+
 def _aed(value) -> str:
     return f"AED {int(round(float(value))):,}"
 
@@ -5648,6 +5668,14 @@ async def _prepare_acot_turn_inner(
             "small_talk": small_talk,
             "audience": components.get("audience") or "buyer",
         }
+
+    community_developer = _community_developer_turn(question)
+    if community_developer is not None:
+        community_developer.update(
+            timing_ms=timing_ms, ask_started=ask_started, rag_chain=rag_chain,
+            conversation_memory=conversation_memory,
+        )
+        return community_developer
 
     # Another city / emirate is out of coverage: say so, never map it onto Dubai data.
     outside_reply = _outside_dubai_market_reply(question)

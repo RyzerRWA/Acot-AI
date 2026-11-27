@@ -85,7 +85,7 @@ def _run_job(job_id: str) -> None:
 
 def _pipeline(job_id: str) -> dict[str, Any]:
     from app.Viedo_generation.catalog_prompt import resolve_catalog_selection
-    from app.Viedo_generation.pack import build_pack
+    from app.Viedo_generation.pack import build_pack, label_film_interiors
     from app.Viedo_generation.render import render
     from app.Viedo_generation.script import build_script
     from app.Viedo_generation.tts import friendly_voice
@@ -112,7 +112,10 @@ def _pipeline(job_id: str) -> dict[str, Any]:
         raise PromptError(pack.get("reason") or "No complete project data.")
 
     language = "hi" if req.get("language") == "hi" else "en"
-    script = build_script(pack, language=language)
+    cinematic = bool(req.get("broker_card"))
+    if cinematic and not single:
+        label_film_interiors(pack)
+    script = build_script(pack, language=language, cinematic=cinematic, broker_card=req.get("broker_card"))
     if not script.get("ok"):
         raise RuntimeError(script.get("reason") or "Script failed.")
 
@@ -128,6 +131,7 @@ def _pipeline(job_id: str) -> dict[str, Any]:
         audio_path=audio_path,
         job_id=job_id,
         presenter=voice,
+        broker_card=req.get("broker_card"),
     )
     preview = {
         "word_count": script.get("word_count"),

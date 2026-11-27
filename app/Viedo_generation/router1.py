@@ -21,6 +21,15 @@ router = APIRouter(prefix="/api/video", tags=["video"])
 INTERNAL_KEY = (os.getenv("VIDEO_INTERNAL_KEY") or "").strip()
 
 
+class BrokerCard(BaseModel):
+    name: str
+    agency: str | None = None
+    phone: str | None = None
+    email: str | None = None
+    photo_url: str | None = None
+    dld_stars: int | None = Field(default=None, ge=1, le=5)
+
+
 class CreateJobBody(BaseModel):
     user_id: str = Field(..., min_length=1)
     voice: Literal["male", "female"] | None = "female"
@@ -31,6 +40,7 @@ class CreateJobBody(BaseModel):
     project_keys: list[str] | None = None
     communities: list[str] | None = None
     prompt_text: str | None = Field(default=None, max_length=1000)
+    broker_card: BrokerCard | None = None
 
 
 def _check_key(x_video_key: str | None) -> None:
