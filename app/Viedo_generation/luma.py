@@ -4,6 +4,7 @@ import argparse
 import base64
 import os
 import time
+from io import BytesIO
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from urllib.parse import quote, urlsplit
@@ -113,6 +114,24 @@ SHOT_PROMPT = (
     "building, layout, materials, furniture and view exactly as shown. Add nothing new. "
     "No people, text or graphic overlays."
 )
+FLYTHROUGH_PROMPT = (
+    "One smooth, clearly visible forward dolly-in at constant speed. Keep the horizon level and the "
+    "camera locked on the subject. No roll, wobble, footsteps, or sideways swings. Show depth with near surfaces "
+    "moving against the background. Preserve the exact architecture, materials, and existing objects. "
+    "Fill the vertical frame with the scene. No cuts, borders, text, people, or invented spaces."
+)
+INTERIOR_FLYTHROUGH_PROMPT = (
+    "One smooth, clearly visible push-in through this existing room. Keep the camera level on a dolly with "
+    "no wobble, roll, footsteps, or side-to-side motion. Keep furniture in perspective as foreground objects shift past "
+    "the background. Fill the vertical frame. Preserve the real layout, furnishings, and lighting. "
+    "No cuts, borders, text, people, or newly revealed rooms."
+)
+AMENITY_WIDE_SHOT_PROMPT = (
+    "One wide vertical establishing shot of this exact shared facility. Film from a few steps back so the "
+    "facility and its surroundings are visible. Make one short, smooth forward camera move, with a level "
+    "horizon and no sideways swings, shake, effects, or cuts. Fill the 9:16 frame without blurred borders. "
+    "Keep the existing equipment, layout and materials. No added people, text, or objects."
+)
 
 
 def luma_enabled() -> bool:
@@ -120,7 +139,12 @@ def luma_enabled() -> bool:
     return not off and bool((os.getenv("LUMA_AGENTS_API_KEY") or "").strip())
 
 
-def animate_photos(urls: list[str], cache_dir: Path) -> dict[str, Path | None]:
+def animate_photos(
+    urls: list[str], cache_dir: Path, *, frame_size: tuple[int, int] | None = None,
+    flythrough: bool = False, interior_urls: set[str] | None = None,
+    amenity_urls: set[str] | None = None,
+    prepared_photos: dict[str, Path | None] | None = None,
+) -> dict[str, Path | None]:
     """Turn real photos into 5s Luma shots, in parallel, cached per photo URL.
 
     A photo that fails (or is over the cap, or not HTTPS) maps to None so the caller
@@ -136,23 +160,41 @@ def animate_photos(urls: list[str], cache_dir: Path) -> dict[str, Path | None]:
         return result
     cache_dir.mkdir(parents=True, exist_ok=True)
     # Cost balance: a few hero shots move with Luma; the rest use free photo motion. Cached shots are free.
-    cap = max(0, int(os.getenv("VIDEO_LUMA_MAX_SHOTS") or 3))
+    default_cap = 2 if flythrough and not amenity_urls else 3
+    cap = max(0, int(os.getenv("VIDEO_LUMA_MAX_SHOTS") or default_cap))
     key = os.getenv("LUMA_AGENTS_API_KEY", "")
     from app.Viedo_generation.render import HEIGHT, WIDTH
-    aspect = "16:9" if WIDTH >= HEIGHT else "9:16"
+    width, height = frame_size or (WIDTH, HEIGHT)
+    aspect = "16:9" if width >= height else "9:16"
     todo = []
     for url in unique:
-        path = cache_dir / f"{hashlib.sha256(f'{url}|{SHOT_PROMPT}|{aspect}'.encode()).hexdigest()[:24]}.mp4"
+        prompt = SHOT_PROMPT
+        if flythrough:
+            prompt = INTERIOR_FLYTHROUGH_PROMPT if interior_urls and url in interior_urls else FLYTHROUGH_PROMPT
+        if amenity_urls and url in amenity_urls:
+            prompt = AMENITY_WIDE_SHOT_PROMPT
+        source_mode = "|prepared" if prepared_photos and prepared_photos.get(url) else ""
+        cache_key = hashlib.sha256(f"{url}|{prompt}|{aspect}{source_mode}".encode()).hexdigest()[:24]
+        path = cache_dir / f"{cache_key}.mp4"
         if path.is_file():
             result[url] = path
         elif _https(url) and len(todo) < cap:
-            todo.append((url, path))
+            todo.append((url, path, prompt))
 
-    def one(item: tuple[str, Path]) -> tuple[str, Path | None]:
-        url, path = item
+    def one(item: tuple[str, Path, str]) -> tuple[str, Path | None]:
+        url, path, prompt = item
         try:
+            source: str | bytes = url
+            if prepared_photos and (prepared := prepared_photos.get(url)):
+                from PIL import Image
+
+                with Image.open(prepared) as photo:
+                    photo.thumbnail((720, 1280), Image.Resampling.LANCZOS)
+                    buffer = BytesIO()
+                    photo.save(buffer, format="JPEG", quality=92)
+                    source = buffer.getvalue()
             with httpx.Client(timeout=30) as client:
-                generate_entrance_clip(client, key, url, None, path, prompt=SHOT_PROMPT, aspect_ratio=aspect)
+                generate_entrance_clip(client, key, source, None, path, prompt=prompt, aspect_ratio=aspect)
             return url, path
         except (LumaError, httpx.HTTPError, OSError) as exc:
             logging.getLogger(__name__).warning("Luma shot failed, using still photo: %s", exc)

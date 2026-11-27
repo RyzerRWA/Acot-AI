@@ -56,9 +56,13 @@ _COMPARE = (
 )
 # Spoken openers before the real question: "Uh, compare…", "Okay so, Marina vs JVC".
 _FILLER = re.compile(r"^\W*(?:(?:uh+|um+|erm|hmm+|ah|so|okay|ok|well|hey|hi|acot|now|and|also|right)\b[\s,.!]*)+", re.I)
-_COMPARE_WORD = re.compile(r"\b(?:compar\w*|vs|versus|difference between|better|best|or)\b", re.I)
+_COMPARE_WORD = re.compile(r"\b(?:compar\w*|vs|versus|difference between|better|best|or|rank\w*)\b", re.I)
 # Speech-to-text slips for short names that the speech hints don't always fix.
 _SPOKEN_SLIPS = {"jbc": "Jumeirah Village Circle"}
+# Everyday names whose DLD label differs (ACOT QA AI-005, AI-010: Dubai South and JLT were not recognised).
+_PLAIN_NAMES = {"jlt": "jumeirah lakes towers", "jumeirah lake towers": "jumeirah lakes towers",
+                "creek harbour": "dubai creek harbour", "creek harbor": "dubai creek harbour",
+                "dubai south": "dubai south residential district"}
 
 
 _COMPARE_STRICT = re.compile(r"\b(?:compar\w*|vs|versus|difference between)\b", re.I)
@@ -95,7 +99,7 @@ def _resolve(text: str) -> str | None:
         if not key or len(key) > 60:
             continue
         alias = ALIASES.get(key)
-        for name in (alias.lower() if alias else None, key, f"dubai {key}"):
+        for name in (_PLAIN_NAMES.get(key), alias.lower() if alias else None, key, f"dubai {key}"):
             if name and name in known:
                 return known[name]
     # Speech-to-text slips: "business way" for Business Bay. Only near-identical names count.
@@ -108,7 +112,8 @@ def areas_in(question: str) -> list[str]:
     text = f" {re.sub(r'[^a-z0-9]+', ' ', (question or '').lower())} "
     known = _known_areas()
     keys = {**known, **{alias: known[proper.lower()] for alias, proper in {**ALIASES, **_SPOKEN_SLIPS}.items()
-                        if proper.lower() in known}}
+                        if proper.lower() in known},
+            **{plain: known[label] for plain, label in _PLAIN_NAMES.items() if label in known}}
     spans = []
     for key, proper in keys.items():
         if len(key) > 2:

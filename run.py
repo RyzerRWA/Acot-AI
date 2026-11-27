@@ -777,6 +777,7 @@ _CHART_ASK = re.compile(
     r"\b(?:bar\s*-?\s*(?:chart|chat|graph)|chart|graph|plot|diagram|visuali[sz]e|visuali[sz]ation|visual\s+representation)\b",
     re.I,
 )
+_VILLA_ASK = re.compile(r"\b(?:villas?|townhouses?|town\s+houses?)\b", re.I)
 _READY_ONLY_ASK = re.compile(
     r"\b(?:ready(?:\s+only)?|only\s+ready|completed\s+only|only\s+completed)\b",
     re.I,
@@ -1519,6 +1520,13 @@ def _execute_search_from_state(question, conversation_memory, *, more: bool = Fa
         payload["communities"] = [place]
     if beds is not None:
         payload["bedrooms"] = beds
+    from app.retrieval.propai_catalog import developers_in_question
+
+    developers = developers_in_question(f"{state.get('source_question') or ''} {question or ''}")
+    if developers:
+        payload["developers"] = developers
+    if _VILLA_ASK.search(f"{state.get('source_question') or ''} {question or ''}"):
+        payload["property_types"] = ["villa"]
     if budget is not None:
         if state.get("prefer_cheaper") or not re.search(
             r"\b(?:above|over|starting)\b", str(state.get("source_question") or ""), re.I
@@ -1823,6 +1831,85 @@ def _llm_generate_from(conversation_memory, components=None):
     if client is not None and hasattr(client, "generate"):
         return client.generate
     return None
+
+
+_PROJECT_TURN_SKIP = re.compile(r"\b(?:compar\w*|vs\.?|versus|agents?|brokers?|charts?|graphs?)\b", re.I)
+_AMENITY_ASK = re.compile(r"\b(?:amenit\w*|facilit\w*|features?)\b", re.I)
+_ON_SCREEN_WORDS = re.compile(r"\b(?:these|those|them|their|each|all|this|it|its)\b", re.I)
+
+_PROJECT_FACTS_PROMPT = """You are ACOT, a Dubai property assistant. Answer the buyer's question about {subject} \
+using ONLY the facts below (Prop-AI project details from the developer, and Dubai Land Department sales and \
+rent registrations).
+- Answer exactly what was asked first, in one or two sentences, then a short bulleted list of the most relevant facts.
+- "Starting price" means the lowest layout starting_price_from (developer price). Also give the 12-month median \
+recorded sale when present, labelled as recorded sales.
+- Features or amenities: list the amenities and highlights as given; mention project_details points when useful.
+- Sales or rent questions: use the sales and rents sections (AED, dates as Month YYYY, newest first).
+- If what was asked is not in the facts, say it is not on record for this project. Never invent facts.
+- Markdown bullets, no headings, AED amounts with thousands separators, under 220 words.
+
+Facts (JSON):
+{facts}
+
+Question: {question}"""
+
+
+async def _named_project_turn(question, conversation_memory, components=None):
+    """A question that names one project, or asks amenities of the projects on screen.
+
+    Runs before the on-screen / follow-up handlers so "starting price of Serenz by Danube" answers
+    Serenz instead of re-listing the last browse. Facts: Prop-AI details (amenities, layouts,
+    payment plan) plus that project's own sales and rents.
+    """
+    from app.retrieval.hybrid.question_text import comparison_pair
+    from app.retrieval.propai_catalog import _id_index, project_fact_sheet, project_in_question
+
+    text = question or ""
+    if _PROJECT_TURN_SKIP.search(text) or comparison_pair(text):
+        return None
+    llm_generate = _llm_generate_from(conversation_memory, components)
+    if llm_generate is None:
+        return None
+    project = await asyncio.to_thread(project_in_question, text)
+    if project:
+        targets = [(project["name"], project["key"])]
+    elif _AMENITY_ASK.search(text) and _ON_SCREEN_WORDS.search(text):
+        ids = await asyncio.to_thread(_id_index)
+        targets = [
+            (item["name"], ids.get(str(item.get("id") or "")))
+            for item in _active_projects(conversation_memory)[:8]
+        ]
+        targets = [(name, key) for name, key in targets if key]
+        if not targets:
+            return None
+    else:
+        return None
+
+    facts = {}
+    for name, key in targets:
+        sheet = await asyncio.to_thread(project_fact_sheet, key)
+        if len(targets) > 1:
+            sheet = {k: sheet[k] for k in ("executive_summary", "amenities", "highlights", "project_details") if k in sheet}
+        facts[name] = sheet or {"note": "nothing on record"}
+    subject = targets[0][0] if len(targets) == 1 else "the projects on screen"
+    prompt = _PROJECT_FACTS_PROMPT.format(
+        subject=subject, question=text.strip(),
+        facts=json.dumps(facts, default=str, ensure_ascii=False)[:24000],
+    )
+    try:
+        answer = (await llm_generate(prompt) or "").strip()
+    except Exception as exc:
+        print(f"named project answer failed: {exc}")
+        return None
+    if not answer:
+        return None
+    if len(targets) == 1:
+        turn = await asyncio.to_thread(_project_detail_turn, text, conversation_memory, targets[0][0])
+        if turn is None:
+            turn = _fast_answer(text, answer, question_type="search")
+        turn["fast_answer"] = answer
+        return turn
+    return _fast_answer(text, answer, projects=_active_projects(conversation_memory)[:8], question_type="search")
 
 
 async def _dialogue_followup_turn(question, conversation_memory, components=None):
@@ -3271,6 +3358,10 @@ def _outside_dubai_market_reply(question):
     text = question or ""
     if not text.strip() or _OUTSIDE_SKIP.search(text):
         return None
+    from app.answers.advice_turn import advice_kind
+
+    if advice_kind(text):
+        return None  # "Compare Dubai and London without assuming my tax residence" wants a framework (AI-058)
     try:
         from app.retrieval.propai_catalog import outside_dubai_city
 
@@ -3606,6 +3697,26 @@ def _fast_answer(question, answer, projects=None, question_type="general"):
                              "documents": []},
         "use_fast": True, "fast_answer": answer, "context": None, "small_talk": None,
     }
+
+
+_COMMUNITY_DEVELOPER_QUESTION = re.compile(
+    r"(?:who\s+(?:(?:is|was)\s+(?:the\s+)?(?:master\s+)?developer\s+(?:of|for)|developed)"
+    r"|(?:the\s+)?(?:master\s+)?developer\s+(?:of|for))\s+"
+    r"(?:jvc|jumeirah village circle(?:\s*\(jvc\))?)(?:\s+in dubai)?[?.!]*",
+    re.I,
+)
+
+
+def _community_developer_turn(question):
+    if not _COMMUNITY_DEVELOPER_QUESTION.fullmatch((question or "").strip()):
+        return None
+    # Nakheel confirms its role for the master community:
+    # https://www.nakheel.com/en/media-centre/blogs/detail/nakheel-neighbourhoods-in-dubai-with-high-roi-for-real-estate-buyers
+    return _fast_answer(
+        question,
+        "**Nakheel** is the master developer of **Jumeirah Village Circle (JVC)**. "
+        "Individual projects in JVC can have their own developers.",
+    )
 
 
 def _aed(value) -> str:
@@ -4315,6 +4426,13 @@ def _sql_project_browse_turn(question, conversation_memory=None):
         payload["communities"] = [resolved]
     if beds:
         payload["bedrooms"] = beds[0]
+    from app.retrieval.propai_catalog import developers_in_question
+
+    developers = developers_in_question(text)
+    if developers:
+        payload["developers"] = developers
+    if _VILLA_ASK.search(text):
+        payload["property_types"] = ["villa"]
     if budget is not None:
         if _PRICE_FLOOR_ASK.search(text) and not _PRICE_CEILING_ASK.search(text):
             payload["min_price"] = budget
@@ -5573,6 +5691,186 @@ async def _try_agent_turn(question, components, timing_ms, ask_started):
     }
 
 
+_LATEST_SALE_ASK = re.compile(r"\b(?:latest|most recent|last)\b[\s\S]{0,40}\b(?:sale|transaction)\b", re.I)
+_COVERAGE_ASK = re.compile(r"\b(?:substantiat\w*|coverage|behind|lag|source|how far|up to date)\b", re.I)
+
+
+def _area_clause(label):
+    return ("(upper(area_name_prop_ai) = upper(%s) or upper(master_project_prop_ai) = upper(%s))", [label, label])
+
+
+def _latest_sale_turn(question):
+    """One dated recorded sale with its details, and how far the feed is behind today (ACOT QA AI-025 got a median)."""
+    from datetime import date
+
+    from app.answers.area_comparison import areas_in
+    from app.database.postgres import CLEAN_SALE, fetch
+
+    if not (_LATEST_SALE_ASK.search(question or "") and _COVERAGE_ASK.search(question or "")):
+        return None
+    named = areas_in(question)
+    if not named:
+        return None
+    clause, params = _area_clause(named[0])
+    rows = fetch(
+        f"select instance_date, sale_price, bedrooms, procedure_area_sqft, project_name_prop_ai, property_type_en "
+        f"from propai_sales where {CLEAN_SALE} and {clause} order by instance_date desc, sale_price desc limit 1",
+        tuple(params),
+    )
+    feed = fetch(f"select max(instance_date) as d from propai_sales where {CLEAN_SALE}")
+    if not rows:
+        return None
+    r, latest_any = rows[0], (feed[0]["d"] if feed else None)
+    when = r["instance_date"]
+    beds = r.get("bedrooms")
+    beds_text = "studio" if beds == 0 else (f"{int(beds)}-bed" if beds is not None else "bedrooms not recorded")
+    size = f", {int(r['procedure_area_sqft']):,} sq ft" if r.get("procedure_area_sqft") else ""
+    today = date.today()
+    lag = (today - date.fromisoformat(str(latest_any)[:10])).days if latest_any else None
+    lines = [
+        f"The latest recorded sale ACOT holds for **{named[0].title()}** is dated **{when}**: "
+        f"**AED {int(r['sale_price']):,}**, {r.get('property_type_en') or 'property'}, {beds_text}{size}"
+        + (f", in {r['project_name_prop_ai']}" if r.get("project_name_prop_ai") else "") + ".",
+        "",
+        "- **Source:** Dubai Land Department sale registrations, as loaded into ACOT (deleted and outlier-flagged records excluded).",
+        f"- **Coverage:** the newest sale anywhere in the feed is dated {latest_any}"
+        + (f", {lag} day{'s' if lag != 1 else ''} behind today ({today})." if lag is not None else "."),
+        "- A registration date can trail the deal date; check the record on the DLD / Dubai REST transaction search before relying on it.",
+    ]
+    return _fast_answer(question, "\n".join(lines))
+
+
+_SUPPLY_ASK = re.compile(r"\b(?:delivered|completed|completions?|handed over|handover)\b", re.I)
+_PLANNED_ASK = re.compile(r"\b(?:announced|planned|upcoming|pipeline|expected|scheduled)\b", re.I)
+
+
+def _supply_turn(question):
+    """Projects completed in one year versus planned for another, from DLD project records (ACOT QA AI-023)."""
+    from app.answers.area_comparison import areas_in
+    from app.database.postgres import fetch
+
+    text = question or ""
+    years = [int(y) for y in re.findall(r"\b(20[1-4]\d)\b", text)]
+    if not (_SUPPLY_ASK.search(text) and _PLANNED_ASK.search(text) and len(years) >= 2):
+        return None
+    named = areas_in(text)
+    if not named:
+        return None
+    from app.answers.area_comparison import _PLAIN_NAMES
+
+    place = named[0]
+    # Project rows say "Dubai South" where sales say "Dubai South Residential District": match the buyer's words too.
+    likes = [f"%{place}%"] + [f"%{k}%" for k in _PLAIN_NAMES if k in text.lower()]
+    where = "(area ilike any(%s) or master_project ilike any(%s)) and not is_plot"
+    rows = fetch(
+        f"select extract(year from end_date)::int as y, "
+        f"count(distinct upper(name)) filter (where development_status = 'FINISHED')::int as done, "
+        f"count(distinct upper(name)) filter (where coalesce(development_status, '') not in ('FINISHED', 'CANCELLED'))::int as planned "
+        f"from propai_projects where {where} and extract(year from end_date) = any(%s) group by 1",
+        (likes, likes, years),
+    )
+    place = next((k.title() for k in _PLAIN_NAMES if k in text.lower()), place.title())
+    by_year = {r["y"]: r for r in rows}
+    lines = [f"From Dubai Land Department project records for **{place}** (counted in projects, not homes):", ""]
+    for y in sorted(set(years)):
+        r = by_year.get(y) or {"done": 0, "planned": 0}
+        lines.append(f"- **{y}:** {r['done']} project{'s' if r['done'] != 1 else ''} recorded as completed, "
+                     f"{r['planned']} still under construction or not started with that completion date")
+    lines += ["", "Unit counts per project are not in ACOT's records, so the number of homes cannot be given. "
+              "Planned dates are developer targets and often move. To verify a project, look it up on the DLD / "
+              "Dubai REST project status service (completion percentage and escrow), and compare with the developer's notice."]
+    return _fast_answer(question, "\n".join(lines))
+
+
+_PULSE_ASK = re.compile(r"\bmarket\s+(?:pulse|overview)\b", re.I)
+
+
+def _market_pulse_turn(question):
+    """Explain and reconcile a Market Overview card count: same table, same filters (ACOT QA AI-017 read
+    "market" as a project called The Market)."""
+    from datetime import date, timedelta
+
+    from app.answers.area_comparison import areas_in
+    from app.database.postgres import fetch
+
+    if not _PULSE_ASK.search(question or ""):
+        return None
+    named = areas_in(question)
+    if not named:
+        return None
+    rows = fetch("select area, sales_12m, last_sale from propai_area_stats where upper(area) = upper(%s)", (named[0],))
+    if not rows:
+        return None
+    row = rows[0]
+    today = date.today()
+    start = today - timedelta(days=365)
+    shown = None
+    for raw in re.findall(r"\b\d{1,3}(?:,\d{3})+\b|\b\d{4,6}\b", question):
+        value = int(raw.replace(",", ""))
+        if not 1900 <= value <= 2100:
+            shown = value
+            break
+    lines = [
+        f"The Market Overview card for **{row['area'].title()}** counts recorded Dubai Land Department sales:",
+        "",
+        f"- **Period:** {start:%-d %b %Y} to {today:%-d %b %Y} (a rolling 12 months ending today)",
+        "- **Included:** every recorded sale in the area, off-plan and ready, all property types, with a sale price above zero",
+        "- **Excluded:** deleted records, records flagged as outliers, and dates after today",
+        f"- **Count today:** **{int(row['sales_12m']):,}** sales; latest recorded sale {row['last_sale']}",
+    ]
+    if shown is not None and shown != int(row["sales_12m"]):
+        diff = int(row["sales_12m"]) - shown
+        lines += ["", f"The {shown:,} you saw differs by {diff:+,}. The window moves every day: the oldest day drops "
+                      "out and newly registered or corrected records come in, so the count changes from one day to the "
+                      "next without any change in method."]
+    elif shown is not None:
+        lines += ["", f"That matches the {shown:,} on the card."]
+    return _fast_answer(question, "\n".join(lines))
+
+
+_ANALYTICAL_ASK = re.compile(
+    r"\b(?:why|which|what|how|evidence|risk|reverse|undermine|net income|net yield|appreciation|liquidity|noise|"
+    r"tenant demand|costs?|thesis|hold|stress|downside)\b", re.I)
+
+
+async def _two_area_analysis_turn(question, conversation_memory, components):
+    from types import SimpleNamespace
+
+    from app.answers.advice_turn import advice_answer
+
+    if len((question or "").split()) < 9 or not _ANALYTICAL_ASK.search(question or ""):
+        return None  # "Compare Marina and JVC" keeps the plain comparison path with cards
+    try:
+        areas = await asyncio.to_thread(parse_area_comparison, question)
+        table = await asyncio.to_thread(build_area_comparison, *areas) if areas else None
+    except Exception as exc:
+        print(f"two-area analysis unavailable: {exc}")
+        return None
+    if not table:
+        return None
+    figures = []
+    for area in areas:
+        try:
+            m = await asyncio.to_thread(_market_numbers, area)
+        except Exception:
+            m = {}
+        bits = [f"{k}={v}" for k, v in (m or {}).items() if v is not None and k in {
+            "price_psf", "price_psf_change_pct", "sales_12m", "sales_change_pct", "gross_yield_pct", "growth_3y_pct",
+            "median_price", "median_rent"}]
+        if bits:
+            figures.append(f"{area.title()} (last 12 months of DLD records): " + ", ".join(bits))
+    turns = list(getattr(conversation_memory, "turns", None) or [])[-6:]
+    turns.append({"user_question": "(ACOT recorded data for both areas)", "answer": "\n".join(figures) + "\n" + table})
+    note = await advice_answer(
+        question + "\nUse the ACOT figures above for both areas; say which figures are missing. Do not list projects.",
+        SimpleNamespace(turns=turns), _llm_generate_from(conversation_memory, components))
+    # The plain comparison closes with "ACOT has no yield…" and a follow-up offer; here the figures follow, so drop both.
+    table = "\n".join(line for line in table.splitlines()
+                      if not re.search(r"no yield or price-growth data|^would you like", line.strip(), re.I)).strip()
+    answer = table + (f"\n\n{note}" if note else "")
+    return _fast_answer(question, answer)
+
+
 async def _prepare_acot_turn(question, components):
     """Prepare a turn; a broker's CRM/claim part carried from a mixed question rides along with the market answer."""
     components.pop("_carry_companion", None)
@@ -5583,10 +5881,16 @@ async def _prepare_acot_turn(question, components):
         prepared["broker_companion"] = carry
         prepared["companion_suffix"] = f"**For you:** {carry['answer']}" if carry.get("answer") else ""
     # A vacancy or viewing ask gets an honest line, whichever path answered it (ACOT QA R02).
-    from app.answers.advice_turn import availability_note, document_note
+    from app.answers.advice_turn import availability_note, document_note, scope_note
 
+    doc_note = None if prepared.get("advice_kind") else document_note(question, prepared.get("documents"))
+    if doc_note and prepared.get("use_fast") and prepared.get("fast_answer"):
+        # A brochure ask is answered first with "not on file", before any sale card (ACOT QA AI-013).
+        prepared["fast_answer"] = f"{doc_note}\n\n{prepared['fast_answer']}"
+        doc_note = None
     notes = [] if prepared.get("advice_kind") else [
-        availability_note(question), document_note(question, prepared.get("documents")),
+        availability_note(question), doc_note,
+        scope_note(question, prepared.get("fast_answer") if prepared.get("use_fast") else None),
     ]
     if any(notes):
         prepared["companion_suffix"] = "\n\n".join(p for p in (prepared.get("companion_suffix"), *notes) if p)
@@ -5648,6 +5952,14 @@ async def _prepare_acot_turn_inner(
             "small_talk": small_talk,
             "audience": components.get("audience") or "buyer",
         }
+
+    community_developer = _community_developer_turn(question)
+    if community_developer is not None:
+        community_developer.update(
+            timing_ms=timing_ms, ask_started=ask_started, rag_chain=rag_chain,
+            conversation_memory=conversation_memory,
+        )
+        return community_developer
 
     # Another city / emirate is out of coverage: say so, never map it onto Dubai data.
     outside_reply = _outside_dubai_market_reply(question)
@@ -5717,6 +6029,37 @@ async def _prepare_acot_turn_inner(
                 "conversation_memory": conversation_memory, "advice_kind": kind,
             })
             return advice
+
+    # Two named areas plus an analytical ask ("Rank Arjan and JVC for net income… which costs could reverse it?"):
+    # the area table from the database, then a short answer to the actual question over those figures (ACOT QA
+    # AI-004, AI-005, AI-010 got a citywide ranking or only one of the two areas).
+    pulse = await asyncio.to_thread(_market_pulse_turn, question)
+    if pulse is not None:
+        pulse.update({"timing_ms": timing_ms, "ask_started": ask_started, "rag_chain": rag_chain,
+                      "conversation_memory": conversation_memory})
+        return pulse
+    for record_turn in (_latest_sale_turn, _supply_turn):
+        record = await asyncio.to_thread(record_turn, question)
+        if record is not None:
+            record.update({"timing_ms": timing_ms, "ask_started": ask_started, "rag_chain": rag_chain,
+                           "conversation_memory": conversation_memory})
+            return record
+    two_areas = await _two_area_analysis_turn(question, conversation_memory, components)
+    if two_areas is not None:
+        two_areas.update({"timing_ms": timing_ms, "ask_started": ask_started, "rag_chain": rag_chain,
+                          "conversation_memory": conversation_memory})
+        return two_areas
+
+    # A named project ("starting price of Serenz by Danube", "What is Sartoria") or amenities of the
+    # cards on screen: answer that project from its own facts, never re-list the last browse. Before the
+    # place-inheritance rewrite below, which turns "recent sale of Gallery Villas" into a Sports City browse.
+    named_project = await _named_project_turn(question, conversation_memory, components)
+    if named_project is not None:
+        named_project["timing_ms"] = timing_ms
+        named_project["ask_started"] = ask_started
+        named_project["rag_chain"] = rag_chain
+        named_project["conversation_memory"] = conversation_memory
+        return named_project
 
     # After clarify: rewrite to a clean browse so SQL can answer (low tokens).
     prior = prior_anchor_question(conversation_memory, question)

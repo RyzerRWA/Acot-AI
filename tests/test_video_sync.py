@@ -59,6 +59,35 @@ class VideoSyncTests(unittest.TestCase):
         # Intro, middle and close each show different real photos.
         self.assertEqual([s["photo_urls"] for s in script["slides"]], [["photo0"], photos[1:5], ["photo5"]])
 
+    def test_cinematic_comparison_starts_on_each_property_and_moves_inside(self):
+        project = {"name": "First", "photos": ["building", "pool", "living", "bath"],
+                   "interior_photos": [{"url": "living"}, {"url": "bath"}]}
+        script = build_script({"ok": True, "projects": [project, {"name": "Second", "photos": ["facade"]}]},
+                              cinematic=True)
+        self.assertEqual([slide["kind"] for slide in script["slides"]], ["project", "project"])
+        self.assertEqual([slide["photo_urls"] for slide in script["slides"]], [["building", "living", "bath"], ["facade"]])
+        self.assertEqual(renderer._slide_durations(script["slides"], 45), [22.48, 22.52])
+
+    def test_named_amenities_have_matching_narration_and_precede_the_agent(self):
+        project = {"name": "Garden View", "photos": ["building", "pool", "play", "room"],
+                   "interior_photos": [{"url": "room", "room": "living room"}],
+                   "amenity_urls": ["pool", "play"],
+                   "amenity_photos": [{"url": "pool", "name": "Swimming pool"},
+                                      {"url": "play", "name": "Children's play area"}],
+                   "amenities": ["Shared pool", "Gym"]}
+        script = build_script({"ok": True, "projects": [project]}, cinematic=True,
+                              broker_card={"name": "Demo Agent"})
+        self.assertEqual([slide["kind"] for slide in script["slides"]],
+                         ["project", "inside", "amenity", "amenity", "amenity", "agent"])
+        self.assertEqual(script["slides"][0]["photo_urls"], ["building"])
+        for slide, label, photo in zip(script["slides"][2:5],
+                                      ["Swimming pool", "Children's play area", "Gym"],
+                                      ["pool", "play", "building"], strict=True):
+            self.assertIn(label, slide["narration"])
+            self.assertEqual(slide["photo_urls"], [photo])
+        self.assertIn("Demo Agent", script["slides"][-1]["narration"])
+        self.assertEqual(script["slides"][-1]["target_frames"], 125)
+
     def test_facts_are_paired_with_their_narration(self):
         project = {"name": "Example", "community": "Community", "developer": "Developer", "bedrooms_min": 2, "photos": ["photo"], "recent_sale": {"price": 1200000, "bedrooms": 2, "date": "2026-10-01"}, "rent": {"annual": 80000, "bedrooms": 2, "date": "2026-10-02"}, "handover": "ready"}
         script = build_script({"ok": True, "projects": [project, {**project, "name": "Second"}]})
@@ -87,6 +116,65 @@ class VideoSyncTests(unittest.TestCase):
             renderer._slide_durations([{"duration_frames": 100}], 20)
         with self.assertRaises(renderer.RenderError):
             caption_schedule({"duration_frames": 250, "cues": [{"start_frame": 1, "end_frame": 250}]}, 250)
+
+    def test_reel_shows_agent_panel_for_exactly_five_seconds_with_audio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            photo = root / "photo.png"
+            frame = Image.new("RGB", (640, 360), (20, 180, 50))
+            draw = ImageDraw.Draw(frame)
+            draw.rectangle((0, 0, 639, 60), fill="red")
+            draw.rectangle((0, 300, 639, 359), fill="blue")
+            frame.save(photo)
+            audio = root / "speech.wav"
+            with wave.open(str(audio), "wb") as wav:
+                wav.setparams((1, 2, 24000, 0, "NONE", "not compressed"))
+                with wave.open(io.BytesIO(tone(3.0, 220)), "rb") as speech:
+                    wav.writeframes(speech.readframes(speech.getnframes()))
+                wav.writeframes(b"\0\0" * (4 * 24000))
+            slide = {"title": "Example", "photo_urls": ["fixture"], "duration_frames": 25,
+                     "cues": [{"start_frame": 0, "end_frame": 25, "lines": []}]}
+            agent_slide = {"kind": "agent", "duration_frames": 125,
+                           "cues": [{"start_frame": 0, "end_frame": 125, "lines": []}]}
+            script = {"ok": True, "slides": [slide, slide, agent_slide]}
+            dld_photo = "https://mobile.dubailand.gov.ae/example.jpg"
+            with (
+                patch.object(renderer, "_download_image", return_value=photo),
+                patch.object(renderer, "_broker_photo", return_value=Image.new("RGB", (300, 300), "#973728")) as profile,
+                patch("app.Viedo_generation.luma.animate_photos", return_value={}),
+                patch.dict(os.environ, {"VIDEO_PRESENTER_ENABLED": "false"}),
+            ):
+                out = renderer.render(
+                    {"ok": True}, script, audio_path=audio, output_path=root / "reel.mp4",
+                    broker_card={"name": "Demo Agent", "email": "agent@example.test", "photo_url": dld_photo, "dld_stars": 5},
+                )
+                profile.assert_called_once_with(dld_photo)
+            ffmpeg = renderer._ffmpeg_bin()
+            def pixels(x, y):
+                result = subprocess.run(
+                    [ffmpeg, "-hide_banner", "-i", str(out), "-vf", f"crop=2:2:{x}:{y}",
+                     "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"],
+                    capture_output=True, check=True,
+                )
+                self.assertIn(b"1080x1920", result.stderr)
+                return [result.stdout[i:i + 3] for i in range(0, len(result.stdout), 12)]
+
+            avatar_edge = pixels(540, 510)
+            self.assertEqual(len(avatar_edge), 175)
+            self.assertTrue(all(pixel[0] < 50 for pixel in avatar_edge[:50]))
+            self.assertTrue(all(pixel[0] > 100 for pixel in avatar_edge[50:]))
+            self.assertTrue(all(pixel[0] > 60 for pixel in pixels(540, 1160)[50:]))
+            self.assertTrue(all(pixel[0] > 200 for pixel in pixels(550, 20)[:50]))
+            self.assertTrue(all(pixel[2] > 35 for pixel in pixels(550, 1900)[:50]))
+            self.assertTrue(all(pixel[0] < 50 for pixel in pixels(990, 1000)[50:]))
+            audio_check = subprocess.run(
+                [ffmpeg, "-v", "error", "-ss", "3.2", "-i", str(out), "-map", "0:a:0",
+                 "-f", "s16le", "-ar", "24000", "pipe:1"],
+                capture_output=True, check=True,
+            )
+            samples = list(struct.iter_unpack("<h", audio_check.stdout))
+            self.assertGreaterEqual(len(samples), 3.76 * 24000)
+            self.assertLess(max(abs(value) for value, in samples), 10)
 
     def test_measured_audio_controls_encoded_captions_and_project_change(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(renderer, "WIDTH", 360), patch.object(renderer, "HEIGHT", 640), patch.dict(os.environ, {"VIDEO_PRESENTER_ENABLED": "false"}):

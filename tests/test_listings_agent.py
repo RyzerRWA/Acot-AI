@@ -299,7 +299,10 @@ class ProjectToolTests(unittest.TestCase):
 
         self.assertFalse(_propai_rejects_filters({"bedrooms": 2, "property_types": ["APARTMENT"]}))
         self.assertFalse(_propai_rejects_filters({"bedrooms": 2, "property_types": ["apartment"]}))
-        self.assertTrue(_propai_rejects_filters({"property_types": ["VILLA"]}))
+        # Villas and townhouses are answered from registered villa sales now (ACOT QA AI-015); offices still fall through.
+        self.assertFalse(_propai_rejects_filters({"property_types": ["VILLA"]}))
+        self.assertFalse(_propai_rejects_filters({"property_types": ["townhouse"]}))
+        self.assertTrue(_propai_rejects_filters({"property_types": ["OFFICE"]}))
         self.assertTrue(_propai_rejects_filters({"min_size": 1000}))
 
     def test_word_bedroom_counts_are_read_as_numbers(self):

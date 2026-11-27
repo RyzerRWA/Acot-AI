@@ -548,6 +548,12 @@ def _expanded(values) -> list[str]:
         alias = ALIASES.get(text.lower())
         if alias and alias not in names:
             names.append(alias)
+    # DLD writes "Jumeirah Lakes Towers"; people (and ALIASES) write "Lake": JLT showed no sales (ACOT QA AI-019).
+    for name in list(names):
+        if re.search(r"\blake towers\b", name, re.I):
+            plural = re.sub(r"(?i)\blake towers\b", "Lakes Towers", name)
+            if plural not in names:
+                names.append(plural)
     return names
 
 
@@ -764,9 +770,13 @@ def _propai_rejects_filters(filters: dict) -> bool:
     if not types:
         return False
     return any(
-        item not in _APARTMENT_TYPES and item.rstrip("s") not in {"apartment", "flat", "unit"}
+        item not in _APARTMENT_TYPES and item.rstrip("s") not in {"apartment", "flat", "unit", "villa", "townhouse"}
         for item in types
     )
+
+
+def _wants_villa(filters: dict) -> bool:
+    return any(str(t).strip().lower().rstrip("s") in {"villa", "townhouse"} for t in (filters.get("property_types") or []))
 
 
 def browse_projects_near_budget(
@@ -827,13 +837,19 @@ def agent_projects(
         params.extend(extra)
     developers = [str(name).strip() for name in (filters.get("developers") or []) if str(name).strip()]
     if developers:
-        parts.append("developer ilike any(%s::text[])")
-        params.append(_likes(developers))
+        parts.append("(developer ilike any(%s::text[]) or developer_group ilike any(%s::text[]))")
+        params.extend([_likes(developers)] * 2)
     name = str(filters.get("name") or "").strip()
     tokens = [token for token in re.findall(r"[a-z0-9]+", name.lower()) if token not in {"by", "at", "the", "of", "in", "and", "a"}]
     for token in tokens:
         parts.append("name ilike %s")
         params.append(_likes([token])[0])
+    if _wants_villa(filters):
+        # Townhouses are registered as villas; a studio tower must not answer a townhouse ask (ACOT QA AI-015).
+        parts.append(
+            "upper(name) in (select upper(project_name_prop_ai) from propai_sales "
+            "where property_type_en = 'Villa' or property_sub_type_en ilike '%%townhouse%%')"
+        )
     if filters.get("handover_year") is not None:
         parts.append("extract(year from end_date) = %s")
         params.append(int(filters["handover_year"]))
@@ -1612,6 +1628,48 @@ def top_developers_by_value(limit: int = 5, months: int = 12) -> list[dict]:
 
 
 _OFF_PLAN_STATUSES = ("ACTIVE", "PENDING", "NOT_STARTED", "CONDITIONAL_ACTIVATING")
+
+
+_GENERIC_BRAND = {"dubai", "al", "the", "gulf", "new", "arabian", "prestige", "diamond", "union", "select", "object",
+                  "tiger", "jumeirah", "beyond", "majid", "mag", "h&h", "gfs", "real", "first", "iman"}
+_DEVELOPER_CUE = (r"(?:\b(?:by|from|developer|developed by|built by)\s+{b}\b|\b{b}(?:[\s-]+only)\b|\bonly\s+{b}\b|"
+                  r"\b{b}(?:'s)?\s+(?:\d\s*-?\s*beds?\b|\d\s*-?\s*bedrooms?\b|studios?\b|projects?\b|apartments?\b|"
+                  r"villas?\b|townhouses?\b|homes?\b|propert(?:y|ies)\b|units?\b|launch(?:es)?\b))")
+# Groups that are also a place or an everyday word: "Dubai South homes" is an area ask.
+_PLACE_OR_WORD_BRAND = {"dubai south", "dubai sports city", "jumeirah golf estates", "time", "seven", "vision"}
+_developer_brands: dict[str, str] | None = None
+
+
+def developers_in_question(text: str | None) -> list[str]:
+    """Developer brands the buyer filtered on: "Emaar-only 2-beds", "projects by Damac" (ACOT QA AI-012, R07).
+    A bare place name such as "Damac Hills" or "Emaar South" is not a developer filter."""
+    global _developer_brands
+    lowered = (text or "").lower()
+    if not lowered:
+        return []
+    if _developer_brands is None:
+        try:
+            # shortcut: only groups with 10+ projects; small groups with everyday names ("City", "Creek") misfire.
+            rows = fetch(
+                "select btrim(developer_group) as g from propai_projects where coalesce(developer_group, '') <> '' "
+                "group by 1 having count(*) >= 10"
+            )
+        except Exception:
+            return []
+        brands: dict[str, str] = {}
+        for row in rows:
+            group = str(row["g"]).lower()
+            first = group.split()[0]
+            brand = group if first in _GENERIC_BRAND or len(first) < 4 else first
+            if brand in _PLACE_OR_WORD_BRAND:
+                continue
+            brands.setdefault(brand, row["g"])
+        _developer_brands = brands
+    found = []
+    for brand, group in _developer_brands.items():
+        if brand in lowered and re.search(_DEVELOPER_CUE.format(b=re.escape(brand)), lowered):
+            found.append(group)
+    return found
 
 
 def count_projects(place: str | None = None, developer: str | None = None, status: str | None = None) -> int:
@@ -2457,3 +2515,206 @@ def sale_summary(communities) -> dict | None:
             "Prefer this price over an older starting price."
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# Named project: everything on record for one project (details, sales, rents)
+# ---------------------------------------------------------------------------
+
+def project_in_question(question: str | None) -> dict | None:
+    """The one catalog project whose full name appears in the question as whole words (longest wins).
+
+    Never a community/area name, so "projects in Dubai Sports City" stays a browse.
+    """
+    text = question or ""
+    if len(text.strip()) < 5:
+        return None
+    rows = fetch(
+        """
+        select name, location_key as key, master_project, area
+        from propai_projects
+        where coalesce(name, '') <> '' and length(name) >= 5 and not is_plot
+          and position(upper(name) in upper(%s)) > 0
+        order by length(name) desc
+        limit 8
+        """,
+        (text,),
+    )
+    for row in rows or []:
+        name = str(row.get("name") or "")
+        if not re.search(rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])", text, re.I):
+            continue
+        if known_dubai_label(name):
+            continue
+        return row
+    return None
+
+
+def _live_project_details(key: str) -> dict:
+    """Prop-AI details for one project, saved for next time. Empty on any failure."""
+    import json
+    import urllib.parse
+
+    import httpx
+
+    try:
+        resp = httpx.get(
+            os.getenv("PROPAI_BASE_URL", "https://api.prop-ai.com").rstrip("/")
+            + "/data/projects/details/" + urllib.parse.quote(key, safe=""),
+            headers={"x-api-key": os.getenv("PROPAI_API_KEY", "")},
+            timeout=20,
+        )
+        if resp.status_code not in (200, 404):
+            return {}
+        data = resp.json() if resp.status_code == 200 else {}
+        data = data.get("data", data) if isinstance(data, dict) else {}
+        from app.database.postgres import execute
+
+        execute(
+            "insert into propai_project_details(location_key, payload) values (%s, %s) "
+            "on conflict (location_key) do update set payload = excluded.payload, fetched_at = now()",
+            (key, json.dumps(data)),
+        )
+        return data
+    except Exception as exc:
+        print(f"live project details failed for {key}: {exc}")
+        return {}
+
+
+def project_details(key: str) -> dict:
+    """Saved Prop-AI project details (amenities, highlights, layouts, payment plans, documents),
+    plus amenities from the developer's official site when Prop-AI has none."""
+    try:
+        rows = fetch(
+            "select payload, web_amenities, official_url from propai_project_details where location_key = %s",
+            (key,),
+        )
+    except Exception:
+        rows = []
+    if not rows:
+        return _live_project_details(key)
+    row = rows[0]
+    payload = dict(row.get("payload") or {})
+    if row.get("web_amenities") and not payload.get("amenities_1"):
+        payload["web_amenities"] = row["web_amenities"]
+        payload["amenities_source"] = row.get("official_url")
+    return payload
+
+
+def _numbered(payload: dict, prefix: str) -> list[str]:
+    items = []
+    for n in range(1, 80):
+        value = payload.get(f"{prefix}_{n}")
+        if value is None:
+            if n > 3 and payload.get(f"{prefix}_{n + 1}") is None:
+                break
+            continue
+        value = str(value).strip()
+        if value and value.lower() not in ("none", "null", "not found"):
+            items.append(value)
+    return items
+
+
+def project_fact_sheet(key: str) -> dict:
+    """Features, amenities, layouts, payment plans, sales and rents for one project key."""
+    d = project_details(key) or {}
+    layouts = [
+        {k: v for k, v in row.items() if v not in (None, "") and "http" not in str(v) and k != "floorplan_name"}
+        for row in (d.get("layouts") or []) if isinstance(row, dict)
+    ]
+    docs = {}
+    for k in ("docs_brochure", "docs_floorplans"):
+        links = [u for u in (d.get(k) or []) if isinstance(u, str)]
+        if links:
+            docs[k.removeprefix("docs_")] = len(links)
+    facts = {
+        "executive_summary": d.get("executive_summary"),
+        "project_details": d.get("project_details"),
+        "amenities": _numbered(d, "amenities") or list(d.get("web_amenities") or []),
+        "amenities_source": d.get("amenities_source") and f"developer website {d['amenities_source']}",
+        "highlights": _numbered(d, "highlight"),
+        "value_propositions": _numbered(d, "value_proposition"),
+        "floors": d.get("building_floors_developer"),
+        "property_types": d.get("property_types"),
+        "layouts": layouts,
+        "payment_plans": [p for p in (d.get("payment_plan_details") or [])
+                          if isinstance(p, dict) and p.get("payment_plan") not in (None, "Not Found")],
+        "service_charges_with_ac": d.get("service_charges_with_ac"),
+        "developer_details": d.get("developer_details"),
+        "delivery_status": d.get("delivery_status"),
+        "offplan_status": d.get("offplan_status"),
+        "offplan_completion": d.get("offplan_completion_year"),
+        "propai_estimated_completion": d.get("propai_estimated_completion"),
+        "documents_on_file": docs,
+    }
+    try:
+        sales = fetch(
+            f"""
+            select count(*)::int as all_time,
+                   count(*) filter (where instance_date >= now() - interval '12 months')::int as last_12m,
+                   percentile_cont(0.5) within group (order by sale_price)
+                       filter (where instance_date >= now() - interval '12 months')::bigint as median_12m,
+                   min(sale_price) filter (where instance_date >= now() - interval '12 months')::bigint as min_12m,
+                   max(sale_price) filter (where instance_date >= now() - interval '12 months')::bigint as max_12m,
+                   round(avg(price_per_sqft) filter (where instance_date >= now() - interval '12 months'))::int as avg_psf_12m,
+                   max(instance_date) as latest
+            from propai_sales
+            where deleted_at is null and sale_price > 0 and location_key_project = %s and {CLEAN_SALE}
+            """,
+            (key,),
+        )[0]
+        by_beds = fetch(
+            f"""
+            select bedrooms, count(*)::int as n,
+                   percentile_cont(0.5) within group (order by sale_price)::bigint as median,
+                   min(sale_price)::bigint as min
+            from propai_sales
+            where deleted_at is null and sale_price > 0 and location_key_project = %s and {CLEAN_SALE}
+              and instance_date >= now() - interval '12 months'
+            group by bedrooms order by bedrooms nulls last
+            """,
+            (key,),
+        )
+        recent = fetch(
+            f"""
+            select instance_date as date, sale_price::bigint as price, bedrooms,
+                   round(procedure_area_sqft)::int as size_sqft, trans_group_en as type
+            from propai_sales
+            where location_key_project = %s and {CLEAN_SALE}
+            order by instance_date desc nulls last limit 6
+            """,
+            (key,),
+        )
+    except Exception as exc:
+        print(f"project sales facts failed: {exc}")
+        sales, by_beds, recent = {}, [], []
+    try:
+        rents = fetch(
+            """
+            select count(*)::int as contracts,
+                   percentile_cont(0.5) within group (order by annual_amount)::bigint as median_annual,
+                   min(annual_amount)::bigint as min_annual, max(annual_amount)::bigint as max_annual,
+                   max(contract_start_date) as latest
+            from propai_rents
+            where deleted_at is null and annual_amount > 0 and location_key_project = %s
+              and contract_start_date >= now() - interval '12 months'
+            """,
+            (key,),
+        )[0]
+        rent_beds = fetch(
+            """
+            select bedrooms, count(*)::int as n,
+                   percentile_cont(0.5) within group (order by annual_amount)::bigint as median_annual
+            from propai_rents
+            where deleted_at is null and annual_amount > 0 and location_key_project = %s
+              and contract_start_date >= now() - interval '12 months'
+            group by bedrooms order by bedrooms nulls last
+            """,
+            (key,),
+        )
+    except Exception as exc:
+        print(f"project rent facts failed: {exc}")
+        rents, rent_beds = {}, []
+    facts["sales"] = {**(sales or {}), "by_bedrooms_12m": by_beds, "most_recent": recent}
+    facts["rents"] = {**(rents or {}), "by_bedrooms_12m": rent_beds}
+    return {k: v for k, v in facts.items() if v not in (None, "", [], {})}

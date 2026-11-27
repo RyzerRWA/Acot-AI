@@ -16,6 +16,7 @@ from run import (
     _broker_place,
     _broker_turn,
     _classify_small_talk,
+    _community_developer_turn,
     _data_freshness_turn,
     _detect_response_type,
     _developer_rank_turn,
@@ -39,6 +40,19 @@ from run import (
     _small_talk_answer,
     build_frontend_response,
 )
+
+
+def test_jvc_master_developer_question_is_distinct_from_project_attributes():
+    for question in (
+        "who is the developer of jvc",
+        "Who developed Jumeirah Village Circle?",
+        "Master developer of Jumeirah Village Circle (JVC)",
+    ):
+        result = _community_developer_turn(question)
+        assert "Nakheel" in result["fast_answer"]
+        assert not result["structured_summary"]["projects"]
+    assert _community_developer_turn("Who is the developer of each of these projects?") is None
+    assert _community_developer_turn("Who is the developer of Laya Crest in JVC?") is None
 
 
 def _projects():
