@@ -259,7 +259,8 @@ def test_bare_agents_does_not_inherit_browse_place():
     text = clarify_question_text(enriched, question)
     assert "agent" in text.lower()
     # Sticky browse place must not appear in the Understood line.
-    assert "understood:" in text.lower()
+    # ACOT QA AI-006: no empty "Understood: you are looking for your request." lead.
+    assert "your request" not in text.lower()
     assert "in motor city" not in text.lower()
 
 

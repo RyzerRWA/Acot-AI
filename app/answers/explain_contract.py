@@ -140,13 +140,17 @@ def build_understood(
             "ready": "ready versus off-plan",
             "compare": "a shortlist compare",
         }.get(goal_key, "a recommendation")
-        bits.append(goal_bit)
+        # "2-bedroom an affordability check" read as broken English (ACOT QA AI-002).
+        bits = [f"{goal_bit} for a {' '.join(bits)} home"] if bits else [goal_bit]
     elif intent == "sales":
         bits.append("recent recorded sales")
     elif intent == "agents":
         bits.append("licensed agents")
     elif intent == "clarify":
-        bits.append("your request")
+        # "Understood: you are looking for your request." says nothing; let the question stand alone (ACOT QA AI-006).
+        if not (bits or (place and str(place).strip()) or budget_aed is not None):
+            return ""
+        bits.append("homes")
     else:
         bits.append("homes" if bed or ready_only else "projects")
 
@@ -164,7 +168,7 @@ def build_understood(
             else f" around AED {int(budget_aed):,}"
         )
 
-    core = " ".join(bits).strip() or "your request"
+    core = " ".join(bits).strip() or "homes"
     lead = f"Understood: you are looking for {core}{where}{budget_bit}."
 
     # Second sentence when we can name the evidence angle without inventing lifestyle.

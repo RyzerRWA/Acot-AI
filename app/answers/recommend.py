@@ -2300,7 +2300,9 @@ def format_afford_answer(
     bedrooms: int | None = 1,
 ) -> str:
     names = [str(row.get("name") or "").strip() for row in projects[:4] if row.get("name")]
-    areas = [str(row.get("area") or "").title() for row in nearby[:3] if row.get("area")]
+    # Industrial and plot zones are not homes to suggest (ACOT QA AI-002: "Al Qusais Industrial" for a Palm 2-bed).
+    areas = [str(row.get("area") or "").title() for row in nearby
+             if row.get("area") and not re.search(r"industrial|\bplot|\bwarehouse|\bfactory", str(row.get("area")), re.I)][:3]
     from app.answers.explain_contract import build_motive, build_understood, prepend_understood
 
     label = _bed_label(bedrooms)
